@@ -177,7 +177,7 @@ class CommInfoBase(with_metaclass(MetaParams)):
           - Use param ``automargin`` * ``price`` if ``automargin > 0``
         '''
         if not self.p.automargin:
-            return self.p.margin
+            return price * self.p.margin
 
         elif self.p.automargin < 0:
             return price * self.p.mult
@@ -192,9 +192,9 @@ class CommInfoBase(with_metaclass(MetaParams)):
     def getsize(self, price, cash):
         '''Returns the needed size to meet a cash operation at a given price'''
         if not self._stocklike:
-            return int(self.p.leverage * (cash // self.get_margin(price)))
+            return self.p.leverage * (cash / self.get_margin(price))
 
-        return int(self.p.leverage * (cash // price))
+        return self.p.leverage * (cash / price)
 
     def getoperationcost(self, size, price):
         '''Returns the needed amount of cash an operation would cost'''

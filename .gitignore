@@ -69,3 +69,11 @@ samples2/
 datas/*.py
 
 .idea/
+.DS_Store
+backtrader/.DS_Store
+contrib/.DS_Store
+samples/.DS_Store
+/datas
+/samples
+/datas/
+/samples/
