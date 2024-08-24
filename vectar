@@ -1,0 +1,58 @@
+import ccxt
+import pandas as pd
+import time
+
+# Replace these with your actual API keys
+api_key = 'YOUR_API_KEY'
+api_secret = 'YOUR_API_SECRET'
+
+# Initialize the exchange
+exchange = ccxt.binance({
+    'apiKey': api_key,
+    'secret': api_secret,
+})
+
+# Define the trading parameters
+symbol = 'BTC/USDT'
+timeframe = '1h'
+limit = 100
+sma_period = 20
+
+def fetch_data():
+    # Fetch historical data
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    return df
+
+def calculate_sma(df):
+    df['sma'] = df['close'].rolling(window=sma_period).mean()
+    return df
+
+def trade_logic(df):
+    last_row = df.iloc[-1]
+    if last_row['close'] > last_row['sma']:
+        return 'buy'
+    elif last_row['close'] < last_row['sma']:
+        return 'sell'
+    return 'hold'
+
+def execute_trade(signal):
+    if signal == 'buy':
+        print("Placing buy order")
+        exchange.create_market_buy_order(symbol, 0.001)  # Adjust the amount as needed
+    elif signal == 'sell':
+        print("Placing sell order")
+        exchange.create_market_sell_order(symbol, 0.001)  # Adjust the amount as needed
+
+def main():
+    while True:
+        df = fetch_data()
+        df = calculate_sma(df)
+        signal = trade_logic(df)
+        execute_trade(signal)
+        time.sleep(60 * 60)  # Sleep for an hour before running again
+
+if __name__ == "__main__":
+    main()
