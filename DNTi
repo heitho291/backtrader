@@ -1,0 +1,20 @@
+import backtrader as bt
+
+class NaturalGasStrategy(bt.Strategy):
+    def __init__(self):
+        self.high_level = 6.30
+        self.low_level = 2.55
+        self.target_price = 5.60
+        self.premium_price = 5.04
+        # ... (Fibonacci levels calculation and other indicators)
+
+    def next(self):
+        # Trading logic here
+        pass
+
+# Create a backtesting engine
+cerebro = bt.Cerebro()
+cerebro.addstrategy(NaturalGasStrategy)
+# Load data
+# cerebro.adddata(data)
+cerebro.run()
