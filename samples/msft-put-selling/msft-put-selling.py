@@ -2,10 +2,10 @@
 # -*- coding: utf-8; py-indent-offset:4 -*-
 ###############################################################################
 #
-# MSFT Put Selling Strategy - Sell on Dips
+# Put Selling Strategy - Sell on Dips
 #
-# Strategy that sells up to 3 MSFT put option contracts, selling 1 contract 
-# every time the stock price drops 5% from the previous sell time.
+# Strategy that sells put option contracts using 1/3 of capital each time,
+# selling when the stock price drops 5% from the previous sell time.
 # Uses 30 delta puts with 6 weeks expiration.
 # Closes positions at 60% profit or holds to expiration.
 #
@@ -28,20 +28,21 @@ from backtrader.optionstrategy import OptionStrategy
 from backtrader.optioncommission import EquityOptionCommissionInfo
 
 
-class MSFTPutSellingStrategy(OptionStrategy):
+class PutSellingStrategy(OptionStrategy):
     '''
-    MSFT Put Selling Strategy that sells put options on price dips
+    Put Selling Strategy that sells put options on price dips using capital allocation
     
     Rules:
-    - Sell up to 3 put option contracts maximum
-    - Sell 1 contract each time MSFT drops 5% from previous sell price
+    - Use 1/3 of total capital for each option sale
+    - Sell when stock drops 5% from previous sell price
     - Use 30 delta puts with 6 weeks (42 days) to expiration
     - Close positions at 60% profit or hold to expiration
     - If assigned at expiration, accept the stock
     '''
     
     params = (
-        ('max_contracts', 3),           # Maximum number of contracts to sell
+        ('total_capital', 100000),      # Total capital to allocate
+        ('capital_fraction', 0.333),    # Fraction of capital to use per trade (1/3)
         ('drop_threshold', 0.05),       # 5% drop threshold
         ('target_dte', 42),            # Target 6 weeks (42 days) to expiration
         ('dte_tolerance', 7),          # Allow +/- 7 days from target
@@ -49,32 +50,43 @@ class MSFTPutSellingStrategy(OptionStrategy):
         ('delta_tolerance', 0.05),     # Allow +/- 5 delta points
         ('profit_target', 0.60),       # Close at 60% profit
         ('option_type', 'put'),        # Option type
+        ('symbol', 'STOCK'),           # Symbol for underlying (configurable)
         ('debug', True),               # Print debug information
     )
     
     def __init__(self):
-        super(MSFTPutSellingStrategy, self).__init__()
+        super(PutSellingStrategy, self).__init__()
         
         # Strategy state
         self.last_sell_price = None     # Price at last option sale
-        self.contracts_sold = 0         # Number of contracts currently sold
+        self.active_trades = []         # List of active trades with capital allocation
         self.sell_history = []          # History of sales
         self.open_positions = {}        # Track individual option positions with entry prices
         
+        # Capital management - now dynamic
+        self.initial_capital = self.p.total_capital  # Store initial capital for reference
+        self.allocated_capital = 0      # Total capital currently allocated to margin
+        self.available_capital = self.p.total_capital  # Available capital for new trades
+        
         # Data references
-        self.msft_data = self.datas[0]  # Underlying MSFT stock data
+        self.stock_data = self.datas[0]  # Underlying stock data
         self.option_feeds = self.datas[1:]  # Option data feeds
         
         # Track stock price for monitoring
         self.current_price = None
         
         if self.p.debug:
-            print("MSFT Put Selling Strategy initialized")
-            print(f"Max contracts: {self.p.max_contracts}")
+            print(f"Put Selling Strategy initialized for {self.p.symbol}")
+            print(f"Initial capital: ${self.initial_capital:,.2f}")
+            print(f"Capital per trade: {self.initial_capital * self.p.capital_fraction:,.2f}")
             print(f"Drop threshold: {self.p.drop_threshold * 100}%")
             print(f"Target DTE: {self.p.target_dte} days")
             print(f"Target Delta: {self.p.target_delta}")
             print(f"Profit target: {self.p.profit_target * 100}%")
+
+    def get_current_total_capital(self):
+        '''Get current total capital (portfolio value)'''
+        return self.broker.getvalue()
     
     def log(self, txt, dt=None):
         '''Logging function for strategy'''
@@ -83,7 +95,10 @@ class MSFTPutSellingStrategy(OptionStrategy):
     
     def next(self):
         '''Main strategy logic called on each bar'''
-        self.current_price = self.msft_data.close[0]
+        self.current_price = self.stock_data.close[0]
+        
+        # Update capital allocation status
+        self.update_capital_status()
         
         # Check for profit taking opportunities
         self.check_profit_targets()
@@ -95,16 +110,73 @@ class MSFTPutSellingStrategy(OptionStrategy):
         if self.should_sell_option():
             self.sell_option()
     
+    def update_capital_status(self):
+        '''Update available and allocated capital based on current portfolio value'''
+        # Get current total capital from broker (includes all cash and positions)
+        current_total_capital = self.get_current_total_capital()
+        
+        # Recalculate allocated capital based on active positions (margin requirements)
+        self.allocated_capital = 0
+        active_trades_temp = []
+        
+        for trade_info in self.active_trades:
+            option_data = trade_info['option_data']
+            position = self.getposition(option_data)
+            
+            if position.size != 0:  # Position still active
+                # Calculate current margin requirement (strike price * contracts * 100)
+                if hasattr(option_data, 'strike'):
+                    margin_required = abs(position.size) * option_data.strike * 100
+                    trade_info['current_margin'] = margin_required
+                    self.allocated_capital += margin_required
+                    active_trades_temp.append(trade_info)
+        
+        # Update active trades list
+        self.active_trades = active_trades_temp
+        
+        # Calculate available capital (total portfolio value minus margin requirements)
+        self.available_capital = max(0, current_total_capital - self.allocated_capital)
+        
+        if self.p.debug and len(self) % 20 == 0:  # Log every 20 bars
+            # Use current total capital for calculating target per trade
+            target_per_trade = current_total_capital * self.p.capital_fraction
+            usable_capital = min(target_per_trade, self.available_capital)
+            utilization = (self.allocated_capital / current_total_capital) * 100 if current_total_capital > 0 else 0
+            
+            # Calculate total return since start
+            total_return = ((current_total_capital - self.initial_capital) / self.initial_capital) * 100 if self.initial_capital > 0 else 0
+            
+            self.log(f"Capital Status - Current Total: ${current_total_capital:,.2f} "
+                    f"(+{total_return:.1f}% from ${self.initial_capital:,.2f})")
+            self.log(f"Available: ${self.available_capital:,.2f}, "
+                    f"Allocated to Margin: ${self.allocated_capital:,.2f} ({utilization:.1f}%)")
+            self.log(f"Next Trade - Target: ${target_per_trade:,.2f}, "
+                    f"Usable: ${usable_capital:,.2f}, "
+                    f"Active Trades: {len(self.active_trades)}")
+
     def should_sell_option(self):
         '''Determine if we should sell an option'''
-        # Don't sell if we already have max contracts
-        if self.contracts_sold >= self.p.max_contracts:
+        # Use current total capital for calculations
+        current_total_capital = self.get_current_total_capital()
+        target_capital = current_total_capital * self.p.capital_fraction
+        trade_capital = min(target_capital, self.available_capital)
+        
+        # Need at least enough for one contract (estimate $5000 minimum)
+        min_capital_needed = 5000  # Conservative estimate
+        
+        if trade_capital < min_capital_needed:
+            if self.p.debug and len(self) % 50 == 0:  # Log less frequently to avoid spam
+                self.log(f"Insufficient capital for new trade: "
+                        f"Target ${target_capital:,.2f}, "
+                        f"Available ${self.available_capital:,.2f}, "
+                        f"Usable ${trade_capital:,.2f}")
             return False
         
         # Don't sell if we don't have a previous sell price (first sale)
         if self.last_sell_price is None:
             if self.p.debug:
-                self.log(f"First sale opportunity at ${self.current_price:.2f}")
+                self.log(f"First sale opportunity at ${self.current_price:.2f} "
+                        f"with ${trade_capital:,.2f} capital (total: ${current_total_capital:,.2f})")
             return True
         
         # Calculate price drop from last sell
@@ -113,13 +185,14 @@ class MSFTPutSellingStrategy(OptionStrategy):
         if price_drop >= self.p.drop_threshold:
             if self.p.debug:
                 self.log(f"5% drop detected: {price_drop*100:.2f}% "
-                        f"(from ${self.last_sell_price:.2f} to ${self.current_price:.2f})")
+                        f"(from ${self.last_sell_price:.2f} to ${self.current_price:.2f}) "
+                        f"with ${trade_capital:,.2f} available capital")
             return True
         
         return False
-    
+
     def sell_option(self):
-        '''Sell a put option contract'''
+        '''Sell a put option contract using capital allocation'''
         try:
             # Find suitable option contract
             option_data = self.find_suitable_put_option()
@@ -129,37 +202,79 @@ class MSFTPutSellingStrategy(OptionStrategy):
                     self.log("No suitable put option contract found")
                 return
             
+            # Use current total capital for position sizing
+            current_total_capital = self.get_current_total_capital()
+            target_capital = current_total_capital * self.p.capital_fraction
+            trade_capital = min(target_capital, self.available_capital)
+            
+            # Ensure we have minimum capital for at least one contract
+            strike_price = getattr(option_data, 'strike', 100)
+            min_capital_needed = strike_price * 100  # One contract margin requirement
+            
+            if trade_capital < min_capital_needed:
+                if self.p.debug:
+                    self.log(f"Insufficient capital for trade. "
+                            f"Need: ${min_capital_needed:,.2f}, "
+                            f"Available: ${trade_capital:,.2f}, "
+                            f"Target: ${target_capital:,.2f}")
+                return
+            
+            # For put selling, margin requirement is approximately strike * contracts * 100
+            # Calculate how many contracts we can sell with allocated capital
+            max_contracts = int(trade_capital / (strike_price * 100))
+            
+            if max_contracts < 1:
+                if self.p.debug:
+                    self.log(f"Cannot afford even 1 contract with available capital: ${trade_capital:,.2f}")
+                return
+            
+            # Limit to reasonable number of contracts (e.g., max 10)
+            contracts_to_sell = min(max_contracts, 10)
+            
+            # Recalculate actual capital used based on contracts we can afford
+            actual_capital_used = contracts_to_sell * strike_price * 100
+            
             # Place sell order (short the put)
-            order = self.sell(data=option_data, size=1)
+            order = self.sell(data=option_data, size=contracts_to_sell)
             
             if order:
                 # Update strategy state
                 self.last_sell_price = self.current_price
-                self.contracts_sold += 1
                 
-                # Record sale
-                sale_record = {
+                # Create trade tracking record
+                trade_info = {
                     'date': self.datas[0].datetime.date(0),
                     'stock_price': self.current_price,
                     'option_data': option_data,
                     'order': order,
-                    'contract_number': self.contracts_sold,
-                    'entry_price': None  # Will be filled in notify_order
+                    'contracts': contracts_to_sell,
+                    'allocated_capital': actual_capital_used,  # Use actual capital used
+                    'target_capital': target_capital,         # Track what we wanted to use
+                    'available_capital': self.available_capital,  # Track what was available
+                    'current_total_capital': current_total_capital,  # Track total capital at time of trade
+                    'strike_price': strike_price,
+                    'entry_price': None,  # Will be filled in notify_order
+                    'current_margin': 0   # Will be updated
                 }
-                self.sell_history.append(sale_record)
+                
+                # Record sale
+                self.sell_history.append(trade_info.copy())
                 
                 if self.p.debug:
-                    strike = getattr(option_data, 'strike', 'Unknown')
                     expiry = getattr(option_data, 'expiry', 'Unknown')
                     delta = self.calculate_option_delta(option_data)
-                    self.log(f"SOLD Put #{self.contracts_sold}: "
-                            f"Strike ${strike}, Expiry {expiry}, "
+                    capital_efficiency = (actual_capital_used / target_capital) * 100 if target_capital > 0 else 0
+                    self.log(f"SOLD {contracts_to_sell} Put contracts: "
+                            f"Strike ${strike_price}, Expiry {expiry}, "
                             f"Delta {delta:.3f}, Stock @ ${self.current_price:.2f}")
+                    self.log(f"Capital: Total ${current_total_capital:,.2f}, Target ${target_capital:,.2f}, "
+                            f"Available ${self.available_capital:,.2f}, "
+                            f"Used ${actual_capital_used:,.2f} ({capital_efficiency:.1f}% of target)")
         
         except Exception as e:
             if self.p.debug:
                 self.log(f"Error selling option: {e}")
-    
+
     def find_suitable_put_option(self):
         '''Find a suitable put option contract to sell (30 delta, 6 weeks)'''
         current_date = self.datas[0].datetime.date(0)
@@ -227,7 +342,7 @@ class MSFTPutSellingStrategy(OptionStrategy):
             
             # Create a temporary contract for delta calculation
             contract = OptionContract(
-                symbol='MSFT',
+                symbol=self.p.symbol,
                 expiry=option_data.expiry,
                 strike=option_data.strike,
                 option_type=getattr(option_data, 'option_type', 'put')
@@ -289,13 +404,12 @@ class MSFTPutSellingStrategy(OptionStrategy):
             if self.p.debug:
                 strike = getattr(option_data, 'strike', 'Unknown')
                 self.log(f"CLOSING PROFITABLE Put: Strike ${strike}, "
+                        f"Contracts: {abs(position.size)}, "
                         f"Profit {profit_pct*100:.1f}%")
             
             # Remove from open positions tracking
             if option_data in self.open_positions:
                 del self.open_positions[option_data]
-            
-            self.contracts_sold = max(0, self.contracts_sold - abs(position.size))
     
     def check_option_expirations(self):
         '''Check for option expirations and handle assignment'''
@@ -314,16 +428,18 @@ class MSFTPutSellingStrategy(OptionStrategy):
         if hasattr(option_data, 'strike'):
             strike = option_data.strike
             current_price = self.current_price
+            contracts = abs(position.size)
             
             # For put options, we get assigned if stock price < strike (ITM)
             if current_price < strike:
                 # We're assigned - must buy stock at strike price
                 intrinsic_value = strike - current_price
+                total_loss = intrinsic_value * contracts * 100
                 
                 if self.p.debug:
-                    self.log(f"PUT ASSIGNED: Strike ${strike:.2f}, "
+                    self.log(f"PUT ASSIGNED: {contracts} contracts @ Strike ${strike:.2f}, "
                             f"Stock ${current_price:.2f}, "
-                            f"Loss ${intrinsic_value:.2f} per share")
+                            f"Total Loss: ${total_loss:,.2f}")
                 
                 # In a real implementation, we'd receive the stock
                 # For this simulation, we just close the position
@@ -332,14 +448,12 @@ class MSFTPutSellingStrategy(OptionStrategy):
             else:
                 # Option expires worthless (good for us as sellers)
                 if self.p.debug:
-                    self.log(f"PUT EXPIRED WORTHLESS: Strike ${strike:.2f}, "
+                    self.log(f"PUT EXPIRED WORTHLESS: {contracts} contracts @ Strike ${strike:.2f}, "
                             f"Stock ${current_price:.2f} - Full profit!")
             
             # Remove from tracking
             if option_data in self.open_positions:
                 del self.open_positions[option_data]
-            
-            self.contracts_sold = max(0, self.contracts_sold - abs(position.size))
     
     def notify_order(self, order):
         '''Handle order notifications'''
@@ -357,8 +471,12 @@ class MSFTPutSellingStrategy(OptionStrategy):
                         self.open_positions[sale_record['option_data']] = {
                             'entry_price': order.executed.price,
                             'entry_date': self.datas[0].datetime.date(0),
-                            'sale_record': sale_record
+                            'sale_record': sale_record,
+                            'contracts': sale_record['contracts']
                         }
+                        
+                        # Add to active trades for capital tracking
+                        self.active_trades.append(sale_record)
                         break
             
             if self.p.debug:
@@ -380,9 +498,13 @@ class MSFTPutSellingStrategy(OptionStrategy):
     def stop(self):
         '''Called when strategy ends'''
         if self.p.debug:
+            current_total_capital = self.get_current_total_capital()
+            
             self.log('Strategy completed')
             self.log(f'Total puts sold: {len(self.sell_history)}')
-            self.log(f'Final contracts outstanding: {self.contracts_sold}')
+            self.log(f'Final active trades: {len(self.active_trades)}')
+            self.log(f'Final allocated capital: ${self.allocated_capital:,.2f}')
+            self.log(f'Final available capital: ${self.available_capital:,.2f}')
             
             # Calculate total PnL
             total_pnl = 0
@@ -390,20 +512,34 @@ class MSFTPutSellingStrategy(OptionStrategy):
                 if trade.isclosed:
                     total_pnl += trade.pnl
             
+            self.log(f'Initial capital: ${self.initial_capital:,.2f}')
+            self.log(f'Final portfolio value: ${current_total_capital:,.2f}')
             self.log(f'Total PnL: ${total_pnl:.2f}')
-            self.log(f'Final portfolio value: ${self.broker.getvalue():.2f}')
+            
+            # Calculate return on initial capital
+            if self.initial_capital > 0:
+                total_return = ((current_total_capital - self.initial_capital) / self.initial_capital) * 100
+                self.log(f'Total Return: {total_return:.2f}%')
+                
+                # Show credits received from option sales
+                total_credits = 0
+                for sale in self.sell_history:
+                    if sale.get('entry_price'):
+                        total_credits += sale['contracts'] * sale['entry_price'] * 100
+                
+                self.log(f'Total option credits received: ${total_credits:,.2f}')
 
 
-def create_msft_put_option_data(stock_data, strike_prices, expiry_date):
+def create_put_option_data(stock_data, strike_prices, expiry_date, symbol='STOCK'):
     '''Create synthetic put option data for different strikes'''
     option_feeds = []
     
     for strike in strike_prices:
         option_data = SyntheticOptionData(
-            symbol='MSFT',
+            symbol=symbol,
             expiry=expiry_date,
             strike=strike,
-            option_type='put',  # Changed to put options
+            option_type='put',
             underlying_data=stock_data,
             volatility=0.25,  # 25% implied volatility
             risk_free_rate=0.05
@@ -413,25 +549,30 @@ def create_msft_put_option_data(stock_data, strike_prices, expiry_date):
     return option_feeds
 
 
-def run_msft_put_selling_strategy():
-    '''Run the MSFT put selling strategy'''
-    print("MSFT Put Selling Strategy")
+def run_put_selling_strategy(symbol='STOCK', data_file=None, total_capital=100000):
+    '''Run the put selling strategy'''
+    print(f"Put Selling Strategy for {symbol}")
+    print(f"Total Capital: ${total_capital:,.2f}")
     print("=" * 50)
     
     # Create Cerebro engine
     cerebro = bt.Cerebro()
     
-    # Add MSFT stock data (using sample data as proxy)
-    data_path = os.path.join(os.path.dirname(__file__), 
-                            '..', '..', 'datas', '2006-day-001.txt')
-    
-    if os.path.exists(data_path):
-        msft_data = bt.feeds.BacktraderCSVData(dataname=data_path)
+    # Add stock data
+    if data_file:
+        stock_data = bt.feeds.BacktraderCSVData(dataname=data_file)
     else:
-        print("Warning: Sample data file not found, creating minimal data")
-        return
+        # Use default sample data
+        data_path = os.path.join(os.path.dirname(__file__), 
+                                '..', '..', 'datas', '2006-day-001.txt')
+        
+        if os.path.exists(data_path):
+            stock_data = bt.feeds.BacktraderCSVData(dataname=data_path)
+        else:
+            print("Warning: Sample data file not found, specify data_file parameter")
+            return
     
-    cerebro.adddata(msft_data, name='MSFT')
+    cerebro.adddata(stock_data, name=symbol)
     
     # Create put option contracts with different strikes
     # Use strikes below current price for OTM puts (typical for selling)
@@ -439,14 +580,14 @@ def run_msft_put_selling_strategy():
     base_price = 100  # Assuming stock around $100
     strike_prices = [85, 90, 95, 100, 105]  # Range including OTM puts
     
-    option_feeds = create_msft_put_option_data(msft_data, strike_prices, expiry_date)
+    option_feeds = create_put_option_data(stock_data, strike_prices, expiry_date, symbol)
     
     for i, option_feed in enumerate(option_feeds):
-        cerebro.adddata(option_feed, name=f'MSFT_Put_{strike_prices[i]}')
+        cerebro.adddata(option_feed, name=f'{symbol}_Put_{strike_prices[i]}')
     
     # Set up options broker with margin requirements for short options
     cerebro.broker = OptionBroker()
-    cerebro.broker.setcash(100000)  # $100,000 starting capital (need more for selling)
+    cerebro.broker.setcash(total_capital)  # Set the capital amount
     
     # Add options commission (higher for selling due to margin requirements)
     option_comm = EquityOptionCommissionInfo(
@@ -456,16 +597,18 @@ def run_msft_put_selling_strategy():
     )
     
     for i, strike in enumerate(strike_prices):
-        cerebro.broker.addcommissioninfo(option_comm, name=f'MSFT_Put_{strike}')
+        cerebro.broker.addcommissioninfo(option_comm, name=f'{symbol}_Put_{strike}')
     
     # Add the strategy
     cerebro.addstrategy(
-        MSFTPutSellingStrategy,
-        max_contracts=3,
-        drop_threshold=0.05,  # 5%
-        target_dte=42,        # 6 weeks
-        target_delta=0.30,    # 30 delta
-        profit_target=0.60,   # 60% profit
+        PutSellingStrategy,
+        total_capital=total_capital,  # Pass total capital to strategy
+        capital_fraction=0.333,       # Use 1/3 of capital per trade
+        drop_threshold=0.05,          # 5%
+        target_dte=42,               # 6 weeks
+        target_delta=0.30,           # 30 delta
+        profit_target=0.60,          # 60% profit
+        symbol=symbol,               # Pass symbol to strategy
         debug=True
     )
     
@@ -508,4 +651,9 @@ def run_msft_put_selling_strategy():
 
 
 if __name__ == '__main__':
-    run_msft_put_selling_strategy()
+    # Example usage:
+    # For MSFT with $50k: run_put_selling_strategy('MSFT', 'path/to/msft_data.csv', 50000)
+    # For SPY with $100k: run_put_selling_strategy('SPY', 'path/to/spy_data.csv', 100000)
+    # For default sample data: run_put_selling_strategy()
+    
+    run_put_selling_strategy()
