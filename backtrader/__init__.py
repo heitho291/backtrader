@@ -36,10 +36,18 @@ from .comminfo import *
 from .trade import *
 from .position import *
 
+# Options support
+from .option import *
+from .optionpricing import *
+from .optionstrategy import *
+
 from .store import Store
 
 from . import broker as broker
 from .broker import *
+
+# Options broker
+from .brokers.optionbroker import OptionBroker
 
 from .lineseries import *
 
@@ -66,6 +74,8 @@ from .flt import *
 from . import utils as utils
 
 from . import feeds as feeds
+# Options feeds
+from .feeds import optiondata as optionfeeds
 from . import indicators as indicators
 from . import indicators as ind
 from . import studies as studies
