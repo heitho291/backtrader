@@ -59,7 +59,7 @@ class VCCommInfo(CommInfoBase):
         return abs(size) * price
 
 
-class MetaVCBroker(BrokerBase.__class__):
+class MetaVCBroker(type(BrokerBase)):
     def __init__(cls, name, bases, dct):
         '''Class has already been created ... register'''
         # Initialize the class

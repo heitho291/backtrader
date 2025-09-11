@@ -51,10 +51,10 @@ class St(bt.Strategy):
         pass
 
     def start(self):
-        self.t0 = datetime.datetime.utcnow()
+        self.t0 = datetime.datetime.now(datetime.UTC)
 
     def stop(self):
-        t1 = datetime.datetime.utcnow()
+        t1 = datetime.datetime.now(datetime.UTC)
         print('Duration:', t1 - self.t0)
 
     def prenext(self):

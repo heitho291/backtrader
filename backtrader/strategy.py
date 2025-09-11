@@ -18,8 +18,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 ###############################################################################
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+from __future__ import annotations
 
 import collections
 import copy
@@ -27,9 +26,19 @@ import datetime
 import inspect
 import itertools
 import operator
-
-from .utils.py3 import (filter, keys, integer_types, iteritems, itervalues,
-                        map, MAXINT, string_types, with_metaclass)
+from typing import (
+    Any,
+    Dict,
+    Generator,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    Union,
+)
 
 import backtrader as bt
 from .lineiterator import LineIterator, StrategyBase
@@ -37,11 +46,31 @@ from .lineroot import LineSingle
 from .lineseries import LineSeriesStub
 from .metabase import ItemCollection, findowner
 from .trade import Trade
-from .utils import OrderedDict, AutoOrderedDict, AutoDictList
+from .types import (
+    DateType,
+    NotifyCallback,
+    OrderCallback,
+    Price,
+    StrategyParams,
+    TradeCallback,
+    Volume,
+)
+from .utils import AutoDictList, AutoOrderedDict, OrderedDict
+from .utils.py3 import (
+    MAXINT,
+    filter,
+    integer_types,
+    iteritems,
+    itervalues,
+    keys,
+    map,
+    string_types,
+    with_metaclass,
+)
 
 
-class MetaStrategy(StrategyBase.__class__):
-    _indcol = dict()
+class MetaStrategy(type(StrategyBase)):
+    _indcol: dict[str, type] = {}
 
     def __new__(meta, name, bases, dct):
         # Hack to support original method name for notify_order
@@ -104,7 +133,7 @@ class MetaStrategy(StrategyBase.__class__):
         return _obj, args, kwargs
 
 
-class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
+class Strategy(StrategyBase, metaclass=MetaStrategy):
     '''
     Base class to be subclassed for user defined strategies.
     '''
@@ -412,8 +441,12 @@ class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
 
         self.start()
 
-    def start(self):
-        '''Called right before the backtesting is about to be started.'''
+    def start(self) -> None:
+        """
+        Called right before the backtesting is about to be started.
+        
+        Override this method to perform any initialization before trading begins.
+        """
         pass
 
     def getwriterheaders(self):
@@ -488,8 +521,12 @@ class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
         # change operators back to stage 1 - allows reuse of datas
         self._stage1()
 
-    def stop(self):
-        '''Called right before the backtesting is about to be stopped'''
+    def stop(self) -> None:
+        """
+        Called right before the backtesting is about to be stopped.
+        
+        Override this method to perform any cleanup after trading ends.
+        """
         pass
 
     def set_tradehistory(self, onoff=True):
@@ -735,16 +772,26 @@ class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
         '''
         pass
 
-    def notify_order(self, order):
-        '''
-        Receives an order whenever there has been a change in one
-        '''
+    def notify_order(self, order: Any) -> None:
+        """
+        Receives an order whenever there has been a change in one.
+        
+        Args:
+            order: Order object with updated status
+            
+        Override this method to handle order status changes.
+        """
         pass
 
-    def notify_trade(self, trade):
-        '''
-        Receives a trade whenever there has been a change in one
-        '''
+    def notify_trade(self, trade: Any) -> None:
+        """
+        Receives a trade whenever there has been a change in one.
+        
+        Args:
+            trade: Trade object with updated status
+            
+        Override this method to handle trade status changes.
+        """
         pass
 
     def notify_store(self, msg, *args, **kwargs):
@@ -771,12 +818,22 @@ class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
         '''Cancels the order in the broker'''
         self.broker.cancel(order)
 
-    def buy(self, data=None,
-            size=None, price=None, plimit=None,
-            exectype=None, valid=None, tradeid=0, oco=None,
-            trailamount=None, trailpercent=None,
-            parent=None, transmit=True,
-            **kwargs):
+    def buy(
+        self,
+        data: Optional[Any] = None,
+        size: Optional[Volume] = None,
+        price: Optional[Price] = None,
+        plimit: Optional[Price] = None,
+        exectype: Optional[Any] = None,
+        valid: Optional[DateType] = None,
+        tradeid: int = 0,
+        oco: Optional[Any] = None,
+        trailamount: Optional[Price] = None,
+        trailpercent: Optional[float] = None,
+        parent: Optional[Any] = None,
+        transmit: bool = True,
+        **kwargs: Any,
+    ) -> Any:
         '''Create a buy (long) order and send it to the broker
 
           - ``data`` (default: ``None``)
@@ -940,12 +997,22 @@ class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
 
         return None
 
-    def sell(self, data=None,
-             size=None, price=None, plimit=None,
-             exectype=None, valid=None, tradeid=0, oco=None,
-             trailamount=None, trailpercent=None,
-             parent=None, transmit=True,
-             **kwargs):
+    def sell(
+        self,
+        data: Optional[Any] = None,
+        size: Optional[Volume] = None,
+        price: Optional[Price] = None,
+        plimit: Optional[Price] = None,
+        exectype: Optional[Any] = None,
+        valid: Optional[DateType] = None,
+        tradeid: int = 0,
+        oco: Optional[Any] = None,
+        trailamount: Optional[Price] = None,
+        trailpercent: Optional[float] = None,
+        parent: Optional[Any] = None,
+        transmit: bool = True,
+        **kwargs: Any,
+    ) -> Any:
         '''
         To create a selll (short) order and send it to the broker
 
@@ -970,7 +1037,12 @@ class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
 
         return None
 
-    def close(self, data=None, size=None, **kwargs):
+    def close(
+        self, 
+        data: Optional[Any] = None, 
+        size: Optional[Volume] = None, 
+        **kwargs: Any
+    ) -> Any:
         '''
         Counters a long/short position closing it
 
@@ -1469,7 +1541,7 @@ class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
         return self._sizer.getsizing(data, isbuy=isbuy)
 
 
-class MetaSigStrategy(Strategy.__class__):
+class MetaSigStrategy(type(Strategy)):
 
     def __new__(meta, name, bases, dct):
         # map user defined next to custom to be able to call own method before
@@ -1521,7 +1593,7 @@ class MetaSigStrategy(Strategy.__class__):
         return _obj, args, kwargs
 
 
-class SignalStrategy(with_metaclass(MetaSigStrategy, Strategy)):
+class SignalStrategy(Strategy, metaclass=MetaSigStrategy):
     '''This subclass of ``Strategy`` is meant to to auto-operate using
     **signals**.
 

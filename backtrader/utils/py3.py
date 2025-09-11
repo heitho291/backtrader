@@ -18,116 +18,142 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 ###############################################################################
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+"""
+Python 3.13+ compatibility module.
 
-import itertools
+This module has been modernized to only support Python 3.13+ and provides
+consistent interfaces and utilities for the backtrader library.
+"""
+from __future__ import annotations
+
+import queue
 import sys
+from io import StringIO
+from typing import Any, Dict, Iterator, List, Tuple, Type, TypeVar, Optional
+from urllib.parse import quote as urlquote
+from urllib.request import ProxyHandler, build_opener, install_opener, urlopen
 
-PY2 = sys.version_info.major == 2
+# Windows registry support (optional)
+try:
+    import winreg
+    HKEY_CURRENT_USER = winreg.HKEY_CURRENT_USER
+    HKEY_LOCAL_MACHINE = winreg.HKEY_LOCAL_MACHINE
+    OpenKey = winreg.OpenKey
+    QueryValueEx = winreg.QueryValueEx
+except ImportError:
+    winreg = None  # type: ignore[assignment]
+    HKEY_CURRENT_USER = None  # type: ignore[assignment]
+    HKEY_LOCAL_MACHINE = None  # type: ignore[assignment]
+    OpenKey = None  # type: ignore[assignment]
+    QueryValueEx = None  # type: ignore[assignment]
 
+# Windows error handling
+try:
+    WindowsError = WindowsError  # type: ignore[name-defined,misc]
+except NameError:
+    # On non-Windows systems, define a stub
+    class WindowsError(OSError):
+        pass
 
-if PY2:
-    try:
-        import _winreg as winreg
-    except ImportError:
-        winreg = None
+# Python 3.13+ constants
+MAXINT = sys.maxsize
+MININT = -sys.maxsize - 1
+MAXFLOAT = sys.float_info.max
+MINFLOAT = sys.float_info.min
 
-    MAXINT = sys.maxint
-    MININT = -sys.maxint - 1
+# Type definitions for Python 3.13+
+string_types = (str,)
+integer_types = (int,)
 
-    MAXFLOAT = sys.float_info.max
-    MINFLOAT = sys.float_info.min
-
-    string_types = str, unicode
-    integer_types = int, long
-
-    filter = itertools.ifilter
-    map = itertools.imap
-    range = xrange
-    zip = itertools.izip
-    long = long
-
-    cmp = cmp
-
-    bytes = bytes
-    bstr = bytes
-
-    from io import StringIO
-
-    from urllib2 import urlopen, ProxyHandler, build_opener, install_opener
-    from urllib import quote as urlquote
-
-    def iterkeys(d): return d.iterkeys()
-
-    def itervalues(d): return d.itervalues()
-
-    def iteritems(d): return d.iteritems()
-
-    def keys(d): return d.keys()
-
-    def values(d): return d.values()
-
-    def items(d): return d.items()
-
-    import Queue as queue
-
-else:
-    try:
-        import winreg
-    except ImportError:
-        winreg = None
-
-    MAXINT = sys.maxsize
-    MININT = -sys.maxsize - 1
-
-    MAXFLOAT = sys.float_info.max
-    MINFLOAT = sys.float_info.min
-
-    string_types = str,
-    integer_types = int,
-
-    filter = filter
-    map = map
-    range = range
-    zip = zip
-    long = int
-
-    def cmp(a, b): return (a > b) - (a < b)
-
-    def bytes(x): return x.encode('utf-8')
-
-    def bstr(x): return str(x)
-
-    from io import StringIO
-
-    from urllib.request import (urlopen, ProxyHandler, build_opener,
-                                install_opener)
-    from urllib.parse import quote as urlquote
-
-    def iterkeys(d): return iter(d.keys())
-
-    def itervalues(d): return iter(d.values())
-
-    def iteritems(d): return iter(d.items())
-
-    def keys(d): return list(d.keys())
-
-    def values(d): return list(d.values())
-
-    def items(d): return list(d.items())
-
-    import queue as queue
+# Built-in functions (no need for compatibility layer)
+filter = filter
+map = map
+range = range
+zip = zip
+long = int
 
 
-# This is from Armin Ronacher from Flash simplified later by six
-def with_metaclass(meta, *bases):
-    """Create a base class with a metaclass."""
-    # This requires a bit of explanation: the basic idea is to make a dummy
-    # metaclass for one level of class instantiation that replaces itself with
-    # the actual metaclass.
-    class metaclass(meta):
+def cmp(a: Any, b: Any) -> int:
+    """Compare two values and return -1, 0, or 1."""
+    return int((a > b) - (a < b))
 
-        def __new__(cls, name, this_bases, d):
-            return meta(name, bases, d)
-    return type.__new__(metaclass, str('temporary_class'), (), {})
+
+def bytes_func(x: str) -> bytes:
+    """Convert string to bytes using UTF-8 encoding."""
+    return x.encode('utf-8')
+
+
+def bstr(x: Any) -> str:
+    """Convert any object to string."""
+    return str(x)
+
+
+# Dictionary iteration helpers
+_T = TypeVar('_T')
+_K = TypeVar('_K')
+_V = TypeVar('_V')
+
+
+def iterkeys(d: Dict[_K, _V]) -> Iterator[_K]:
+    """Iterate over dictionary keys."""
+    return iter(d.keys())
+
+
+def itervalues(d: Dict[_K, _V]) -> Iterator[_V]:
+    """Iterate over dictionary values."""
+    return iter(d.values())
+
+
+def iteritems(d: Dict[_K, _V]) -> Iterator[Tuple[_K, _V]]:
+    """Iterate over dictionary items."""
+    return iter(d.items())
+
+
+def keys(d: Dict[_K, _V]) -> List[_K]:
+    """Get dictionary keys as a list."""
+    return list(d.keys())
+
+
+def values(d: Dict[_K, _V]) -> List[_V]:
+    """Get dictionary values as a list."""
+    return list(d.values())
+
+
+def items(d: Dict[_K, _V]) -> List[Tuple[_K, _V]]:
+    """Get dictionary items as a list."""
+    return list(d.items())
+
+
+# Modern Python 3.13+ metaclass utilities
+
+
+def with_metaclass(meta: Type[type], *bases: Type[Any]) -> Type[Any]:
+    """
+    Create a base class with a metaclass - modernized for Python 3.13+.
+    
+    This function creates a temporary metaclass that will be replaced
+    by the actual metaclass during class creation. This provides
+    compatibility for the existing codebase while maintaining type safety.
+    
+    Args:
+        meta: The metaclass to use
+        *bases: Base classes for the new class
+        
+    Returns:
+        A temporary class that will use the specified metaclass
+    """
+    class metaclass(meta):  # type: ignore[misc,valid-type]
+        def __new__(cls, name: str, this_bases: Tuple[Type[Any], ...], d: Dict[str, Any]) -> Type[Any]:
+            if this_bases is None:
+                # First pass - creating the temporary class
+                return type.__new__(cls, name, (), d)
+            # Second pass - create the actual class with the target metaclass
+            return meta(name, bases, d)  # type: ignore[misc]
+        
+        @classmethod
+        def __prepare__(cls, name: str, this_bases: Tuple[Type[Any], ...]) -> Dict[str, Any]:
+            if hasattr(meta, '__prepare__'):
+                return meta.__prepare__(name, bases)  # type: ignore[misc,return-value]
+            return {}
+    
+    return type.__new__(metaclass, 'temporary_class', (), {})

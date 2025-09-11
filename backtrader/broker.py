@@ -22,8 +22,7 @@ from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
 from backtrader.comminfo import CommInfoBase
-from backtrader.metabase import MetaParams
-from backtrader.utils.py3 import with_metaclass
+from backtrader.metabase import MetaParams, ParamsBase
 
 from . import fillers as fillers
 from . import fillers as filler
@@ -46,7 +45,7 @@ class MetaBroker(MetaParams):
                 setattr(cls, name, getattr(cls, trans))
 
 
-class BrokerBase(with_metaclass(MetaBroker, object)):
+class BrokerBase(ParamsBase, metaclass=MetaBroker):
     params = (
         ('commission', CommInfoBase(percabs=True)),
     )

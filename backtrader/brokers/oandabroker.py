@@ -49,7 +49,7 @@ class OandaCommInfo(CommInfoBase):
         return abs(size) * price
 
 
-class MetaOandaBroker(BrokerBase.__class__):
+class MetaOandaBroker(type(BrokerBase)):
     def __init__(cls, name, bases, dct):
         '''Class has already been created ... register'''
         # Initialize the class

@@ -23,11 +23,10 @@ from __future__ import (absolute_import, division, print_function,
 
 import datetime
 
-from .utils.py3 import with_metaclass
-from .metabase import MetaParams
+from .metabase import MetaParams, ParamsBase
 
 
-class CommInfoBase(with_metaclass(MetaParams)):
+class CommInfoBase(ParamsBase, metaclass=MetaParams):
     '''Base Class for the Commission Schemes.
 
     Params:

@@ -32,7 +32,7 @@ from backtrader.metabase import MetaParams
 from backtrader.stores import ibstore
 
 
-class MetaIBData(DataBase.__class__):
+class MetaIBData(type(DataBase)):
     def __init__(cls, name, bases, dct):
         '''Class has already been created ... register'''
         # Initialize the class
@@ -453,7 +453,7 @@ class IBData(with_metaclass(MetaIBData, DataBase)):
                         return None  # indicate timeout situation
 
                     # Awaiting data and nothing came in - fake it up until now
-                    dtend = self.num2date(date2num(datetime.datetime.utcnow()))
+                    dtend = self.num2date(date2num(datetime.datetime.now(datetime.UTC)))
                     dtbegin = None
                     if len(self) > 1:
                         dtbegin = self.num2date(self.datetime[-1])

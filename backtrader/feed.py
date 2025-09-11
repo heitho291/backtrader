@@ -38,8 +38,8 @@ from .resamplerfilter import Resampler, Replayer
 from .tradingcal import PandasMarketCalendar
 
 
-class MetaAbstractDataBase(dataseries.OHLCDateTime.__class__):
-    _indcol = dict()
+class MetaAbstractDataBase(type(dataseries.OHLCDateTime)):
+    _indcol: dict[str, type] = {}
 
     def __init__(cls, name, bases, dct):
         '''
@@ -119,8 +119,7 @@ class MetaAbstractDataBase(dataseries.OHLCDateTime.__class__):
         return _obj, args, kwargs
 
 
-class AbstractDataBase(with_metaclass(MetaAbstractDataBase,
-                                      dataseries.OHLCDateTime)):
+class AbstractDataBase(dataseries.OHLCDateTime, metaclass=MetaAbstractDataBase):
 
     params = (
         ('dataname', None),
@@ -600,7 +599,7 @@ class DataBase(AbstractDataBase):
     pass
 
 
-class FeedBase(with_metaclass(metabase.MetaParams, object)):
+class FeedBase(metaclass=metabase.MetaParams):
     params = () + DataBase.params._gettuple()
 
     def __init__(self):
@@ -634,7 +633,7 @@ class FeedBase(with_metaclass(metabase.MetaParams, object)):
         return self.DataCls(**kwargs)
 
 
-class MetaCSVDataBase(DataBase.__class__):
+class MetaCSVDataBase(type(DataBase)):
     def dopostinit(cls, _obj, *args, **kwargs):
         # Before going to the base class to make sure it overrides the default
         if not _obj.p.name and not _obj._name:
@@ -646,7 +645,7 @@ class MetaCSVDataBase(DataBase.__class__):
         return _obj, args, kwargs
 
 
-class CSVDataBase(with_metaclass(MetaCSVDataBase, DataBase)):
+class CSVDataBase(DataBase, metaclass=MetaCSVDataBase):
     '''
     Base class for classes implementing CSV DataFeeds
 

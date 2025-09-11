@@ -104,7 +104,7 @@ class Trades(Observer):
                 self.lines.pnlminus[0] = pnl
 
 
-class MetaDataTrades(Observer.__class__):
+class MetaDataTrades(type(Observer)):
     def donew(cls, *args, **kwargs):
         _obj, args, kwargs = super(MetaDataTrades, cls).donew(*args, **kwargs)
 
@@ -141,7 +141,7 @@ class MetaDataTrades(Observer.__class__):
         return _obj, args, kwargs  # return the instantiated object and args
 
 
-class DataTrades(with_metaclass(MetaDataTrades, Observer)):
+class DataTrades(Observer, metaclass=MetaDataTrades):
     _stclock = True
 
     params = (('usenames', True),)

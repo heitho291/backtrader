@@ -21,12 +21,10 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
-from .utils.py3 import with_metaclass
-
-from .metabase import MetaParams
+from .metabase import ParamsBase
 
 
-class Sizer(with_metaclass(MetaParams, object)):
+class Sizer(ParamsBase):
     '''This is the base class for *Sizers*. Any *sizer* should subclass this
     and override the ``_getsizing`` method
 

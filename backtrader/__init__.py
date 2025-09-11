@@ -26,6 +26,40 @@ from .version import __version__, __btversion__
 from .errors import *
 from . import errors as errors
 
+# Modern typing support
+from . import types as types
+from .types import (
+    # Core types
+    Numeric, Price, Volume, Percentage,
+    DateType, TimeType, TimeDelta,
+    
+    # Order types
+    OrderStatus, OrderType, OrderExecution, BuySell,
+    OrderData,
+    
+    # Data types
+    OHLCV, TimeFrameType, Compression, BarData, DataFeedConfig,
+    
+    # Strategy types
+    ParameterDict, StrategyParams, PositionData,
+    
+    # Configuration
+    CerebroConfig,
+    
+    # Trade types
+    TradeData, PerformanceMetrics,
+    
+    # Protocols for type checking
+    Datasource, Broker, Strategy as StrategyProtocol, 
+    Indicator as IndicatorProtocol, Observer as ObserverProtocol,
+    Analyzer as AnalyzerProtocol,
+    
+    # Function types
+    StrategyClass, IndicatorClass, ObserverClass, AnalyzerClass,
+    OrderCallback, TradeCallback, NotifyCallback,
+    OptimizationResult, OptimizationCallback,
+)
+
 from .utils import num2date, date2num, time2num, num2time
 
 from .linebuffer import *
@@ -36,7 +70,7 @@ from .comminfo import *
 from .trade import *
 from .position import *
 
-from .store import Store
+from .store import *
 
 from . import broker as broker
 from .broker import *

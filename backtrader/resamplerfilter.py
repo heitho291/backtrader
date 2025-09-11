@@ -25,7 +25,6 @@ from __future__ import (absolute_import, division, print_function,
 from datetime import datetime, date, timedelta
 
 from .dataseries import TimeFrame, _Bar
-from .utils.py3 import with_metaclass
 from . import metabase
 from .utils.date import date2num, num2date
 
@@ -52,7 +51,7 @@ class DTFaker(object):
         self.p = self
 
         if forcedata is None:
-            _dtime = datetime.utcnow() + data._timeoffset()
+            _dtime = datetime.now(datetime.UTC) + data._timeoffset()
             self._dt = dt = date2num(_dtime)  # utc-like time
             self._dtime = data.num2date(dt)  # localized time
         else:
@@ -93,7 +92,7 @@ class DTFaker(object):
         return self.data._getnexteos()
 
 
-class _BaseResampler(with_metaclass(metabase.MetaParams, object)):
+class _BaseResampler(metabase.ParamsBase, metaclass=metabase.MetaParams):
     params = (
         ('bar2edge', True),
         ('adjbartime', True),

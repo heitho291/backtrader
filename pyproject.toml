@@ -1,0 +1,184 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["backtrader*"]
+exclude = ["tests*", "examples*", "samples*", "contrib*", "datas*"]
+
+[project]
+name = "backtrader"
+dynamic = ["version"]
+description = "BackTesting Engine"
+readme = "README.rst"
+license = "GPL-3.0-or-later"
+authors = [
+    {name = "Daniel Rodriguez", email = "danjrod@gmail.com"}
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Topic :: Software Development",
+    "Topic :: Office/Business :: Financial",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Operating System :: OS Independent",
+]
+keywords = ["trading", "development"]
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.11.0",
+    "typing-extensions>=4.12.0",
+]
+
+[project.optional-dependencies]
+plotting = [
+    "matplotlib>=3.8.0",
+]
+pandas = [
+    "pandas>=2.2.0",
+]
+talib = [
+    "TA-Lib>=0.4.28",
+]
+brokers = [
+    "ibapi>=9.81.1",
+    "oandapyV20>=0.6.3",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=24.0.0",
+    "isort>=5.13.0",
+    "ruff>=0.6.0",
+    "mypy>=1.12.0",
+    "pyright>=1.1.380",
+    "build>=1.0.0",
+    "twine>=4.0.0",
+    "pydantic>=2.11.0",
+    "typing-extensions>=4.12.0",
+]
+test = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-xdist>=3.5.0",
+    "pytest-mock>=3.12.0",
+]
+docs = [
+    "sphinx>=7.2.0",
+    "sphinx-rtd-theme>=2.0.0",
+]
+all = [
+    "matplotlib>=3.8.0",
+    "pandas>=2.2.0",
+    "TA-Lib>=0.4.28",
+    "ibapi>=9.81.1",
+    "oandapyV20>=0.6.3",
+]
+
+[project.scripts]
+btrun = "backtrader.btrun:btrun"
+
+[project.urls]
+Homepage = "https://github.com/mementum/backtrader"
+Documentation = "http://www.backtrader.com/docu"
+Repository = "https://github.com/mementum/backtrader"
+"Bug Reports" = "https://github.com/mementum/backtrader/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-cov>=7.0.0",
+    "types-python-dateutil>=2.9.0.20250822",
+    "types-pytz>=2025.2.0.20250809",
+]
+
+[tool.black]
+line-length = 88
+target-version = ['py313']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["backtrader"]
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # Gradually enable this
+ignore_missing_imports = true
+strict_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+check_untyped_defs = true
+no_implicit_reexport = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = "backtrader.types"
+disallow_untyped_defs = true
+disallow_any_generics = true
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "B",  # flake8-bugbear
+    "C4", # flake8-comprehensions
+    "UP", # pyupgrade
+    "RUF100", # Unused noqa
+]
+ignore = []
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.ruff.isort]
+known-first-party = ["backtrader"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.coverage.run]
+source = ["backtrader"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "setup.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+]

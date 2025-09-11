@@ -25,7 +25,7 @@ from __future__ import (absolute_import, division, print_function,
 from datetime import datetime, timedelta, time
 
 from .metabase import MetaParams
-from backtrader.utils.py3 import string_types, with_metaclass
+from backtrader.utils.py3 import string_types
 from backtrader.utils import UTC
 
 __all__ = ['TradingCalendarBase', 'TradingCalendar', 'PandasMarketCalendar']
@@ -44,7 +44,7 @@ ISOWEEKEND = [ISOSATURDAY, ISOSUNDAY]
 ONEDAY = timedelta(days=1)
 
 
-class TradingCalendarBase(with_metaclass(MetaParams, object)):
+class TradingCalendarBase(metaclass=MetaParams):
     def _nextday(self, day):
         '''
         Returns the next trading day (datetime/date instance) after ``day``

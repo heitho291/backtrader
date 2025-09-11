@@ -65,13 +65,13 @@ class VChartFile(bt.Store):
         for rkey in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE,):
             try:
                 vckey = winreg.OpenKey(rkey, VC_KEYNAME)
-            except WindowsError as e:
+            except (OSError, FileNotFoundError) as e:
                 continue
 
             # Try to get the key value
             try:
                 vcdir, _ = winreg.QueryValueEx(vckey, VC_KEYVAL)
-            except WindowsError as e:
+            except (OSError, FileNotFoundError) as e:
                 continue
             else:
                 break  # found vcdir

@@ -44,7 +44,7 @@ bytes = bstr  # py2/3 need for ibpy
 def _ts2dt(tstamp=None):
     # Transforms a RTVolume timestamp to a datetime object
     if not tstamp:
-        return datetime.utcnow()
+        return datetime.now(datetime.UTC)
 
     sec, msec = divmod(long(tstamp), 1000)
     usec = msec * 1000
@@ -968,7 +968,7 @@ class IBStore(with_metaclass(MetaSingleton, object)):
                 else:
                     dteosutc = dteos
 
-                if dteosutc <= datetime.utcnow():
+                if dteosutc <= datetime.now(datetime.UTC):
                     dt = dteosutc
 
                 msg.date = dt

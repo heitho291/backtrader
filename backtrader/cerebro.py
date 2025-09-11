@@ -18,46 +18,82 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 ###############################################################################
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+from __future__ import annotations
 
-import datetime
 import collections
+import datetime
 import itertools
 import multiprocessing
-
-try:  # For new Python versions
-    collectionsAbc = collections.abc  # collections.Iterable -> collections.abc.Iterable
-except AttributeError:  # For old Python versions
-    collectionsAbc = collections  # Используем collections.Iterable
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    Union,
+)
 
 import backtrader as bt
-from .utils.py3 import (map, range, zip, with_metaclass, string_types,
-                        integer_types)
+from .types import (
+    AnalyzerClass,
+    CerebroConfig,
+    DateType,
+    IndicatorClass,
+    NotifyCallback,
+    ObserverClass,
+    OptimizationResult,
+    StrategyClass,
+    StrategyType,
+    T,
+)
+from .utils.py3 import (
+    integer_types,
+    map,
+    range,
+    string_types,
+    with_metaclass,
+    zip,
+)
 
-from . import linebuffer
 from . import indicator
-from .brokers import BackBroker
-from .metabase import MetaParams
+from . import linebuffer
 from . import observers
-from .writer import WriterFile
-from .utils import OrderedDict, tzparse, num2date, date2num
-from .strategy import Strategy, SignalStrategy
-from .tradingcal import (TradingCalendarBase, TradingCalendar,
-                         PandasMarketCalendar)
+from .brokers import BackBroker
+from .metabase import MetaParams, ParamsBase
+from .strategy import SignalStrategy, Strategy
 from .timer import Timer
+from .tradingcal import (
+    PandasMarketCalendar,
+    TradingCalendar,
+    TradingCalendarBase,
+)
+from .utils import OrderedDict, date2num, num2date, tzparse
+from .writer import WriterFile
 
 # Defined here to make it pickable. Ideally it could be defined inside Cerebro
 
 
-class OptReturn(object):
-    def __init__(self, params, **kwargs):
+class OptReturn:
+    """
+    Container for optimization results.
+    
+    This class holds the parameters and results from strategy optimization runs.
+    It's defined at module level to make it picklable for multiprocessing.
+    """
+    
+    def __init__(self, params: Any, **kwargs: Any) -> None:
         self.p = self.params = params
         for k, v in kwargs.items():
             setattr(self, k, v)
 
 
-class Cerebro(with_metaclass(MetaParams, object)):
+class Cerebro(ParamsBase, metaclass=MetaParams):
     '''Params:
 
       - ``preload`` (default: ``True``)
@@ -293,118 +329,107 @@ class Cerebro(with_metaclass(MetaParams, object)):
         ('quicknotify', False),
     )
 
-    def __init__(self):
-        self._dolive = False
-        self._doreplay = False
-        self._dooptimize = False
-        self.stores = list()
-        self.feeds = list()
-        self.datas = list()
-        self.datasbyname = collections.OrderedDict()
-        self.strats = list()
-        self.optcbs = list()  # holds a list of callbacks for opt strategies
-        self.observers = list()
-        self.analyzers = list()
-        self.indicators = list()
-        self.sizers = dict()
-        self.writers = list()
-        self.storecbs = list()
-        self.datacbs = list()
-        self.signals = list()
-        self._signal_strat = (None, None, None)
-        self._signal_concurrent = False
-        self._signal_accumulate = False
+    def __init__(self) -> None:
+        # Control flags for execution modes
+        self._dolive: bool = False
+        self._doreplay: bool = False
+        self._dooptimize: bool = False
+        
+        # Storage containers for trading components
+        self.stores: List[Any] = []
+        self.feeds: List[Any] = []
+        self.datas: List[Any] = []
+        self.datasbyname: collections.OrderedDict[str, Any] = collections.OrderedDict()
+        self.strats: List[Tuple[StrategyClass, Tuple[Any, ...], Dict[str, Any]]] = []
+        self.optcbs: List[NotifyCallback] = []  # callbacks for opt strategies
+        self.observers: List[Tuple[ObserverClass, Tuple[Any, ...], Dict[str, Any]]] = []
+        self.analyzers: List[Tuple[AnalyzerClass, Tuple[Any, ...], Dict[str, Any]]] = []
+        self.indicators: List[Tuple[IndicatorClass, Tuple[Any, ...], Dict[str, Any]]] = []
+        self.sizers: Dict[int, Tuple[Type[Any], Tuple[Any, ...], Dict[str, Any]]] = {}
+        self.writers: List[Any] = []
+        self.storecbs: List[NotifyCallback] = []
+        self.datacbs: List[NotifyCallback] = []
+        self.signals: List[Tuple[Any, ...]] = []
+        self._signal_strat: Tuple[Optional[Any], Optional[Any], Optional[Any]] = (None, None, None)
+        self._signal_concurrent: bool = False
+        self._signal_accumulate: bool = False
 
-        self._dataid = itertools.count(1)
+        # Data management
+        self._dataid: Iterator[int] = itertools.count(1)
 
-        self._broker = BackBroker()
+        # Broker setup
+        self._broker: BackBroker = BackBroker()
         self._broker.cerebro = self
 
-        self._tradingcal = None  # TradingCalendar()
+        # Calendar and timing
+        self._tradingcal: Optional[TradingCalendarBase] = None
 
-        self._pretimers = list()
-        self._ohistory = list()
-        self._fhistory = None
+        # Timer and history management
+        self._pretimers: List[Timer] = []
+        self._ohistory: List[Tuple[Iterable[Any], bool]] = []
+        self._fhistory: Optional[Iterable[Sequence[Union[DateType, float]]]] = None
 
     @staticmethod
-    def iterize(iterable):
-        '''Handy function which turns things into things that can be iterated upon
-        including iterables
-        '''
-        niterable = list()
+    def iterize(iterable: Iterable[Any]) -> List[Tuple[Any, ...]]:
+        """
+        Handy function which turns things into things that can be iterated upon
+        including iterables.
+        
+        Args:
+            iterable: Input iterable to normalize
+            
+        Returns:
+            List of tuples ensuring all elements are iterable
+        """
+        niterable: List[Tuple[Any, ...]] = []
         for elem in iterable:
             if isinstance(elem, string_types):
                 elem = (elem,)
-            elif not isinstance(elem, collectionsAbc.Iterable):  # Different functions will be called for different Python versions
+            elif not isinstance(elem, collections.abc.Iterable):
                 elem = (elem,)
 
             niterable.append(elem)
 
         return niterable
 
-    def set_fund_history(self, fund):
-        '''
-        Add a history of orders to be directly executed in the broker for
-        performance evaluation
+    def set_fund_history(self, fund: Iterable[Sequence[Union[DateType, float]]]) -> None:
+        """
+        Add a history of fund values for performance evaluation.
 
-          - ``fund``: is an iterable (ex: list, tuple, iterator, generator)
-            in which each element will be also an iterable (with length) with
-            the following sub-elements (2 formats are possible)
-
-            ``[datetime, share_value, net asset value]``
-
-            **Note**: it must be sorted (or produce sorted elements) by
-              datetime ascending
-
-            where:
-
-              - ``datetime`` is a python ``date/datetime`` instance or a string
-                with format YYYY-MM-DD[THH:MM:SS[.us]] where the elements in
-                brackets are optional
-              - ``share_value`` is an float/integer
-              - ``net_asset_value`` is a float/integer
-        '''
+        Args:
+            fund: Iterable of sequences containing [datetime, share_value, net_asset_value]
+                  Must be sorted by datetime ascending.
+                  
+                  - datetime: date/datetime instance or string in format YYYY-MM-DD[THH:MM:SS[.us]]
+                  - share_value: float/integer representing share value
+                  - net_asset_value: float/integer representing net asset value
+        """
         self._fhistory = fund
 
-    def add_order_history(self, orders, notify=True):
-        '''
+    def add_order_history(
+        self, 
+        orders: Iterable[Sequence[Union[DateType, int, float, str, None]]], 
+        notify: bool = True
+    ) -> None:
+        """
         Add a history of orders to be directly executed in the broker for
-        performance evaluation
+        performance evaluation.
 
-          - ``orders``: is an iterable (ex: list, tuple, iterator, generator)
-            in which each element will be also an iterable (with length) with
-            the following sub-elements (2 formats are possible)
+        Args:
+            orders: Iterable of order sequences in format:
+                   [datetime, size, price] or [datetime, size, price, data]
+                   Must be sorted by datetime ascending.
+                   
+                   - datetime: date/datetime instance or string in format YYYY-MM-DD[THH:MM:SS[.us]]
+                   - size: integer (positive to buy, negative to sell)
+                   - price: float/integer order price
+                   - data: Optional target data (None, int index, or string name)
+                   
+            notify: If True, notify the first strategy of artificial orders
 
-            ``[datetime, size, price]`` or ``[datetime, size, price, data]``
-
-            **Note**: it must be sorted (or produce sorted elements) by
-              datetime ascending
-
-            where:
-
-              - ``datetime`` is a python ``date/datetime`` instance or a string
-                with format YYYY-MM-DD[THH:MM:SS[.us]] where the elements in
-                brackets are optional
-              - ``size`` is an integer (positive to *buy*, negative to *sell*)
-              - ``price`` is a float/integer
-              - ``data`` if present can take any of the following values
-
-                - *None* - The 1st data feed will be used as target
-                - *integer* - The data with that index (insertion order in
-                  **Cerebro**) will be used
-                - *string* - a data with that name, assigned for example with
-                  ``cerebro.addata(data, name=value)``, will be the target
-
-          - ``notify`` (default: *True*)
-
-            If ``True`` the 1st strategy inserted in the system will be
-            notified of the artificial orders created following the information
-            from each order in ``orders``
-
-        **Note**: Implicit in the description is the need to add a data feed
-          which is the target of the orders. This is for example needed by
-          analyzers which track for example the returns
-        '''
+        Note:
+            Requires adding a target data feed for analyzers that track returns.
+        """
         self._ohistory.append((orders, notify))
 
     def notify_timer(self, timer, when, *args, **kwargs):
@@ -672,7 +697,7 @@ class Cerebro(with_metaclass(MetaParams, object)):
 
         The signature of the callback must support the following:
 
-          - callback(msg, \*args, \*\*kwargs)
+          - callback(msg, *args, **kwargs)
 
         The actual ``msg``, ``*args`` and ``**kwargs`` received are
         implementation defined (depend entirely on the *data/broker/store*) but
@@ -714,7 +739,7 @@ class Cerebro(with_metaclass(MetaParams, object)):
 
         The signature of the callback must support the following:
 
-          - callback(data, status, \*args, \*\*kwargs)
+          - callback(data, status, *args, **kwargs)
 
         The actual ``*args`` and ``**kwargs`` received are implementation
         defined (depend entirely on the *data/broker/store*) but in general one
@@ -749,13 +774,17 @@ class Cerebro(with_metaclass(MetaParams, object)):
         '''
         pass
 
-    def adddata(self, data, name=None):
-        '''
-        Adds a ``Data Feed`` instance to the mix.
+    def adddata(self, data: Any, name: Optional[str] = None) -> Any:
+        """
+        Adds a Data Feed instance to the cerebro engine.
 
-        If ``name`` is not None it will be put into ``data._name`` which is
-        meant for decoration/plotting purposes.
-        '''
+        Args:
+            data: Data feed instance to add
+            name: Optional name for decoration/plotting purposes
+            
+        Returns:
+            The added data feed instance
+        """
         if name is not None:
             data._name = name
 
@@ -905,35 +934,46 @@ class Cerebro(with_metaclass(MetaParams, object)):
         it = itertools.product([strategy], optargs, optkwargs)
         self.strats.append(it)
 
-    def addstrategy(self, strategy, *args, **kwargs):
-        '''
-        Adds a ``Strategy`` class to the mix for a single pass run.
-        Instantiation will happen during ``run`` time.
+    def addstrategy(self, strategy: StrategyClass, *args: Any, **kwargs: Any) -> int:
+        """
+        Adds a Strategy class to the mix for a single pass run.
+        Instantiation will happen during run time.
 
-        args and kwargs will be passed to the strategy as they are during
-        instantiation.
+        Args:
+            strategy: Strategy class to add
+            *args: Positional arguments passed to strategy during instantiation
+            **kwargs: Keyword arguments passed to strategy during instantiation
 
-        Returns the index with which addition of other objects (like sizers)
-        can be referenced
-        '''
+        Returns:
+            Index for referencing when adding other objects (like sizers)
+        """
         self.strats.append([(strategy, args, kwargs)])
         return len(self.strats) - 1
 
-    def setbroker(self, broker):
-        '''
-        Sets a specific ``broker`` instance for this strategy, replacing the
+    def setbroker(self, broker: Any) -> Any:
+        """
+        Sets a specific broker instance for this strategy, replacing the
         one inherited from cerebro.
-        '''
+        
+        Args:
+            broker: Broker instance to set
+            
+        Returns:
+            The broker instance
+        """
         self._broker = broker
         broker.cerebro = self
         return broker
 
-    def getbroker(self):
-        '''
+    def getbroker(self) -> Any:
+        """
         Returns the broker instance.
 
-        This is also available as a ``property`` by the name ``broker``
-        '''
+        This is also available as a property by the name 'broker'.
+        
+        Returns:
+            The current broker instance
+        """
         return self._broker
 
     broker = property(getbroker, setbroker)
@@ -1002,12 +1042,17 @@ class Cerebro(with_metaclass(MetaParams, object)):
 
         return figs
 
-    def __call__(self, iterstrat):
-        '''
-        Used during optimization to pass the cerebro over the multiprocesing
-        module without complains
-        '''
-
+    def __call__(self, iterstrat: Any) -> List[Any]:
+        """
+        Used during optimization to pass cerebro over the multiprocessing
+        module without complaints.
+        
+        Args:
+            iterstrat: Iterator containing strategy configuration
+            
+        Returns:
+            Results from running strategies
+        """
         predata = self.p.optdatas and self._dopreload and self._dorunonce
         return self.runstrategies(iterstrat, predata=predata)
 
@@ -1022,26 +1067,29 @@ class Cerebro(with_metaclass(MetaParams, object)):
             del(rv['runstrats'])
         return rv
 
-    def runstop(self):
-        '''If invoked from inside a strategy or anywhere else, including other
-        threads the execution will stop as soon as possible.'''
+    def runstop(self) -> None:
+        """
+        Signals execution to stop as soon as possible.
+        
+        Can be invoked from inside a strategy or anywhere else, including other threads.
+        """
         self._event_stop = True  # signal a stop has been requested
 
-    def run(self, **kwargs):
-        '''The core method to perform backtesting. Any ``kwargs`` passed to it
-        will affect the value of the standard parameters ``Cerebro`` was
-        instantiated with.
+    def run(self, **kwargs: Any) -> List[Any]:
+        """
+        The core method to perform backtesting.
+        
+        Any kwargs passed will affect the value of the standard parameters
+        Cerebro was instantiated with.
 
-        If ``cerebro`` has not datas the method will immediately bail out.
-
-        It has different return values:
-
-          - For No Optimization: a list contanining instances of the Strategy
-            classes added with ``addstrategy``
-
-          - For Optimization: a list of lists which contain instances of the
-            Strategy classes added with ``addstrategy``
-        '''
+        Args:
+            **kwargs: Parameters to override default cerebro parameters
+            
+        Returns:
+            - For No Optimization: List containing instances of Strategy classes
+            - For Optimization: List of lists containing Strategy class instances
+            - Empty list if no data feeds are available
+        """
         self._event_stop = False  # Stop is requested
 
         if not self.datas:
@@ -1540,9 +1588,9 @@ class Cerebro(with_metaclass(MetaParams, object)):
             # record starting time and tell feeds to discount the elapsed time
             # from the qcheck value
             drets = []
-            qstart = datetime.datetime.utcnow()
+            qstart = datetime.datetime.now(datetime.UTC)
             for d in datas:
-                qlapse = datetime.datetime.utcnow() - qstart
+                qlapse = datetime.datetime.now(datetime.UTC) - qstart
                 d.do_qcheck(newqcheck, qlapse.total_seconds())
                 drets.append(d.next(ticks=False))
 

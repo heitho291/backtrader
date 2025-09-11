@@ -18,17 +18,21 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 ###############################################################################
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+from __future__ import annotations
 
 import calendar
 from collections import OrderedDict
 import datetime
 import pprint as pp
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import backtrader as bt
+from backtrader.utils.autodict import AutoOrderedDict
 from backtrader import TimeFrame
 from backtrader.utils.py3 import MAXINT, with_metaclass
+
+if TYPE_CHECKING:
+    from backtrader.strategy import Strategy
 
 
 class MetaAnalyzer(bt.MetaParams):
@@ -86,7 +90,7 @@ class MetaAnalyzer(bt.MetaParams):
         return _obj, args, kwargs
 
 
-class Analyzer(with_metaclass(MetaAnalyzer, object)):
+class Analyzer(bt.metabase.ParamsBase, metaclass=MetaAnalyzer):
     '''Analyzer base class. All analyzers are subclass of this one
 
     An Analyzer instance operates in the frame of a strategy and provides an
@@ -135,6 +139,14 @@ class Analyzer(with_metaclass(MetaAnalyzer, object)):
     implementation dependent)
 
     '''
+    # Attributes set by metaclass
+    _children: List['Analyzer']
+    strategy: 'Strategy'
+    _parent: Optional['Analyzer']
+    datas: List[Any]  # Data feeds
+    data: Any  # Primary data feed
+    rets: AutoOrderedDict  # Analysis results
+    
     csv = True
 
     def __len__(self):
@@ -286,7 +298,7 @@ class Analyzer(with_metaclass(MetaAnalyzer, object)):
         pp.pprint(self.get_analysis(), *args, **kwargs)
 
 
-class MetaTimeFrameAnalyzerBase(Analyzer.__class__):
+class MetaTimeFrameAnalyzerBase(type(Analyzer)):
     def __new__(meta, name, bases, dct):
         # Hack to support original method name
         if '_on_dt_over' in dct:
@@ -296,13 +308,20 @@ class MetaTimeFrameAnalyzerBase(Analyzer.__class__):
                                                               bases, dct)
 
 
-class TimeFrameAnalyzerBase(with_metaclass(MetaTimeFrameAnalyzerBase,
-                                           Analyzer)):
+class TimeFrameAnalyzerBase(Analyzer, metaclass=MetaTimeFrameAnalyzerBase):
     params = (
         ('timeframe', None),
         ('compression', None),
         ('_doprenext', True),
     )
+    
+    # Additional attributes for time frame analysis
+    timeframe: Any
+    compression: Any
+    dtcmp: Any
+    dtkey: Any
+    dtcmp1: Any
+    dtkey1: Any
 
     def _start(self):
         # Override to add specific attributes

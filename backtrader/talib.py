@@ -62,9 +62,9 @@ else:
 
     # Generate all indicators as subclasses
 
-    class _MetaTALibIndicator(bt.Indicator.__class__):
+    class _MetaTALibIndicator(type(bt.Indicator)):
         _refname = '_taindcol'
-        _taindcol = dict()
+        _taindcol: dict[str, type] = {}
 
         _KNOWN_UNSTABLE = ['SAR']
 
@@ -89,7 +89,7 @@ else:
             _obj._tafunc = getattr(talib, tafuncinfo['name'], None)
             return _obj, args, kwargs  # return the object and args
 
-    class _TALibIndicator(with_metaclass(_MetaTALibIndicator, bt.Indicator)):
+    class _TALibIndicator(bt.Indicator, metaclass=_MetaTALibIndicator):
         CANDLEOVER = 1.02  # 2% over
         CANDLEREF = 1  # Open, High, Low, Close (0, 1, 2, 3)
 

@@ -29,7 +29,7 @@ import backtrader as bt
 from backtrader import date2num  # avoid dict lookups
 
 
-class MetaVChartFile(bt.DataBase.__class__):
+class MetaVChartFile(type(bt.DataBase)):
     def __init__(cls, name, bases, dct):
         '''Class has already been created ... register'''
         # Initialize the class

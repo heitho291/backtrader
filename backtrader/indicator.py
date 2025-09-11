@@ -29,9 +29,9 @@ from .lineseries import LineSeriesMaker, Lines
 from .metabase import AutoInfoClass
 
 
-class MetaIndicator(IndicatorBase.__class__):
+class MetaIndicator(type(IndicatorBase)):
     _refname = '_indcol'
-    _indcol = dict()
+    _indcol: dict[str, type] = {}
 
     _icache = dict()
     _icacheuse = False
@@ -87,7 +87,7 @@ class MetaIndicator(IndicatorBase.__class__):
             cls.oncestart = cls.oncestart_via_nextstart
 
 
-class Indicator(with_metaclass(MetaIndicator, IndicatorBase)):
+class Indicator(IndicatorBase, metaclass=MetaIndicator):
     _ltype = LineIterator.IndType
 
     csv = False
@@ -136,7 +136,7 @@ class Indicator(with_metaclass(MetaIndicator, IndicatorBase)):
             self.next()
 
 
-class MtLinePlotterIndicator(Indicator.__class__):
+class MtLinePlotterIndicator(type(Indicator)):
     def donew(cls, *args, **kwargs):
         lname = kwargs.pop('name')
         name = cls.__name__
@@ -160,5 +160,5 @@ class MtLinePlotterIndicator(Indicator.__class__):
         return _obj, args, kwargs
 
 
-class LinePlotterIndicator(with_metaclass(MtLinePlotterIndicator, Indicator)):
+class LinePlotterIndicator(Indicator, metaclass=MtLinePlotterIndicator):
     pass

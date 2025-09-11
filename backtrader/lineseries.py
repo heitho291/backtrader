@@ -302,7 +302,7 @@ class Lines(object):
         return self.lines[line].buflen()
 
 
-class MetaLineSeries(LineMultiple.__class__):
+class MetaLineSeries(type(LineMultiple)):
     '''
     Dirty job manager for a LineSeries
 
@@ -441,7 +441,7 @@ class MetaLineSeries(LineMultiple.__class__):
         return _obj, args, kwargs
 
 
-class LineSeries(with_metaclass(MetaLineSeries, LineMultiple)):
+class LineSeries(LineMultiple, metaclass=MetaLineSeries):
     plotinfo = dict(
         plot=True,
         plotmaster=None,

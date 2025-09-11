@@ -219,7 +219,7 @@ class OrderData(object):
         return obj
 
 
-class OrderBase(with_metaclass(MetaParams, object)):
+class OrderBase(metaclass=MetaParams):
     params = (
         ('owner', None), ('data', None),
         ('size', None), ('price', None), ('pricelimit', None),

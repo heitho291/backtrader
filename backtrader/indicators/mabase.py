@@ -72,7 +72,7 @@ class MovAv(MovingAverage):
     pass  # alias
 
 
-class MetaMovAvBase(Indicator.__class__):
+class MetaMovAvBase(type(Indicator)):
     # Register any MovingAverage with the placeholder to allow the automatic
     # creation of envelopes and oscillators
 
@@ -86,6 +86,6 @@ class MetaMovAvBase(Indicator.__class__):
         return cls
 
 
-class MovingAverageBase(with_metaclass(MetaMovAvBase, Indicator)):
+class MovingAverageBase(Indicator, metaclass=MetaMovAvBase):
     params = (('period', 30),)
     plotinfo = dict(subplot=False)

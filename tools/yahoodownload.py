@@ -30,13 +30,8 @@ import logging
 import sys
 
 
-PY2 = sys.version_info.major == 2
-if PY2:
-    from urllib2 import urlopen
-    from urllib import quote as urlquote
-else:
-    from urllib.request import urlopen
-    from urllib.parse import quote as urlquote
+from urllib.request import urlopen
+from urllib.parse import quote as urlquote
 
 
 logging.basicConfig(
@@ -60,7 +55,7 @@ class YahooDownload(object):
 
         url = self.urlhist.format(ticker)
 
-        sesskwargs = dict()
+        sesskwargs: dict[str, any] = dict()
         if False and self.p.proxies:
             sesskwargs['proxies'] = self.p.proxies
 

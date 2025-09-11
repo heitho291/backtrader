@@ -35,7 +35,7 @@ from .dataseries import DataSeries
 from . import metabase
 
 
-class MetaLineIterator(LineSeries.__class__):
+class MetaLineIterator(type(LineSeries)):
     def donew(cls, *args, **kwargs):
         _obj, args, kwargs = \
             super(MetaLineIterator, cls).donew(*args, **kwargs)
@@ -145,26 +145,26 @@ class MetaLineIterator(LineSeries.__class__):
         return _obj, args, kwargs
 
 
-class LineIterator(with_metaclass(MetaLineIterator, LineSeries)):
+class LineIterator(LineSeries, metaclass=MetaLineIterator):
     _nextforce = False  # force cerebro to run in next mode (runonce=False)
 
     _mindatas = 1
     _ltype = LineSeries.IndType
 
-    plotinfo = dict(plot=True,
-                    subplot=True,
-                    plotname='',
-                    plotskip=False,
-                    plotabove=False,
-                    plotlinelabels=False,
-                    plotlinevalues=True,
-                    plotvaluetags=True,
-                    plotymargin=0.0,
-                    plotyhlines=[],
-                    plotyticks=[],
-                    plothlines=[],
-                    plotforce=False,
-                    plotmaster=None,)
+    plotinfo: dict = dict(plot=True,
+                         subplot=True,
+                         plotname='',
+                         plotskip=False,
+                         plotabove=False,
+                         plotlinelabels=False,
+                         plotlinevalues=True,
+                         plotvaluetags=True,
+                         plotymargin=0.0,
+                         plotyhlines=[],
+                         plotyticks=[],
+                         plothlines=[],
+                         plotforce=False,
+                         plotmaster=None,)
 
     def _periodrecalc(self):
         # last check in case not all lineiterators were assigned to

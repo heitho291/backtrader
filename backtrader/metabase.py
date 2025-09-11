@@ -18,12 +18,12 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 ###############################################################################
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+from __future__ import annotations
 
 from collections import OrderedDict
 import itertools
 import sys
+from typing import Any, Dict, List, Optional, Tuple, Type, Union, ClassVar
 
 import backtrader as bt
 from .utils.py3 import zip, string_types, with_metaclass
@@ -67,8 +67,8 @@ class MetaBase(type):
     def doprenew(cls, *args, **kwargs):
         return cls, args, kwargs
 
-    def donew(cls, *args, **kwargs):
-        _obj = cls.__new__(cls, *args, **kwargs)
+    def donew(cls, *args: Any, **kwargs: Any) -> Tuple[Any, Tuple[Any, ...], Dict[str, Any]]:
+        _obj: Any = cls.__new__(cls, *args, **kwargs)
         return _obj, args, kwargs
 
     def dopreinit(cls, _obj, *args, **kwargs):
@@ -91,9 +91,9 @@ class MetaBase(type):
 
 
 class AutoInfoClass(object):
-    _getpairsbase = classmethod(lambda cls: OrderedDict())
-    _getpairs = classmethod(lambda cls: OrderedDict())
-    _getrecurse = classmethod(lambda cls: False)
+    _getpairsbase: ClassVar = classmethod(lambda cls: OrderedDict())
+    _getpairs: ClassVar = classmethod(lambda cls: OrderedDict())
+    _getrecurse: ClassVar = classmethod(lambda cls: False)
 
     @classmethod
     def _derive(cls, name, info, otherbases, recurse=False):
@@ -201,6 +201,10 @@ class AutoInfoClass(object):
 
 
 class MetaParams(MetaBase):
+    # Class attributes that may be set by metaclass
+    packages: Tuple[Union[str, Tuple[str, str]], ...] = ()
+    frompackages: Tuple[Union[str, Tuple[str, str]], ...] = ()
+    params: Type[AutoInfoClass] = AutoInfoClass
     def __new__(meta, name, bases, dct):
         # Remove params from class definition to avoid inheritance
         # (and hence "repetition")
@@ -293,7 +297,11 @@ class MetaParams(MetaBase):
         return _obj, args, kwargs
 
 
-class ParamsBase(with_metaclass(MetaParams, object)):
+class ParamsBase(object, metaclass=MetaParams):
+    # Type annotations for dynamically created attributes
+    params: AutoInfoClass
+    p: AutoInfoClass  # shorter alias for params
+    
     pass  # stub to allow easy subclassing without metaclasses
 
 

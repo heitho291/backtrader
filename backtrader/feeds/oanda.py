@@ -31,7 +31,7 @@ from backtrader.metabase import MetaParams
 from backtrader.stores import oandastore
 
 
-class MetaOandaData(DataBase.__class__):
+class MetaOandaData(type(DataBase)):
     def __init__(cls, name, bases, dct):
         '''Class has already been created ... register'''
         # Initialize the class

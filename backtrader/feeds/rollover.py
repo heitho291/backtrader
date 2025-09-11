@@ -27,7 +27,7 @@ from datetime import datetime
 import backtrader as bt
 
 
-class MetaRollOver(bt.DataBase.__class__):
+class MetaRollOver(type(bt.DataBase)):
     def __init__(cls, name, bases, dct):
         '''Class has already been created ... register'''
         # Initialize the class
@@ -45,7 +45,7 @@ class MetaRollOver(bt.DataBase.__class__):
         return _obj, args, kwargs
 
 
-class RollOver(bt.with_metaclass(MetaRollOver, bt.DataBase)):
+class RollOver(bt.DataBase, metaclass=MetaRollOver):
     '''Class that rolls over to the next future when a condition is met
 
     Params:

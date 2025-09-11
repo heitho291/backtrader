@@ -58,7 +58,7 @@ class MetaLineRoot(metabase.MetaParams):
         return _obj, args, kwargs
 
 
-class LineRoot(with_metaclass(MetaLineRoot, object)):
+class LineRoot(object, metaclass=MetaLineRoot):
     '''
     Defines a common base and interfaces for Single and Multiple
     LineXXX instances
@@ -235,11 +235,15 @@ class LineRoot(with_metaclass(MetaLineRoot, object)):
     def __rmul__(self, other):
         return self._roperation(other, operator.__mul__)
 
-    def __div__(self, other):
-        return self._operation(other, operator.__div__)
+    def __truediv__(self, other):
+        return self._operation(other, operator.__truediv__)
 
-    def __rdiv__(self, other):
-        return self._roperation(other, operator.__div__)
+    def __rtruediv__(self, other):
+        return self._roperation(other, operator.__truediv__)
+    
+    # Legacy Python 2 compatibility (for reference)
+    __div__ = __truediv__
+    __rdiv__ = __rtruediv__
 
     def __floordiv__(self, other):
         return self._operation(other, operator.__floordiv__)

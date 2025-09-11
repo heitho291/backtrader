@@ -28,7 +28,7 @@ from datetime import date, datetime, timedelta
 from itertools import islice
 
 from .feed import AbstractDataBase
-from .metabase import MetaParams
+from .metabase import MetaParams, ParamsBase
 from .utils import date2num, num2date
 from .utils.py3 import integer_types, range, with_metaclass
 from .utils import TIME_MAX
@@ -39,7 +39,7 @@ __all__ = ['SESSION_TIME', 'SESSION_START', 'SESSION_END', 'Timer']
 SESSION_TIME, SESSION_START, SESSION_END = range(3)
 
 
-class Timer(with_metaclass(MetaParams, object)):
+class Timer(ParamsBase, metaclass=MetaParams):
     params = (
         ('tid', None),
         ('owner', None),

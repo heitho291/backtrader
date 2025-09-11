@@ -115,10 +115,10 @@ List of built-in Indicators (122)
 
   - `Indicators Reference <http://www.backtrader.com/docu/indautoref.html>`_
 
-Python 2/3 Support
-==================
+Python Support
+==============
 
-  - Python >= ``3.2``
+  - Python >= ``3.13``
 
   - It also works with ``pypy`` and ``pypy3`` (no plotting - ``matplotlib`` is
     not supported under *pypy*)
@@ -127,30 +127,63 @@ Installation
 ============
 
 ``backtrader`` is self-contained with no external dependencies (except if you
-want to plot)
+want to plot). We recommend using ``uv`` for the fastest installation experience.
 
-From *pypi*:
+**Using uv (recommended)**::
 
-  - ``pip install backtrader``
+  # Install uv if you haven't already
+  curl -LsSf https://astral.sh/uv/install.sh | sh
 
-  - ``pip install backtrader[plotting]``
+  # Install backtrader
+  uv add backtrader
 
-    If ``matplotlib`` is not installed and you wish to do some plotting
+  # Or install with optional dependencies
+  uv add "backtrader[plotting]"
+  uv add "backtrader[all]"
 
-.. note:: The minimum matplotlib version is ``1.4.1``
+**Using pip**::
 
-An example for *IB* Data Feeds/Trading:
+  pip install backtrader
+  pip install backtrader[plotting]
 
-  - ``IbPy`` doesn't seem to be in PyPi. Do either::
+.. note:: The minimum matplotlib version is ``3.8.0``
 
-      pip install git+https://github.com/blampe/IbPy.git
+**Optional dependencies with uv**::
 
-    or (if ``git`` is not available in your system)::
+  # For plotting support
+  uv add "backtrader[plotting]"
+  
+  # For pandas data feed support
+  uv add "backtrader[pandas]"
+  
+  # For TA-Lib indicator support
+  uv add "backtrader[talib]"
+  
+  # For live broker support
+  uv add "backtrader[brokers]"
+  
+  # For development
+  uv add "backtrader[dev]"
+  
+  # Install everything
+  uv add "backtrader[all]"
 
-      pip install https://github.com/blampe/IbPy/archive/master.zip
+**Development setup with uv**::
 
-For other functionalities like: ``Visual Chart``, ``Oanda``, ``TA-Lib``, check
-the dependencies in the documentation.
+  # Clone the repository
+  git clone https://github.com/mementum/backtrader.git
+  cd backtrader
+  
+  # Install in development mode with all dependencies
+  uv sync --extra dev --extra all
+
+**For live trading with modern APIs**::
+
+  # Interactive Brokers
+  uv add ibapi
+  
+  # Oanda
+  uv add oandapyV20
 
 From source:
 

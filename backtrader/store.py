@@ -26,6 +26,8 @@ import collections
 from backtrader.metabase import MetaParams
 from backtrader.utils.py3 import with_metaclass
 
+__all__ = ['Store']
+
 
 class MetaSingleton(MetaParams):
     '''Metaclass to make a metaclassed class a singleton'''
@@ -41,7 +43,7 @@ class MetaSingleton(MetaParams):
         return cls._singleton
 
 
-class Store(with_metaclass(MetaSingleton, object)):
+class Store(metaclass=MetaSingleton):
     '''Base class for all Stores'''
 
     _started = False

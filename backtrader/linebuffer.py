@@ -496,7 +496,7 @@ class LineBuffer(LineSingle):
         return num2date(int(self.array[self.idx + ago]) + tm)
 
 
-class MetaLineActions(LineBuffer.__class__):
+class MetaLineActions(type(LineBuffer)):
     '''
     Metaclass for Lineactions
 

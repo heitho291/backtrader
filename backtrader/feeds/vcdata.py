@@ -34,7 +34,7 @@ from backtrader.utils.py3 import (integer_types, queue, string_types,
 from backtrader.stores import vcstore
 
 
-class MetaVCData(DataBase.__class__):
+class MetaVCData(type(DataBase)):
     def __init__(cls, name, bases, dct):
         '''Class has already been created ... register'''
         # Initialize the class
