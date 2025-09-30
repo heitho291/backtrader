@@ -2,6 +2,8 @@ import backtrader as bt
 import yfinance as yf
 import pandas as pd
 
+# Runs a 30 day SMA test for apple stocks for complete 2023
+
 # ---------- 1) Download once ----------
 df = yf.download(
     "AAPL",
@@ -71,3 +73,4 @@ print("Final Portfolio Value:", cerebro.broker.getvalue())
 
 
 cerebro.plot()
+
