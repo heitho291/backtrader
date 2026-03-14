@@ -112,6 +112,15 @@ def parse_args() -> argparse.Namespace:
                    help="Disable support/resist identical-reference dedup check (faster/less memory)")
     p.add_argument("--out-summary", type=Path, default=Path("best_rules_summary.csv"))
     p.add_argument("--out-signals", type=Path, default=Path("signals_best_rules.csv"))
+
+    p.add_argument("--tick-data", type=Path, default=None,
+                   help="Optional tick file (CSV/Parquet) for realistic intrabar sequencing on critical candles")
+    p.add_argument("--tick-cache-parquet", type=Path, default=None,
+                   help="Optional parquet cache path used when --tick-data points to CSV")
+    p.add_argument("--tick-datetime-column", type=str, default="datetime")
+    p.add_argument("--tick-price-column", type=str, default="auto",
+                   help="Price column in tick data; auto tries price/last/close or bid+ask mid")
+    p.add_argument("--tick-sep", type=str, default=",", help="CSV separator for --tick-data when needed")
     return p.parse_args()
 
 
@@ -176,6 +185,71 @@ def load_features(path: Path, tail_rows: int = 0) -> pd.DataFrame:
         if dt != np.float32:
             df[c] = pd.to_numeric(df[c], errors="coerce").astype(np.float32)
     return df
+
+
+def load_tick_minute_map(
+    path: Path,
+    datetime_col: str = "datetime",
+    price_col: str = "auto",
+    sep: str = ",",
+    cache_parquet: Optional[Path] = None,
+) -> Dict[int, np.ndarray]:
+    src = path
+    if str(path).lower().endswith(".csv") and cache_parquet is not None:
+        if cache_parquet.exists():
+            src = cache_parquet
+        else:
+            tmp = cache_parquet.with_suffix(cache_parquet.suffix + ".tmp")
+            tdf = pd.read_csv(path, sep=sep, low_memory=False)
+            tdf.to_parquet(tmp, index=False)
+            tmp.replace(cache_parquet)
+            src = cache_parquet
+
+    if str(src).lower().endswith(".parquet"):
+        tdf = pd.read_parquet(src)
+    else:
+        tdf = pd.read_csv(src, sep=sep, low_memory=False)
+
+    lower_cols = {str(c).strip().lower(): c for c in tdf.columns}
+    dt_col = lower_cols.get(datetime_col.strip().lower()) if datetime_col else None
+    if dt_col is None:
+        for cand in ("datetime", "time", "timestamp", "date"):
+            if cand in lower_cols:
+                dt_col = lower_cols[cand]
+                break
+    if dt_col is None:
+        raise ValueError("tick data needs a datetime column (use --tick-datetime-column)")
+
+    price_series = None
+    if price_col.strip().lower() != "auto":
+        pc = lower_cols.get(price_col.strip().lower())
+        if pc is None:
+            raise ValueError(f"tick price column not found: {price_col}")
+        price_series = pd.to_numeric(tdf[pc], errors="coerce")
+    else:
+        for cand in ("price", "last", "close", "mid"):
+            if cand in lower_cols:
+                price_series = pd.to_numeric(tdf[lower_cols[cand]], errors="coerce")
+                break
+        if price_series is None and "bid" in lower_cols and "ask" in lower_cols:
+            bid = pd.to_numeric(tdf[lower_cols["bid"]], errors="coerce")
+            ask = pd.to_numeric(tdf[lower_cols["ask"]], errors="coerce")
+            price_series = (bid + ask) / 2.0
+    if price_series is None:
+        raise ValueError("tick data needs a price column (price/last/close/mid or bid+ask)")
+
+    dt = pd.to_datetime(tdf[dt_col], errors="coerce", utc=False)
+    ticks = pd.DataFrame({"datetime": dt, "price": price_series}).dropna(subset=["datetime", "price"]).sort_values("datetime")
+    if ticks.empty:
+        raise ValueError("tick data has no valid rows")
+
+    minute_ns = ticks["datetime"].dt.floor("min").view("int64")
+    ticks["minute_ns"] = minute_ns
+
+    out: Dict[int, np.ndarray] = {}
+    for m, g in ticks.groupby("minute_ns", sort=False):
+        out[int(m)] = g["price"].to_numpy(dtype=np.float64, copy=False)
+    return out
 
 
 def build_candidate_features(df: pd.DataFrame, allow_absolute_price: bool, max_features: int) -> List[str]:
@@ -409,6 +483,8 @@ def simulate_multitp_trailing_pessimistic(
     trail_factor: float,
     trail_min_level: float,
     include_unrealized_at_test_end: bool,
+    bar_time_ns: Optional[np.ndarray] = None,
+    tick_map: Optional[Dict[int, np.ndarray]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n = close.shape[0]
     pnl = np.full(n, np.nan, dtype=np.float64)
@@ -441,6 +517,65 @@ def simulate_multitp_trailing_pessimistic(
             j = i + k
             h = high[j]
             l = low[j]
+
+            tick_prices = None
+            if tick_map is not None and bar_time_ns is not None:
+                minute_ns = int(bar_time_ns[j])
+                if minute_ns in tick_map:
+                    critical = (
+                        (l <= stop_level)
+                        or (tp_enabled and hits < k_max and h >= tp_levels[hits])
+                        or (trail and (not trailing_active) and ((h / entry) - 1.0) >= trail_activate)
+                    )
+                    if critical:
+                        tick_prices = tick_map[minute_ns]
+
+            if tick_prices is not None and tick_prices.size > 0:
+                for px in tick_prices:
+                    curr_profit_ret = (float(px) / entry) - 1.0
+                    if curr_profit_ret > max_profit_ret:
+                        max_profit_ret = curr_profit_ret
+
+                    if trail and (not trailing_active) and max_profit_ret >= trail_activate:
+                        trailing_active = True
+
+                    if trail and trailing_active:
+                        cand = (max_profit_ret - trail_offset) * trail_factor
+                        if cand > stop_ret:
+                            stop_ret = cand
+                            stop_level = entry * (1.0 + stop_ret)
+
+                    if (not qualified) and trail and k <= hold and max_profit_ret >= trail_activate:
+                        qualified = True
+                        t_qual[i] = k
+
+                    if float(px) <= stop_level:
+                        realized += remaining * stop_ret
+                        pnl[i] = realized
+                        y[i] = 1 if qualified else (1 if realized > 0 else 0)
+                        t_exit[i] = k
+                        tp_hits[i] = hits
+                        break
+
+                    if tp_enabled:
+                        while hits < k_max and float(px) >= tp_levels[hits]:
+                            w = min(float(tp_w[hits]), remaining)
+                            if w > 0:
+                                realized += w * float(tps_arr[hits])
+                                remaining -= w
+                            hits += 1
+                            if remaining <= 1e-12:
+                                pnl[i] = realized
+                                y[i] = 1 if qualified else (1 if realized > 0 else 0)
+                                t_exit[i] = k
+                                tp_hits[i] = hits
+                                break
+                        if y[i] != -1:
+                            break
+
+                if y[i] != -1:
+                    break
+                continue
 
             # update max profit based on current bar high
             curr_profit_ret = (h / entry) - 1.0
@@ -1134,10 +1269,12 @@ def run_single_config(
     score_cfg: dict,
     tp_summary_value: float,
     seed: int,
+    tick_map: Optional[Dict[int, np.ndarray]] = None,
 ) -> Tuple[dict, pd.DataFrame]:
     high = df["high"].to_numpy(dtype=np.float32, copy=False)
     low = df["low"].to_numpy(dtype=np.float32, copy=False)
     close = df["close"].to_numpy(dtype=np.float32, copy=False)
+    bar_time_ns = pd.DatetimeIndex(df.index).floor("min").view("int64").to_numpy(dtype=np.int64, copy=False)
 
     pnl, y, t_exit, t_qual, tp_hits = simulate_multitp_trailing_pessimistic(
         high=high,
@@ -1156,6 +1293,8 @@ def run_single_config(
         trail_factor=trail_factor,
         trail_min_level=trail_min_level,
         include_unrealized_at_test_end=include_unrealized_at_test_end,
+        bar_time_ns=bar_time_ns,
+        tick_map=tick_map,
     )
 
     summary, sig = mine_best_rule(
@@ -1261,6 +1400,41 @@ def main() -> None:
     print(f"Candidate features: {len(cols)}")
     thresholds = quantile_thresholds(df.iloc[:train_idx], cols, qs)
 
+    score_cfg = {
+        "ret_bad_test": args.score_return_bad_test,
+        "ret_mid_test": args.score_return_mid_test,
+        "ret_good_test": args.score_return_good_test,
+        "ret_bad_train": args.score_return_bad_train,
+        "ret_mid_train": args.score_return_mid_test,
+        "ret_good_train": args.score_return_good_test,
+        "dd_good": args.score_dd_good,
+        "dd_mid": args.score_dd_mid,
+        "dd_bad": args.score_dd_bad,
+        "so_bad": args.score_sortino_bad,
+        "so_mid": args.score_sortino_mid,
+        "so_good": args.score_sortino_good,
+        "tr_bad_test": args.score_trades_bad_test,
+        "tr_mid_test": args.score_trades_mid_test,
+        "tr_good_test": args.score_trades_good_test,
+        "tr_bad_train": args.score_trades_bad_train,
+        "tr_mid_train": args.score_trades_mid_train,
+        "tr_good_train": args.score_trades_good_train,
+        "k_low": args.score_k_low,
+        "k_high": args.score_k_high,
+    }
+
+    tick_map: Optional[Dict[int, np.ndarray]] = None
+    if args.tick_data is not None:
+        print(f"Loading tick data: {args.tick_data}")
+        tick_map = load_tick_minute_map(
+            path=args.tick_data,
+            datetime_col=args.tick_datetime_column,
+            price_col=args.tick_price_column,
+            sep=args.tick_sep,
+            cache_parquet=args.tick_cache_parquet,
+        )
+        print(f"Tick minutes loaded: {len(tick_map)}")
+
     summaries: List[dict] = []
     signals: List[pd.DataFrame] = []
 
@@ -1302,8 +1476,13 @@ def main() -> None:
             objective=args.objective,
             one_trade_at_a_time=args.one_trade_at_a_time,
             disable_same_reference_check=args.disable_same_reference_check,
+            two_starts=args.two_starts,
+            two_starts_topk=args.two_starts_topk,
+            two_starts_family_topn=args.two_starts_family_topn,
+            score_cfg=score_cfg,
             tp_summary_value=tp,
             seed=args.seed,
+            tick_map=tick_map,
         )
 
         print(f"Best rule: {summary['rule']}")

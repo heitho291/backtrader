@@ -8,8 +8,10 @@ miner summary CSV output (e.g. test_win, test_ev, wf_mean_win).
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import math
+import os
 import random
 import subprocess
 import sys
@@ -51,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-every", type=int, default=5)
     p.add_argument("--max-attempts-per-run", type=int, default=5, help="Retry failed/empty runs up to N attempts per final run")
     p.add_argument("--keep-failed-runs", action="store_true", default=False, help="Keep failed attempts in output CSV")
+    p.add_argument("--workers", type=str, default="1", help="Parallel optimizer workers count or auto")
 
     p.add_argument("--objective-column", type=str, default="test_score")
     p.add_argument(
@@ -556,122 +559,155 @@ def main() -> None:
         if args.trail_offset_range[0] >= args.trail_activate_range[1]:
             raise ValueError("trail-offset-range min must be < trail-activate-range max when trailing can be enabled")
 
-    rng = random.Random(args.seed)
+    workers_raw = str(args.workers).strip().lower()
+    if workers_raw == "auto":
+        workers = max(1, int(os.cpu_count() or 1))
+    else:
+        workers = max(1, int(workers_raw))
+
     rows: list[dict[str, object]] = []
 
-    try:
-        for run in range(1, args.runs + 1):
-            success = False
-            attempt = 0
-            last_row: dict[str, object] | None = None
-            while attempt < args.max_attempts_per_run and not success:
-                attempt += 1
-                cfg = sample_cfg(rng, args)
+    def execute_run(run: int) -> tuple[list[dict[str, object]], list[str]]:
+        rng_local = random.Random(args.seed + run * 1000003)
+        run_rows: list[dict[str, object]] = []
+        logs: list[str] = []
+        success = False
+        attempt = 0
+        last_row: dict[str, object] | None = None
 
-                with tempfile.TemporaryDirectory(prefix="miner_opt_") as td:
-                    out_summary = Path(td) / "summary.csv"
-                    out_signals = Path(td) / "signals.csv"
-                    cmd = build_cmd(args, cfg, out_summary, out_signals)
-                    t0 = time.time()
-                    timed_out = False
-                    try:
-                        proc = subprocess.run(
-                            cmd,
-                            stdout=(subprocess.PIPE if args.capture_stdout else subprocess.DEVNULL),
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            timeout=(args.timeout_sec if args.timeout_sec > 0 else None),
-                        )
-                    except subprocess.TimeoutExpired as e:
-                        timed_out = True
-                        proc = subprocess.CompletedProcess(
-                            cmd,
-                            returncode=124,
-                            stdout=(e.stdout or "") if args.capture_stdout else "",
-                            stderr=(e.stderr or "") + "\n[timeout] miner subprocess exceeded timeout",
-                        )
-                    sec = time.time() - t0
+        while attempt < args.max_attempts_per_run and not success:
+            attempt += 1
+            cfg = sample_cfg(rng_local, args)
 
-                    objective = float("nan")
-                    rows_used = 0
-                    best_rule = ""
-                    best_metrics: dict[str, object] = {}
-                    risk_metrics: dict[str, object] = {}
-                    if proc.returncode == 0 and out_summary.exists():
-                        try:
-                            s = pd.read_csv(out_summary)
-                            objective, rows_used = aggregate_objective(
-                                s,
-                                objective_col=args.objective_column,
-                                mode=args.objective_agg,
-                                hit_col=args.objective_hit_column,
-                                min_hits=args.min_objective_hits,
-                            )
-                            best_metrics = extract_best_row_metrics(s, args.objective_column)
-                            if "best_rule" in best_metrics:
-                                best_rule = str(best_metrics["best_rule"])
-                            if out_signals.exists():
-                                sig = pd.read_csv(out_signals)
-                                risk_metrics = compute_loss_streak_risk_metrics(sig)
-                        except Exception:
-                            pass
-
-                    valid_result = proc.returncode == 0 and math.isfinite(objective) and rows_used > 0 and bool(best_rule)
-                    err_tail = _tail_line(proc.stderr or "") if proc.returncode != 0 else ""
-                    out_tail = _tail_line(proc.stdout or "") if proc.returncode != 0 else ""
-
-                    row = {
-                        "run": run,
-                        "attempt": attempt,
-                        **cfg,
-                        "exit_code": proc.returncode,
-                        "runtime_sec": round(sec, 3),
-                        "objective": objective,
-                        "objective_rows_used": rows_used,
-                        "best_rule": best_rule,
-                        **best_metrics,
-                        **risk_metrics,
-                        "error_tail": err_tail,
-                        "stdout_tail": out_tail,
-                    }
-
-                    last_row = row
-
-                    if valid_result:
-                        rows.append(row)
-                        success = True
-                    elif args.keep_failed_runs:
-                        if timed_out:
-                            row["failed_reason"] = "timeout"
-                        elif proc.returncode != 0:
-                            row["failed_reason"] = f"miner_exit_{proc.returncode}"
-                        elif not math.isfinite(objective):
-                            row["failed_reason"] = "non_finite_objective"
-                        elif rows_used <= 0:
-                            row["failed_reason"] = "no_objective_rows"
-                        elif not best_rule:
-                            row["failed_reason"] = "empty_best_rule"
-                        else:
-                            row["failed_reason"] = "non_finite_objective_or_no_rule"
-                        rows.append(row)
-
-                    print(
-                        f"[{run}/{args.runs} attempt {attempt}/{args.max_attempts_per_run}] "
-                        f"code={proc.returncode} objective={objective:.8g} rows={rows_used} "
-                        f"valid={int(valid_result)} sec={sec:.2f} tail_rows={cfg.get('tail_rows')} max_feat={cfg.get('max_features')}"
-                        + (f" err={err_tail[:160]}" if err_tail else "")
+            with tempfile.TemporaryDirectory(prefix="miner_opt_") as td:
+                out_summary = Path(td) / "summary.csv"
+                out_signals = Path(td) / "signals.csv"
+                cmd = build_cmd(args, cfg, out_summary, out_signals)
+                t0 = time.time()
+                timed_out = False
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        stdout=(subprocess.PIPE if args.capture_stdout else subprocess.DEVNULL),
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=(args.timeout_sec if args.timeout_sec > 0 else None),
                     )
+                except subprocess.TimeoutExpired as e:
+                    timed_out = True
+                    proc = subprocess.CompletedProcess(
+                        cmd,
+                        returncode=124,
+                        stdout=(e.stdout or "") if args.capture_stdout else "",
+                        stderr=(e.stderr or "") + "\n[timeout] miner subprocess exceeded timeout",
+                    )
+                sec = time.time() - t0
 
-            if not success:
-                print(f"[WARN] run {run}: no valid result after {args.max_attempts_per_run} attempts")
-                if (not args.keep_failed_runs) and (last_row is not None):
-                    fail_row = dict(last_row)
-                    fail_row["failed_reason"] = "no_valid_result_after_attempts"
-                    rows.append(fail_row)
+                objective = float("nan")
+                rows_used = 0
+                best_rule = ""
+                best_metrics: dict[str, object] = {}
+                risk_metrics: dict[str, object] = {}
+                if proc.returncode == 0 and out_summary.exists():
+                    try:
+                        s = pd.read_csv(out_summary)
+                        objective, rows_used = aggregate_objective(
+                            s,
+                            objective_col=args.objective_column,
+                            mode=args.objective_agg,
+                            hit_col=args.objective_hit_column,
+                            min_hits=args.min_objective_hits,
+                        )
+                        best_metrics = extract_best_row_metrics(s, args.objective_column)
+                        if "best_rule" in best_metrics:
+                            best_rule = str(best_metrics["best_rule"])
+                        if out_signals.exists():
+                            sig = pd.read_csv(out_signals)
+                            risk_metrics = compute_loss_streak_risk_metrics(sig)
+                    except Exception:
+                        pass
 
-            if args.checkpoint_every > 0 and run % args.checkpoint_every == 0:
-                save_results(args.out, rows)
-                print(f"checkpoint saved: {args.out} ({run} runs)")
+                valid_result = proc.returncode == 0 and math.isfinite(objective) and rows_used > 0 and bool(best_rule)
+                err_tail = _tail_line(proc.stderr or "") if proc.returncode != 0 else ""
+                out_tail = _tail_line(proc.stdout or "") if proc.returncode != 0 else ""
+
+                row = {
+                    "run": run,
+                    "attempt": attempt,
+                    **cfg,
+                    "exit_code": proc.returncode,
+                    "runtime_sec": round(sec, 3),
+                    "objective": objective,
+                    "objective_rows_used": rows_used,
+                    "best_rule": best_rule,
+                    **best_metrics,
+                    **risk_metrics,
+                    "error_tail": err_tail,
+                    "stdout_tail": out_tail,
+                }
+
+                last_row = row
+
+                if valid_result:
+                    run_rows.append(row)
+                    success = True
+                elif args.keep_failed_runs:
+                    if timed_out:
+                        row["failed_reason"] = "timeout"
+                    elif proc.returncode != 0:
+                        row["failed_reason"] = f"miner_exit_{proc.returncode}"
+                    elif not math.isfinite(objective):
+                        row["failed_reason"] = "non_finite_objective"
+                    elif rows_used <= 0:
+                        row["failed_reason"] = "no_objective_rows"
+                    elif not best_rule:
+                        row["failed_reason"] = "empty_best_rule"
+                    else:
+                        row["failed_reason"] = "non_finite_objective_or_no_rule"
+                    run_rows.append(row)
+
+                logs.append(
+                    f"[{run}/{args.runs} attempt {attempt}/{args.max_attempts_per_run}] "
+                    f"code={proc.returncode} objective={objective:.8g} rows={rows_used} "
+                    f"valid={int(valid_result)} sec={sec:.2f} tail_rows={cfg.get('tail_rows')} max_feat={cfg.get('max_features')}"
+                    + (f" err={err_tail[:160]}" if err_tail else "")
+                )
+
+        if not success and (last_row is not None):
+            logs.append(f"[WARN] run {run}: no valid result after {args.max_attempts_per_run} attempts")
+            if not args.keep_failed_runs:
+                fail_row = dict(last_row)
+                fail_row["failed_reason"] = "no_valid_result_after_attempts"
+                run_rows.append(fail_row)
+
+        return run_rows, logs
+
+    try:
+        if workers <= 1:
+            completed = 0
+            for run in range(1, args.runs + 1):
+                rr, logs = execute_run(run)
+                rows.extend(rr)
+                for ln in logs:
+                    print(ln)
+                completed += 1
+                if args.checkpoint_every > 0 and completed % args.checkpoint_every == 0:
+                    save_results(args.out, rows)
+                    print(f"checkpoint saved: {args.out} ({completed} runs)")
+        else:
+            print(f"Running optimizer with workers={workers}")
+            completed = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(execute_run, run) for run in range(1, args.runs + 1)]
+                for fut in concurrent.futures.as_completed(futs):
+                    rr, logs = fut.result()
+                    rows.extend(rr)
+                    for ln in logs:
+                        print(ln)
+                    completed += 1
+                    if args.checkpoint_every > 0 and completed % args.checkpoint_every == 0:
+                        save_results(args.out, rows)
+                        print(f"checkpoint saved: {args.out} ({completed} runs)")
 
     except KeyboardInterrupt:
         print("\n[WARN] Interrupted by user, saving checkpoint before exit...")

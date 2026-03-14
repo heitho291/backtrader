@@ -10,6 +10,7 @@ Input format (your XAUUSD.txt):
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import json
 import re
@@ -39,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Extract indicator features (multi-TF) incl. OHLCV export.")
     p.add_argument("--data", type=Path, required=True, help="Path to XAUUSD.txt or .csv")
     p.add_argument("--tail", type=int, default=240000, help="Use last N rows (increase as you like)")
+    p.add_argument("--fast-loader", choices=["auto", "pandas", "pyarrow", "polars"], default="auto",
+                   help="CSV loader backend preference for large files")
+    p.add_argument("--chunk-size", type=int, default=2_000_000,
+                   help="Reserved for chunk-based CSV processing tuning")
     p.add_argument("--tfs", type=str, default="1,2,3,5,15,30,60", help="Minute timeframes")
     p.add_argument("--ema-lens", type=str, default="8,13,20,21,34,50,55,89,100,144,200")
     p.add_argument("--rsi-lens", type=str, default="5,7,9,14,21,28")
@@ -121,66 +126,112 @@ def dmi_components(df: pd.DataFrame, period: int = 14):
     return plus_di, minus_di, dx, adx
 
 
-def load_base(path: Path, tail: int) -> pd.DataFrame:
-    # Your file is comma-separated .txt; read with sep="," 
-    df = pd.read_csv(path, sep=",", low_memory=False)
+def _detect_sep(path: Path) -> str:
+    sample = path.read_text(encoding="utf-8", errors="ignore")[:8192]
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",;").delimiter
+    except Exception:
+        return ","
 
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        # Fallback: no header
-        df = pd.read_csv(path, sep=",", header=None, names=REQUIRED_COLUMNS, low_memory=False)
-        missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-        if missing:
-            raise ValueError(f"Missing columns: {missing}")
 
-    df = df.tail(tail).copy()
+def _read_csv_any(path: Path, sep: str, fast_loader: str, chunk_size: int = 2_000_000):
+    mode = (fast_loader or "auto").lower()
+    if mode in {"auto", "pyarrow"}:
+        try:
+            import pyarrow.csv as pacsv
+            table = pacsv.read_csv(str(path), parse_options=pacsv.ParseOptions(delimiter=sep))
+            return table.to_pandas(), "pyarrow"
+        except Exception:
+            if mode == "pyarrow":
+                raise
+    if mode in {"auto", "polars"}:
+        try:
+            import polars as pl
+            return pl.scan_csv(str(path), separator=sep).collect().to_pandas(), "polars"
+        except Exception:
+            if mode == "polars":
+                raise
+    if chunk_size > 0:
+        chunks = pd.read_csv(path, sep=sep, low_memory=False, chunksize=chunk_size)
+        return pd.concat(chunks, ignore_index=True), "pandas_chunked"
+    return pd.read_csv(path, sep=sep, low_memory=False), "pandas"
 
-    dt = pd.to_datetime(
-        df["<DTYYYYMMDD>"].astype(str).str.zfill(8) + df["<TIME>"].astype(str).str.zfill(6),
-        format="%Y%m%d%H%M%S",
-        errors="coerce",
-    )
 
-    def _to_float(col: str) -> np.ndarray:
-        s = df[col].astype(str).str.strip().str.replace(",", ".", regex=False)
-        return pd.to_numeric(s, errors="coerce").to_numpy()
+def load_ohlc_any_format(
+    path: Path,
+    tail: int,
+    fast_loader: str = "auto",
+    chunk_size: int = 2_000_000,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    sep = _detect_sep(path)
+    df, loader_used = _read_csv_any(path, sep=sep, fast_loader=fast_loader, chunk_size=chunk_size)
 
-    open_v = _to_float("<OPEN>")
-    high_v = _to_float("<HIGH>")
-    low_v = _to_float("<LOW>")
-    close_v = _to_float("<CLOSE>")
-    vol_v = _to_float("<VOL>")
+    cols_lower = {str(c).strip().lower(): c for c in df.columns}
+    rows_read = int(len(df))
+    fmt = "unknown"
 
-    valid = (
-        (~pd.isna(dt))
-        & (~pd.isna(open_v))
-        & (~pd.isna(high_v))
-        & (~pd.isna(low_v))
-        & (~pd.isna(close_v))
-        & (~pd.isna(vol_v))
-    )
+    if all(c in df.columns for c in REQUIRED_COLUMNS):
+        fmt = "mt_header"
+        dt_str = df["<DTYYYYMMDD>"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(8)
+        tm_str = df["<TIME>"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(6)
+        open_s, high_s, low_s, close_s, vol_s = df["<OPEN>"], df["<HIGH>"], df["<LOW>"], df["<CLOSE>"], df["<VOL>"]
+    elif all(k in cols_lower for k in ["date", "time", "open", "high", "low", "close", "volume"]):
+        fmt = "dukascopy"
+        dt_str = df[cols_lower["date"]].astype(str).str.replace(".", "", regex=False).str.replace("-", "", regex=False).str.replace("/", "", regex=False)
+        tm_str = df[cols_lower["time"]].astype(str).str.replace(":", "", regex=False).str.zfill(6)
+        open_s, high_s, low_s, close_s, vol_s = df[cols_lower["open"]], df[cols_lower["high"]], df[cols_lower["low"]], df[cols_lower["close"]], df[cols_lower["volume"]]
+    else:
+        df2 = pd.read_csv(path, sep=sep, header=None, names=REQUIRED_COLUMNS, low_memory=False)
+        rows_read = int(len(df2))
+        fmt = "mt_no_header"
+        dt_str = df2["<DTYYYYMMDD>"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(8)
+        tm_str = df2["<TIME>"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(6)
+        open_s, high_s, low_s, close_s, vol_s = df2["<OPEN>"], df2["<HIGH>"], df2["<LOW>"], df2["<CLOSE>"], df2["<VOL>"]
 
-    if (~valid).any():
-        print(f"Dropped invalid source rows: {int((~valid).sum())}")
+    if tail > 0:
+        dt_str = dt_str.tail(tail)
+        tm_str = tm_str.tail(tail)
+        open_s = open_s.tail(tail)
+        high_s = high_s.tail(tail)
+        low_s = low_s.tail(tail)
+        close_s = close_s.tail(tail)
+        vol_s = vol_s.tail(tail)
 
-    out = pd.DataFrame(
-        {
-            "open": open_v[valid],
-            "high": high_v[valid],
-            "low": low_v[valid],
-            "close": close_v[valid],
-            "volume": vol_v[valid],
-        },
-        index=dt[valid],
-    )
+    dt = pd.to_datetime(dt_str.astype(str).str.zfill(8) + tm_str.astype(str).str.zfill(6), format="%Y%m%d%H%M%S", errors="coerce")
 
+    def _to_float(series: pd.Series) -> np.ndarray:
+        x = series.astype(str).str.strip().str.replace(",", ".", regex=False)
+        return pd.to_numeric(x, errors="coerce").to_numpy()
+
+    open_v, high_v, low_v, close_v, vol_v = _to_float(open_s), _to_float(high_s), _to_float(low_s), _to_float(close_s), _to_float(vol_s)
+    valid = ((~pd.isna(dt)) & (~pd.isna(open_v)) & (~pd.isna(high_v)) & (~pd.isna(low_v)) & (~pd.isna(close_v)) & (~pd.isna(vol_v)))
+    dropped_invalid = int((~valid).sum())
+
+    out = pd.DataFrame({"open": open_v[valid], "high": high_v[valid], "low": low_v[valid], "close": close_v[valid], "volume": vol_v[valid]}, index=dt[valid])
     out = out[~out.index.duplicated(keep="last")].sort_index()
     if out.empty:
         raise ValueError("No valid rows after parsing.")
-    return out
+
+    stats = {
+        "format": fmt,
+        "separator": sep,
+        "fast_loader_requested": fast_loader,
+        "fast_loader_used": loader_used,
+        "rows_read": rows_read,
+        "rows_after_tail": int(len(dt_str)),
+        "rows_dropped_invalid": dropped_invalid,
+        "rows_valid": int(len(out)),
+    }
+    return out, stats
 
 
-
+def load_base(
+    path: Path,
+    tail: int,
+    fast_loader: str = "auto",
+    chunk_size: int = 2_000_000,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    return load_ohlc_any_format(path, tail=tail, fast_loader=fast_loader, chunk_size=chunk_size)
 
 def _bars_since_event(flag: pd.Series) -> pd.Series:
     arr = flag.fillna(False).to_numpy(dtype=bool)
@@ -599,7 +650,19 @@ def main() -> None:
     delta_windows = [int(x) for x in args.delta_windows.split(",") if x.strip()]
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
 
-    base = load_base(args.data, args.tail)
+    base, load_stats = load_base(
+        args.data,
+        args.tail,
+        fast_loader=args.fast_loader,
+        chunk_size=args.chunk_size,
+    )
+    print(f"Source format: {load_stats.get('format')} | sep={load_stats.get('separator')}")
+    print(
+        "Loader requested/used: "
+        f"{load_stats.get('fast_loader_requested')} -> {load_stats.get('fast_loader_used')}"
+    )
+    print(f"Rows read: {load_stats.get('rows_read')}")
+    print(f"Rows valid: {load_stats.get('rows_valid')}")
     print(f"Base rows loaded: {len(base)}")
 
     feature_table = pd.DataFrame(index=base.index)
@@ -702,6 +765,8 @@ def main() -> None:
     if write_summary:
         report = summarize(feature_table, horizons)
         report["miner_feature_usage"] = miner_feature_usage(feature_table)
+        report["source_load_stats"] = load_stats
+        report["rows_after_warmup"] = int(len(feature_table))
         report["features_output_path"] = str(out_path)
         report["features_output_format"] = args.output_format
         args.out_summary.write_text(json.dumps(report, indent=2), encoding="utf-8")
