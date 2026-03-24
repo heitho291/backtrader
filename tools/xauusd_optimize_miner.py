@@ -608,7 +608,7 @@ def load_miner_module(path: Path):
 def run_miner_inprocess(
     miner_mod,
     df_preloaded: pd.DataFrame,
-    binned_df_preloaded: pd.DataFrame,
+    binned_source,
     cfg: dict[str, object],
     args: argparse.Namespace,
     score_cfg: dict[str, float],
@@ -617,7 +617,6 @@ def run_miner_inprocess(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     tail_rows = int(cfg["tail_rows"])
     df = df_preloaded.tail(tail_rows)
-    binned_df = binned_df_preloaded.reindex(df.index).tail(tail_rows)
     n = len(df)
     if n < 3:
         raise ValueError("Not enough rows after tail_rows for in-process miner run")
@@ -630,6 +629,48 @@ def run_miner_inprocess(
         bool(cfg["allow_absolute_price_features"]),
         int(cfg["max_features"]),
     )
+
+    binned_df: pd.DataFrame
+    if isinstance(binned_source, pd.DataFrame):
+        binned_df = binned_source.reindex(df.index)
+        if cols:
+            missing = [c for c in cols if c not in binned_df.columns]
+            binned_df = binned_df.reindex(columns=[c for c in cols if c in binned_df.columns])
+            for c in missing:
+                binned_df[c] = np.uint8(0)
+            binned_df = binned_df.reindex(columns=cols)
+    else:
+        src = Path(str(binned_source))
+        if str(src).lower().endswith(".parquet"):
+            wanted = list(dict.fromkeys(["datetime"] + cols))
+            try:
+                raw = pd.read_parquet(src, columns=wanted)
+            except Exception:
+                raw = pd.read_parquet(src, columns=cols)
+            if "datetime" in raw.columns:
+                raw["datetime"] = pd.to_datetime(raw["datetime"], errors="coerce")
+                raw = raw.set_index("datetime")
+            elif not isinstance(raw.index, pd.DatetimeIndex):
+                raw = miner_mod.load_binned_features(src, tail_rows)
+        else:
+            raw = miner_mod.load_binned_features(src, tail_rows)
+
+        raw = raw.sort_index()
+        if tail_rows > 0 and len(raw) > tail_rows:
+            raw = raw.tail(tail_rows)
+        binned_df = raw.reindex(df.index)
+        keep = [c for c in cols if c in binned_df.columns]
+        binned_df = binned_df[keep].copy() if keep else pd.DataFrame(index=df.index)
+        for c in cols:
+            if c not in binned_df.columns:
+                binned_df[c] = np.uint8(0)
+        binned_df = binned_df.reindex(columns=cols)
+
+    if not binned_df.empty:
+        num_cols = binned_df.select_dtypes(include=["number"]).columns
+        for c in num_cols:
+            binned_df[c] = pd.to_numeric(binned_df[c], errors="coerce").fillna(0).astype(np.uint8)
+
     tps_all = [float(x) for x in str(cfg["tps"]).split(",") if x.strip()]
     if not tps_all:
         raise ValueError("No tps sampled")
@@ -707,7 +748,7 @@ def main() -> None:
 
     miner_mod = None
     df_preloaded: pd.DataFrame | None = None
-    binned_df_preloaded: pd.DataFrame | None = None
+    binned_source = None
     tick_prices_all = None
     tick_minute_bounds = None
     score_cfg = build_score_cfg(args)
@@ -789,12 +830,15 @@ def main() -> None:
             df_preloaded = df_preloaded.tail(preload_rows)
         print(f"Preloaded rows: {len(df_preloaded)}")
         if args.binned_features is not None:
-            print(f"Loading binned features once for in-process miner: {args.binned_features} (tail={preload_rows})")
-            binned_df_preloaded = miner_mod.load_binned_features(args.binned_features, preload_rows)
+            binned_source = args.binned_features
+            print(
+                "Using binned parquet in on-demand subset mode for in-process miner: "
+                f"{args.binned_features}"
+            )
         else:
             cols_pre = miner_mod.build_candidate_features(df_preloaded, False, 0)
-            binned_df_preloaded = miner_mod.build_binned_feature_frame(df_preloaded, cols_pre, int(args.prefilter_bins))
-        binned_df_preloaded = binned_df_preloaded.reindex(df_preloaded.index)
+            binned_source = miner_mod.build_binned_feature_frame(df_preloaded, cols_pre, int(args.prefilter_bins))
+            binned_source = binned_source.reindex(df_preloaded.index)
         if args.tick_data is not None:
             tick_prices_all, tick_minute_bounds = miner_mod.load_tick_minute_map(
                 path=args.tick_data,
@@ -833,12 +877,12 @@ def main() -> None:
                 timed_out = False
                 if args.inprocess_miner:
                     assert miner_mod is not None and df_preloaded is not None
-                    assert binned_df_preloaded is not None
+                    assert binned_source is not None
                     try:
                         s, sig = run_miner_inprocess(
                             miner_mod=miner_mod,
                             df_preloaded=df_preloaded,
-                            binned_df_preloaded=binned_df_preloaded,
+                            binned_source=binned_source,
                             cfg=cfg,
                             args=args,
                             score_cfg=score_cfg,
