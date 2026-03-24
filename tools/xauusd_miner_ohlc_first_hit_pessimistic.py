@@ -1504,6 +1504,41 @@ def mine_best_rule(
         min_coverage=prefilter_min_coverage,
         max_coverage=prefilter_max_coverage,
     )
+    prefilter_relaxed_used = 0
+    if not candidates:
+        relax_steps = [
+            (
+                max(1, int(prefilter_min_positive_hits // 2)),
+                max(0.0, float(prefilter_min_coverage) * 0.5),
+                min(0.995, max(float(prefilter_max_coverage), 0.985)),
+            ),
+            (
+                1,
+                0.0,
+                0.999,
+            ),
+        ]
+        for mph, mn_cov, mx_cov in relax_steps:
+            candidates = build_prefiltered_candidates(
+                df=df,
+                binned_df=binned_df,
+                cols=cols,
+                train_idx=train_idx,
+                y=y,
+                realistic_train_mask=realistic_train_mask,
+                max_features=max(len(cols), prefilter_max_candidates),
+                top_per_family=prefilter_top_per_family,
+                max_candidates=prefilter_max_candidates,
+                min_positive_hits=int(mph),
+                min_pos_rate=0.0,
+                max_neg_rate=1.0,
+                min_lift=0.0,
+                min_coverage=float(mn_cov),
+                max_coverage=float(mx_cov),
+            )
+            if candidates:
+                prefilter_relaxed_used = 1
+                break
 
     summary_empty = {
         "rule": "",
@@ -1528,6 +1563,8 @@ def mine_best_rule(
         "min_hits_override_used": 0,
         "test_cumulative_return": float("nan"),
         "train_hits": 0,
+        "prefilter_candidates": int(len(candidates)),
+        "prefilter_relaxed_used": int(prefilter_relaxed_used),
     }
     if not candidates:
         return summary_empty, pd.DataFrame()
@@ -2064,6 +2101,7 @@ def mine_best_rule(
         "lot_run": lot_run_resolved,
         "lot_max_single": lot_scenarios["lot_max_single"],
         "prefilter_candidates": len(candidates),
+        "prefilter_relaxed_used": int(prefilter_relaxed_used),
         "prefilter_realistic_train_rows": int(realistic_train_mask.sum()),
         "cluster_gap_minutes": cluster_gap_minutes,
         "max_entries_per_cluster": max_entries_per_cluster,
