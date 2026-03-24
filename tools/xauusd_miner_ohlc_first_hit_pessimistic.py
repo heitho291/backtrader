@@ -208,11 +208,35 @@ def load_features(path: Path, tail_rows: int = 0) -> pd.DataFrame:
     return df
 
 
+def load_tabular_with_datetime(path: Path, tail_rows: int = 0) -> pd.DataFrame:
+    if str(path).lower().endswith(".parquet"):
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(path, compression="infer")
+    if tail_rows > 0 and len(df) > tail_rows:
+        df = df.tail(int(tail_rows))
+
+    if isinstance(df.index, pd.DatetimeIndex):
+        pass
+    elif "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.set_index("datetime")
+    elif len(df.columns) and str(df.columns[0]).lower().startswith("unnamed"):
+        df[df.columns[0]] = pd.to_datetime(df[df.columns[0]], errors="coerce")
+        df = df.set_index(df.columns[0])
+    else:
+        raise ValueError("Table must provide datetime index/column.")
+    return df.sort_index()
+
+
 def load_binned_features(path: Path, tail_rows: int = 0) -> pd.DataFrame:
-    df = load_features(path, tail_rows=tail_rows)
+    df = load_tabular_with_datetime(path, tail_rows=tail_rows)
     num_cols = df.select_dtypes(include=[np.number]).columns
     for c in num_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(np.uint8)
+        if c in {"open", "high", "low", "close", "volume"}:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype(np.float32)
+        else:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(np.uint8)
     return df
 
 

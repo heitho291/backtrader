@@ -39,6 +39,18 @@ def load_features(path: Path) -> pd.DataFrame:
     raise ValueError("Features must include a datetime index/column.")
 
 
+def build_metadata_frame(df: pd.DataFrame) -> pd.DataFrame:
+    meta: dict[str, pd.Series] = {
+        "datetime": pd.Series(df.index, index=df.index),
+        "date": pd.Series(df.index.strftime("%Y-%m-%d"), index=df.index),
+        "time": pd.Series(df.index.strftime("%H:%M:%S"), index=df.index),
+    }
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df.columns:
+            meta[col] = pd.to_numeric(df[col], errors="coerce")
+    return pd.DataFrame(meta, index=df.index)
+
+
 def build_candidate_columns(df: pd.DataFrame) -> list[str]:
     out: list[str] = []
     for c in df.columns:
@@ -83,12 +95,14 @@ def main() -> None:
     cols = build_candidate_columns(df)
     dtype = np.uint8 if args.bins <= np.iinfo(np.uint8).max else np.uint16
 
-    out = pd.DataFrame(index=df.index)
+    binned_cols: dict[str, pd.Series] = {}
     for c in cols:
-        out[c] = bin_series(pd.to_numeric(df[c], errors="coerce"), args.bins, dtype)
+        binned_cols[c] = bin_series(pd.to_numeric(df[c], errors="coerce"), args.bins, dtype)
+
+    out = pd.concat([build_metadata_frame(df), pd.DataFrame(binned_cols, index=df.index)], axis=1)
 
     args.out_binned.parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(args.out_binned)
+    out.to_parquet(args.out_binned, index=False)
     print(f"Saved binned parquet: {args.out_binned}")
     print(f"Rows={len(out)} cols={len(out.columns)} dtype={np.dtype(dtype).name}")
 
