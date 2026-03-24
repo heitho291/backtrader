@@ -408,36 +408,40 @@ def aggregate_objective(
         return float("nan"), 0, f"objective column missing: {objective_col}"
 
     x = df.copy()
+    note = ""
     x[objective_col] = pd.to_numeric(x[objective_col], errors="coerce")
     if hit_col in x.columns:
         x[hit_col] = pd.to_numeric(x[hit_col], errors="coerce")
         if min_threshold > 0:
             before = len(x)
-            x = x[x[hit_col] >= min_threshold]
-            if x.empty and before > 0:
-                return float("nan"), 0, (
-                    f"all rows filtered by --min-objective-threshold={min_threshold} on column '{hit_col}'"
+            x_filtered = x[x[hit_col] >= min_threshold]
+            if x_filtered.empty and before > 0:
+                note = (
+                    f"all rows filtered by --min-objective-threshold={min_threshold} on column '{hit_col}'; "
+                    "fallback to unfiltered objective rows"
                 )
+            else:
+                x = x_filtered
 
     x = x[x[objective_col].notna()]
     if x.empty:
         return float("nan"), 0, f"no finite rows in objective column: {objective_col}"
 
     if mode == "mean":
-        return float(x[objective_col].mean()), int(len(x)), ""
+        return float(x[objective_col].mean()), int(len(x)), note
     if mode == "max":
-        return float(x[objective_col].max()), int(len(x)), ""
+        return float(x[objective_col].max()), int(len(x)), note
     if mode == "min":
-        return float(x[objective_col].min()), int(len(x)), ""
+        return float(x[objective_col].min()), int(len(x)), note
 
     if hit_col in x.columns:
         w = x[hit_col].to_numpy(dtype=float)
         v = x[objective_col].to_numpy(dtype=float)
         s = float(w.sum())
         if s > 0:
-            return float((v * w).sum() / s), int(len(x)), ""
+            return float((v * w).sum() / s), int(len(x)), note
 
-    return float(x[objective_col].mean()), int(len(x)), ""
+    return float(x[objective_col].mean()), int(len(x)), note
 
 
 
