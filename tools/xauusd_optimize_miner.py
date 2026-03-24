@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import importlib.util
 import math
 import os
 import random
@@ -46,6 +47,7 @@ def _validate_range(name: str, lo: float, hi: float) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Random optimize miner hyperparameters")
     p.add_argument("--features", type=Path, required=True)
+    p.add_argument("--binned-features", type=Path, default=None)
     p.add_argument("--miner-script", type=Path, default=Path("tools/xauusd_miner_ohlc_first_hit_pessimistic.py"))
     p.add_argument("--runs", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
@@ -54,6 +56,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-attempts-per-run", type=int, default=5, help="Retry failed/empty runs up to N attempts per final run")
     p.add_argument("--keep-failed-runs", action="store_true", default=False, help="Keep failed attempts in output CSV")
     p.add_argument("--workers", type=str, default="1", help="Parallel optimizer workers count or auto")
+    p.add_argument("--inprocess-miner", action="store_true", default=False,
+                   help="Run miner in-process and reuse one preloaded features table (faster, lower RAM)")
 
     p.add_argument("--objective-column", type=str, default="test_score")
     p.add_argument(
@@ -62,8 +66,9 @@ def parse_args() -> argparse.Namespace:
         default="weighted_by_hits",
         help="How to aggregate objective over multiple summary rows (e.g. multiple TP rows)",
     )
-    p.add_argument("--objective-hit-column", type=str, default="test_hits", help="Hit column used for weighted objective")
-    p.add_argument("--min-objective-hits", type=int, default=0, help="Drop rows below this hit count before aggregation")
+    p.add_argument("--objective-hit-column", type=str, default="test_hits", help="Column used for weighted aggregation or threshold filtering")
+    p.add_argument("--min-objective-threshold", type=float, default=0.0,
+                   help="Drop rows below this threshold on --objective-hit-column before aggregation")
 
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument("--hold-range", type=parse_int_range, default=(60, 120))
@@ -91,7 +96,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trail-factor-range", type=parse_float_range, default=(0.2, 0.8))
     p.add_argument("--p-trail", type=float, default=1.0, help="Probability to enable trailing per run")
     p.add_argument("--p-use-multi-tp", type=float, default=1.0, help="Probability to enable TP-based exits per run")
-    p.add_argument("--trail-min-level-range", type=parse_float_range, default=(0.0, 0.0040))
     p.add_argument("--min-test-hits-reduce-step-range", type=parse_float_range, default=(0.05, 0.20))
     p.add_argument("--min-hits-return-override-range", type=parse_float_range, default=(2.0, 4.0))
     p.add_argument("--p-include-unrealized-at-test-end", type=float, default=1.0,
@@ -105,17 +109,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--score-dd-good", type=float, default=0.075)
     p.add_argument("--score-dd-mid", type=float, default=0.175)
     p.add_argument("--score-dd-bad", type=float, default=0.25)
-    p.add_argument("--score-sortino-bad", type=float, default=0.5)
-    p.add_argument("--score-sortino-mid", type=float, default=1.0)
-    p.add_argument("--score-sortino-good", type=float, default=1.75)
-    p.add_argument("--score-trades-bad-test", type=float, default=0.5)
-    p.add_argument("--score-trades-mid-test", type=float, default=2.0)
-    p.add_argument("--score-trades-good-test", type=float, default=4.5)
-    p.add_argument("--score-trades-bad-train", type=float, default=0.5)
-    p.add_argument("--score-trades-mid-train", type=float, default=1.75)
-    p.add_argument("--score-trades-good-train", type=float, default=3.5)
-    p.add_argument("--score-k-low", type=float, default=4.0)
-    p.add_argument("--score-k-high", type=float, default=1.2)
+    p.add_argument("--score-profit-factor-bad", type=float, default=1.00)
+    p.add_argument("--score-profit-factor-mid", type=float, default=1.30)
+    p.add_argument("--score-profit-factor-good", type=float, default=1.75)
+    p.add_argument("--score-runner-efficiency-bad", type=float, default=0.50)
+    p.add_argument("--score-runner-efficiency-mid", type=float, default=1.00)
+    p.add_argument("--score-runner-efficiency-good", type=float, default=1.75)
     p.add_argument(
         "--quantiles-choices",
         type=parse_str_choices,
@@ -131,6 +130,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tp-weight-total-pct-min", type=float, default=35.0, help="Minimum total TP close percent")
     p.add_argument("--tp-weight-total-pct-max", type=float, default=90.0, help="Maximum total TP close percent")
     p.add_argument("--p-allow-absolute-price-features", type=float, default=0.0)
+    p.add_argument("--cluster-gap-minutes", type=int, default=5)
+    p.add_argument("--max-entries-per-cluster", type=int, default=1)
+    p.add_argument("--account-margin-usd", type=float, default=1000.0)
+    p.add_argument("--broker-leverage", type=float, default=20.0)
+    p.add_argument("--lot-step", type=float, default=0.01)
+    p.add_argument("--contract-units-per-lot", type=float, default=100.0)
+    p.add_argument("--lot-run-range", type=parse_float_range, default=None)
+    p.add_argument("--lot-run-choices", type=str, default="")
+    p.add_argument("--lot-run-min", type=float, default=0.01)
+    p.add_argument("--prefilter-top-per-family", type=int, default=10)
+    p.add_argument("--prefilter-max-candidates", type=int, default=200)
+    p.add_argument("--prefilter-min-positive-hits", type=int, default=25)
+    p.add_argument("--prefilter-min-pos-rate", type=float, default=0.0)
+    p.add_argument("--prefilter-max-neg-rate", type=float, default=1.0)
+    p.add_argument("--prefilter-min-lift", type=float, default=0.0)
+    p.add_argument("--prefilter-min-coverage", type=float, default=0.001)
+    p.add_argument("--prefilter-max-coverage", type=float, default=0.98)
+    p.add_argument("--prefilter-bins", type=int, default=20)
+    p.add_argument("--tick-data", type=Path, default=None)
+    p.add_argument("--tick-cache-parquet", type=Path, default=None)
+    p.add_argument("--tick-datetime-column", type=str, default="datetime")
+    p.add_argument("--tick-price-column", type=str, default="auto")
+    p.add_argument("--tick-sep", type=str, default=",")
+    p.add_argument("--two-starts-topk", type=int, default=32)
 
     return p.parse_args()
 
@@ -174,6 +197,7 @@ def sample_cfg(rng: random.Random, args: argparse.Namespace) -> dict[str, object
     trail_offset = round(trail_offset, 6)
     if trail_offset >= trail_activate:
         trail_offset = max(trail_activate - 1e-6, 1e-6)
+    one_trade_at_a_time = rng.random() < args.p_one_trade_at_a_time
 
     return {
         "hold": rng.randint(*args.hold_range),
@@ -189,7 +213,6 @@ def sample_cfg(rng: random.Random, args: argparse.Namespace) -> dict[str, object
         "trail_activate": trail_activate,
         "trail_offset": trail_offset,
         "trail_factor": round(rng.uniform(*args.trail_factor_range), 6),
-        "trail_min_level": round(rng.uniform(*args.trail_min_level_range), 6),
         "min_test_hits_reduce_step": round(rng.uniform(*args.min_test_hits_reduce_step_range), 4),
         "min_hits_return_override": round(rng.uniform(*args.min_hits_return_override_range), 6),
         "include_unrealized_at_test_end": rng.random() < args.p_include_unrealized_at_test_end,
@@ -203,8 +226,13 @@ def sample_cfg(rng: random.Random, args: argparse.Namespace) -> dict[str, object
         "tp_weight_each_pct": round(each_pct, 4),
         "tp_weight_total_pct": round(each_pct * n_tps, 4),
         "allow_absolute_price_features": rng.random() < args.p_allow_absolute_price_features,
-        "one_trade_at_a_time": rng.random() < args.p_one_trade_at_a_time,
+        "one_trade_at_a_time": one_trade_at_a_time,
         "disable_same_reference_check": rng.random() < args.p_disable_same_reference_check,
+        "lot_run": (
+            round(rng.uniform(*args.lot_run_range), 4)
+            if args.lot_run_range is not None and not one_trade_at_a_time
+            else None
+        ),
     }
 
 
@@ -248,8 +276,6 @@ def build_cmd(args: argparse.Namespace, cfg: dict[str, object], out_summary: Pat
         str(cfg["trail_offset"]),
         "--trail-factor",
         str(cfg["trail_factor"]),
-        "--trail-min-level",
-        str(cfg["trail_min_level"]),
         "--min-test-hits-reduce-step",
         str(cfg["min_test_hits_reduce_step"]),
         "--min-hits-return-override",
@@ -276,28 +302,50 @@ def build_cmd(args: argparse.Namespace, cfg: dict[str, object], out_summary: Pat
         str(args.score_dd_mid),
         "--score-dd-bad",
         str(args.score_dd_bad),
-        "--score-sortino-bad",
-        str(args.score_sortino_bad),
-        "--score-sortino-mid",
-        str(args.score_sortino_mid),
-        "--score-sortino-good",
-        str(args.score_sortino_good),
-        "--score-trades-bad-test",
-        str(args.score_trades_bad_test),
-        "--score-trades-mid-test",
-        str(args.score_trades_mid_test),
-        "--score-trades-good-test",
-        str(args.score_trades_good_test),
-        "--score-trades-bad-train",
-        str(args.score_trades_bad_train),
-        "--score-trades-mid-train",
-        str(args.score_trades_mid_train),
-        "--score-trades-good-train",
-        str(args.score_trades_good_train),
-        "--score-k-low",
-        str(args.score_k_low),
-        "--score-k-high",
-        str(args.score_k_high),
+        "--score-profit-factor-bad",
+        str(args.score_profit_factor_bad),
+        "--score-profit-factor-mid",
+        str(args.score_profit_factor_mid),
+        "--score-profit-factor-good",
+        str(args.score_profit_factor_good),
+        "--score-runner-efficiency-bad",
+        str(args.score_runner_efficiency_bad),
+        "--score-runner-efficiency-mid",
+        str(args.score_runner_efficiency_mid),
+        "--score-runner-efficiency-good",
+        str(args.score_runner_efficiency_good),
+        "--cluster-gap-minutes",
+        str(args.cluster_gap_minutes),
+        "--max-entries-per-cluster",
+        str(args.max_entries_per_cluster),
+        "--account-margin-usd",
+        str(args.account_margin_usd),
+        "--broker-leverage",
+        str(args.broker_leverage),
+        "--lot-step",
+        str(args.lot_step),
+        "--contract-units-per-lot",
+        str(args.contract_units_per_lot),
+        "--prefilter-top-per-family",
+        str(args.prefilter_top_per_family),
+        "--prefilter-max-candidates",
+        str(args.prefilter_max_candidates),
+        "--prefilter-min-positive-hits",
+        str(args.prefilter_min_positive_hits),
+        "--prefilter-min-pos-rate",
+        str(args.prefilter_min_pos_rate),
+        "--prefilter-max-neg-rate",
+        str(args.prefilter_max_neg_rate),
+        "--prefilter-min-lift",
+        str(args.prefilter_min_lift),
+        "--prefilter-min-coverage",
+        str(args.prefilter_min_coverage),
+        "--prefilter-max-coverage",
+        str(args.prefilter_max_coverage),
+        "--prefilter-bins",
+        str(args.prefilter_bins),
+        "--two-starts-topk",
+        str(args.two_starts_topk),
         "--tps",
         cmd_tps,
         "--tp-weights",
@@ -307,6 +355,8 @@ def build_cmd(args: argparse.Namespace, cfg: dict[str, object], out_summary: Pat
         "--out-signals",
         str(out_signals),
     ]
+    if args.binned_features is not None:
+        cmd.extend(["--binned-features", str(args.binned_features)])
     if bool(cfg["allow_absolute_price_features"]):
         cmd.append("--allow-absolute-price-features")
     if bool(cfg["one_trade_at_a_time"]):
@@ -327,39 +377,64 @@ def build_cmd(args: argparse.Namespace, cfg: dict[str, object], out_summary: Pat
         cmd.append("--include-unrealized-at-test-end")
     else:
         cmd.append("--no-include-unrealized-at-test-end")
+    if cfg.get("lot_run") is not None:
+        cmd.extend(["--lot-run", str(cfg["lot_run"])])
+    if args.lot_run_choices.strip():
+        cmd.extend(["--lot-run-choices", args.lot_run_choices])
+    cmd.extend(["--lot-run-min", str(args.lot_run_min)])
+    if args.tick_data is not None:
+        cmd.extend([
+            "--tick-data", str(args.tick_data),
+            "--tick-datetime-column", str(args.tick_datetime_column),
+            "--tick-price-column", str(args.tick_price_column),
+            "--tick-sep", str(args.tick_sep),
+        ])
+        if args.tick_cache_parquet is not None:
+            cmd.extend(["--tick-cache-parquet", str(args.tick_cache_parquet)])
     return cmd
 
 
-def aggregate_objective(df: pd.DataFrame, objective_col: str, mode: str, hit_col: str, min_hits: int) -> tuple[float, int]:
+def aggregate_objective(
+    df: pd.DataFrame,
+    objective_col: str,
+    mode: str,
+    hit_col: str,
+    min_threshold: float,
+) -> tuple[float, int, str]:
     if objective_col not in df.columns:
-        return float("nan"), 0
+        return float("nan"), 0, f"objective column missing: {objective_col}"
 
     x = df.copy()
     x[objective_col] = pd.to_numeric(x[objective_col], errors="coerce")
     if hit_col in x.columns:
         x[hit_col] = pd.to_numeric(x[hit_col], errors="coerce")
-        if min_hits > 0:
-            x = x[x[hit_col] >= min_hits]
+        if min_threshold > 0:
+            before = len(x)
+            x = x[x[hit_col] >= min_threshold]
+            if x.empty and before > 0:
+                return float("nan"), 0, (
+                    f"all rows filtered by --min-objective-threshold={min_threshold} on column '{hit_col}'"
+                )
 
     x = x[x[objective_col].notna()]
     if x.empty:
-        return float("nan"), 0
+        return float("nan"), 0, f"no finite rows in objective column: {objective_col}"
 
     if mode == "mean":
-        return float(x[objective_col].mean()), int(len(x))
+        return float(x[objective_col].mean()), int(len(x)), ""
     if mode == "max":
-        return float(x[objective_col].max()), int(len(x))
+        return float(x[objective_col].max()), int(len(x)), ""
     if mode == "min":
-        return float(x[objective_col].min()), int(len(x))
+        return float(x[objective_col].min()), int(len(x)), ""
 
     if hit_col in x.columns:
         w = x[hit_col].to_numpy(dtype=float)
         v = x[objective_col].to_numpy(dtype=float)
         s = float(w.sum())
         if s > 0:
-            return float((v * w).sum() / s), int(len(x))
+            return float((v * w).sum() / s), int(len(x)), ""
 
-    return float(x[objective_col].mean()), int(len(x))
+    return float(x[objective_col].mean()), int(len(x)), ""
 
 
 
@@ -376,7 +451,7 @@ def compute_loss_streak_risk_metrics(signals_df: pd.DataFrame) -> dict[str, obje
 
     losses = pnl < 0
     loss_rate = float(losses.mean())
-    out["loss_rate"] = loss_rate
+    out["risk_loss_rate"] = loss_rate
 
     max_streak = 0
     cur = 0
@@ -387,13 +462,13 @@ def compute_loss_streak_risk_metrics(signals_df: pd.DataFrame) -> dict[str, obje
                 max_streak = cur
         else:
             cur = 0
-    out["max_consecutive_losses_observed"] = int(max_streak)
+    out["risk_max_consecutive_losses_observed"] = int(max_streak)
 
     if not losses.any():
         return out
 
     worst_loss_ret = float(max(-p for p in pnl if p < 0))
-    out["worst_loss_return"] = worst_loss_ret
+    out["risk_worst_loss_return"] = worst_loss_ret
 
     def losses_needed_for_drawdown(L: int, dd: float) -> float:
         one_step = 1.0 - (L * worst_loss_ret)
@@ -407,15 +482,15 @@ def compute_loss_streak_risk_metrics(signals_df: pd.DataFrame) -> dict[str, obje
     for L in (5, 10, 20, 30):
         k75 = losses_needed_for_drawdown(L, 0.75)
         k99 = losses_needed_for_drawdown(L, 0.99)
-        out[f"L{L}_losses_to_m75"] = k75
-        out[f"L{L}_losses_to_m99"] = k99
-        out[f"L{L}_p_streak_m75"] = float(loss_rate ** k75) if math.isfinite(k75) else float("nan")
-        out[f"L{L}_p_streak_m99"] = float(loss_rate ** k99) if math.isfinite(k99) else float("nan")
+        out[f"risk_L{L}_losses_to_m75"] = k75
+        out[f"risk_L{L}_losses_to_m99"] = k99
+        out[f"risk_L{L}_p_streak_m75"] = float(loss_rate ** k75) if math.isfinite(k75) else float("nan")
+        out[f"risk_L{L}_p_streak_m99"] = float(loss_rate ** k99) if math.isfinite(k99) else float("nan")
 
     return out
 
 
-def extract_best_row_metrics(summary_df: pd.DataFrame, objective_col: str) -> dict[str, object]:
+def extract_row_metrics(summary_df: pd.DataFrame, objective_col: str) -> dict[str, object]:
     if summary_df.empty:
         return {}
 
@@ -449,7 +524,7 @@ def extract_best_row_metrics(summary_df: pd.DataFrame, objective_col: str) -> di
     out: dict[str, object] = {}
     for k in wanted:
         if k in row.index:
-            out[f"best_{k}"] = row[k]
+            out[f"row_{k}"] = row[k]
     return out
 
 
@@ -501,8 +576,141 @@ def save_results(path: Path, rows: list[dict[str, object]]) -> None:
         print(f"[WARN] Could not write {target} (locked?). Wrote {alt} instead.")
 
 
+def build_score_cfg(args: argparse.Namespace) -> dict[str, float]:
+    return {
+        "ret_bad_test": args.score_return_bad_test,
+        "ret_mid_test": args.score_return_mid_test,
+        "ret_good_test": args.score_return_good_test,
+        "ret_bad_train": args.score_return_bad_train,
+        "ret_mid_train": args.score_return_mid_test,
+        "ret_good_train": args.score_return_good_test,
+        "dd_good": args.score_dd_good,
+        "dd_mid": args.score_dd_mid,
+        "dd_bad": args.score_dd_bad,
+        "pf_bad": args.score_profit_factor_bad,
+        "pf_mid": args.score_profit_factor_mid,
+        "pf_good": args.score_profit_factor_good,
+        "re_bad": args.score_runner_efficiency_bad,
+        "re_mid": args.score_runner_efficiency_mid,
+        "re_good": args.score_runner_efficiency_good,
+    }
+
+
+def load_miner_module(path: Path):
+    spec = importlib.util.spec_from_file_location("xau_miner_module", str(path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load miner script: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def run_miner_inprocess(
+    miner_mod,
+    df_preloaded: pd.DataFrame,
+    binned_df_preloaded: pd.DataFrame,
+    cfg: dict[str, object],
+    args: argparse.Namespace,
+    score_cfg: dict[str, float],
+    tick_prices_all=None,
+    tick_minute_bounds=None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    tail_rows = int(cfg["tail_rows"])
+    df = df_preloaded.tail(tail_rows)
+    binned_df = binned_df_preloaded.reindex(df.index).tail(tail_rows)
+    n = len(df)
+    if n < 3:
+        raise ValueError("Not enough rows after tail_rows for in-process miner run")
+
+    train_idx = int(n * args.train_frac)
+    train_idx = max(1, min(train_idx, n - 1))
+
+    cols = miner_mod.build_candidate_features(
+        df,
+        bool(cfg["allow_absolute_price_features"]),
+        int(cfg["max_features"]),
+    )
+    tps_all = [float(x) for x in str(cfg["tps"]).split(",") if x.strip()]
+    if not tps_all:
+        raise ValueError("No tps sampled")
+
+    use_multi_tp = bool(cfg["use_multi_tp"])
+    tps = tps_all if use_multi_tp else [tps_all[0]]
+    tp_weights = str(cfg["tp_weights"]) if use_multi_tp else "1.0"
+    tp_w = miner_mod.parse_tp_weights(tps, tp_weights)
+
+    summary, sig = miner_mod.run_single_config(
+        df=df,
+        binned_df=binned_df,
+        train_idx=train_idx,
+        cols=cols,
+        tps=tps,
+        tp_w=tp_w,
+        tp_enabled=use_multi_tp,
+        sl=float(cfg["sl"]),
+        hold=int(cfg["hold"]),
+        slippage_bps=float(cfg["slippage_bps"]),
+        spread_bps=float(cfg["spread_bps"]),
+        trail=bool(cfg["trail"]),
+        trail_activate=float(cfg["trail_activate"]),
+        trail_offset=float(cfg["trail_offset"]),
+        trail_factor=float(cfg["trail_factor"]),
+        trail_min_level=0.0,
+        include_unrealized_at_test_end=bool(cfg["include_unrealized_at_test_end"]),
+        min_conds=int(cfg["min_conds"]),
+        max_conds=int(cfg["max_conds"]),
+        min_test_hits=int(cfg["min_test_hits"]),
+        min_test_hits_reduce_step=float(cfg["min_test_hits_reduce_step"]),
+        min_hits_return_override=float(cfg["min_hits_return_override"]),
+        wf_folds=int(cfg["wf_folds"]),
+        objective=str(cfg["objective"]),
+        one_trade_at_a_time=bool(cfg["one_trade_at_a_time"]),
+        disable_same_reference_check=bool(cfg["disable_same_reference_check"]),
+        two_starts=True,
+        two_starts_topk=int(args.two_starts_topk),
+        two_starts_family_topn=int(args.two_starts_family_topn),
+        score_cfg=score_cfg,
+        cluster_gap_minutes=int(args.cluster_gap_minutes),
+        max_entries_per_cluster=int(args.max_entries_per_cluster),
+        account_margin_usd=float(args.account_margin_usd),
+        broker_leverage=float(args.broker_leverage),
+        lot_step=float(args.lot_step),
+        contract_units_per_lot=float(args.contract_units_per_lot),
+        lot_run=float(cfg["lot_run"]) if cfg.get("lot_run") is not None else float("nan"),
+        lot_run_min=float(args.lot_run_min),
+        lot_run_choices=str(args.lot_run_choices),
+        prefilter_top_per_family=int(args.prefilter_top_per_family),
+        prefilter_max_candidates=int(args.prefilter_max_candidates),
+        prefilter_min_positive_hits=int(args.prefilter_min_positive_hits),
+        prefilter_min_pos_rate=float(args.prefilter_min_pos_rate),
+        prefilter_max_neg_rate=float(args.prefilter_max_neg_rate),
+        prefilter_min_lift=float(args.prefilter_min_lift),
+        prefilter_min_coverage=float(args.prefilter_min_coverage),
+        prefilter_max_coverage=float(args.prefilter_max_coverage),
+        finalist_tick_validation=True,
+        tp_summary_value=tps_all[0],
+        seed=int(cfg["miner_seed"]),
+        tick_prices_all=tick_prices_all,
+        tick_minute_bounds=tick_minute_bounds,
+    )
+
+    s = pd.DataFrame([summary])
+    if sig is None or sig.empty:
+        sig_df = pd.DataFrame()
+    else:
+        sig_df = sig.reset_index().rename(columns={"index": "datetime"})
+    return s, sig_df
+
+
 def main() -> None:
     args = parse_args()
+
+    miner_mod = None
+    df_preloaded: pd.DataFrame | None = None
+    binned_df_preloaded: pd.DataFrame | None = None
+    tick_prices_all = None
+    tick_minute_bounds = None
+    score_cfg = build_score_cfg(args)
 
     if not (0.0 <= args.p_allow_absolute_price_features <= 1.0):
         raise ValueError("p-allow-absolute-price-features must be in [0,1]")
@@ -522,11 +730,22 @@ def main() -> None:
         raise ValueError("timeout-sec must be >= 0")
     if args.two_starts_family_topn < 1:
         raise ValueError("two-starts-family-topn must be >= 1")
+    if args.two_starts_topk < 2:
+        raise ValueError("two-starts-topk must be >= 2")
+    if args.cluster_gap_minutes < 0 or args.max_entries_per_cluster < 1:
+        raise ValueError("cluster parameters must satisfy gap>=0 and max-entries>=1")
+    if args.account_margin_usd <= 0 or args.broker_leverage <= 0 or args.lot_step <= 0 or args.contract_units_per_lot <= 0:
+        raise ValueError("account/margin/lot parameters must be > 0")
+    if args.lot_run_range is not None:
+        _validate_range("lot-run", *args.lot_run_range)
+    if args.lot_run_min <= 0:
+        raise ValueError("lot-run-min must be > 0")
+    if args.prefilter_bins < 2:
+        raise ValueError("prefilter-bins must be >= 2")
 
     _validate_range("trail-activate", *args.trail_activate_range)
     _validate_range("trail-offset", *args.trail_offset_range)
     _validate_range("trail-factor", *args.trail_factor_range)
-    _validate_range("trail-min-level", *args.trail_min_level_range)
     _validate_range("min-test-hits-reduce-step", *args.min_test_hits_reduce_step_range)
     _validate_range("min-hits-return-override", *args.min_hits_return_override_range)
     _validate_range("max-features", *args.max_features_range)
@@ -538,8 +757,6 @@ def main() -> None:
         raise ValueError("trail-offset-range max must be > 0")
     if args.trail_factor_range[1] <= 0:
         raise ValueError("trail-factor-range max must be > 0")
-    if args.trail_min_level_range[0] < 0:
-        raise ValueError("trail-min-level-range min must be >= 0")
     if args.min_test_hits_reduce_step_range[0] < 0 or args.min_test_hits_reduce_step_range[1] >= 1:
         raise ValueError("min-test-hits-reduce-step-range must be within [0,1)")
     if args.min_hits_return_override_range[0] < 0:
@@ -558,6 +775,35 @@ def main() -> None:
             raise ValueError("trail-factor-range min must be > 0 when trailing can be enabled")
         if args.trail_offset_range[0] >= args.trail_activate_range[1]:
             raise ValueError("trail-offset-range min must be < trail-activate-range max when trailing can be enabled")
+
+    if args.inprocess_miner:
+        if args.timeout_sec > 0:
+            print("[WARN] --timeout-sec is ignored with --inprocess-miner")
+        if args.capture_stdout:
+            print("[WARN] --capture-stdout is ignored with --inprocess-miner")
+        miner_mod = load_miner_module(args.miner_script)
+        preload_rows = int(args.tail_rows_range[1])
+        print(f"Loading features once for in-process miner: {args.features} (tail={preload_rows})")
+        df_preloaded = miner_mod.load_features(args.features, preload_rows)
+        if preload_rows > 0 and len(df_preloaded) > preload_rows:
+            df_preloaded = df_preloaded.tail(preload_rows)
+        print(f"Preloaded rows: {len(df_preloaded)}")
+        if args.binned_features is not None:
+            print(f"Loading binned features once for in-process miner: {args.binned_features} (tail={preload_rows})")
+            binned_df_preloaded = miner_mod.load_binned_features(args.binned_features, preload_rows)
+        else:
+            cols_pre = miner_mod.build_candidate_features(df_preloaded, False, 0)
+            binned_df_preloaded = miner_mod.build_binned_feature_frame(df_preloaded, cols_pre, int(args.prefilter_bins))
+        binned_df_preloaded = binned_df_preloaded.reindex(df_preloaded.index)
+        if args.tick_data is not None:
+            tick_prices_all, tick_minute_bounds = miner_mod.load_tick_minute_map(
+                path=args.tick_data,
+                datetime_col=args.tick_datetime_column,
+                price_col=args.tick_price_column,
+                sep=args.tick_sep,
+                cache_parquet=args.tick_cache_parquet,
+            )
+            print(f"Preloaded tick minutes: {len(tick_minute_bounds)}")
 
     workers_raw = str(args.workers).strip().lower()
     if workers_raw == "auto":
@@ -585,49 +831,76 @@ def main() -> None:
                 cmd = build_cmd(args, cfg, out_summary, out_signals)
                 t0 = time.time()
                 timed_out = False
-                try:
-                    proc = subprocess.run(
-                        cmd,
-                        stdout=(subprocess.PIPE if args.capture_stdout else subprocess.DEVNULL),
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        timeout=(args.timeout_sec if args.timeout_sec > 0 else None),
-                    )
-                except subprocess.TimeoutExpired as e:
-                    timed_out = True
-                    proc = subprocess.CompletedProcess(
-                        cmd,
-                        returncode=124,
-                        stdout=(e.stdout or "") if args.capture_stdout else "",
-                        stderr=(e.stderr or "") + "\n[timeout] miner subprocess exceeded timeout",
-                    )
+                if args.inprocess_miner:
+                    assert miner_mod is not None and df_preloaded is not None
+                    assert binned_df_preloaded is not None
+                    try:
+                        s, sig = run_miner_inprocess(
+                            miner_mod=miner_mod,
+                            df_preloaded=df_preloaded,
+                            binned_df_preloaded=binned_df_preloaded,
+                            cfg=cfg,
+                            args=args,
+                            score_cfg=score_cfg,
+                            tick_prices_all=tick_prices_all,
+                            tick_minute_bounds=tick_minute_bounds,
+                        )
+                        s.to_csv(out_summary, index=False)
+                        if not sig.empty:
+                            sig.to_csv(out_signals, index=False)
+                        proc = subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+                    except Exception as e:
+                        proc = subprocess.CompletedProcess(
+                            cmd,
+                            returncode=1,
+                            stdout="",
+                            stderr=f"[inprocess-miner-error] {type(e).__name__}: {e}",
+                        )
+                else:
+                    try:
+                        proc = subprocess.run(
+                            cmd,
+                            stdout=(subprocess.PIPE if args.capture_stdout else subprocess.DEVNULL),
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            timeout=(args.timeout_sec if args.timeout_sec > 0 else None),
+                        )
+                    except subprocess.TimeoutExpired as e:
+                        timed_out = True
+                        proc = subprocess.CompletedProcess(
+                            cmd,
+                            returncode=124,
+                            stdout=(e.stdout or "") if args.capture_stdout else "",
+                            stderr=(e.stderr or "") + "\n[timeout] miner subprocess exceeded timeout",
+                        )
                 sec = time.time() - t0
 
                 objective = float("nan")
                 rows_used = 0
-                best_rule = ""
-                best_metrics: dict[str, object] = {}
+                objective_note = ""
+                row_rule = ""
+                row_metrics: dict[str, object] = {}
                 risk_metrics: dict[str, object] = {}
                 if proc.returncode == 0 and out_summary.exists():
                     try:
                         s = pd.read_csv(out_summary)
-                        objective, rows_used = aggregate_objective(
+                        objective, rows_used, objective_note = aggregate_objective(
                             s,
                             objective_col=args.objective_column,
                             mode=args.objective_agg,
                             hit_col=args.objective_hit_column,
-                            min_hits=args.min_objective_hits,
+                            min_threshold=args.min_objective_threshold,
                         )
-                        best_metrics = extract_best_row_metrics(s, args.objective_column)
-                        if "best_rule" in best_metrics:
-                            best_rule = str(best_metrics["best_rule"])
+                        row_metrics = extract_row_metrics(s, args.objective_column)
+                        if "row_rule" in row_metrics:
+                            row_rule = str(row_metrics["row_rule"])
                         if out_signals.exists():
                             sig = pd.read_csv(out_signals)
                             risk_metrics = compute_loss_streak_risk_metrics(sig)
                     except Exception:
                         pass
 
-                valid_result = proc.returncode == 0 and math.isfinite(objective) and rows_used > 0 and bool(best_rule)
+                valid_result = proc.returncode == 0 and math.isfinite(objective) and rows_used > 0 and bool(row_rule)
                 err_tail = _tail_line(proc.stderr or "") if proc.returncode != 0 else ""
                 out_tail = _tail_line(proc.stdout or "") if proc.returncode != 0 else ""
 
@@ -639,8 +912,11 @@ def main() -> None:
                     "runtime_sec": round(sec, 3),
                     "objective": objective,
                     "objective_rows_used": rows_used,
-                    "best_rule": best_rule,
-                    **best_metrics,
+                    "row_rule": row_rule,
+                    "agg_objective": objective,
+                    "agg_objective_rows_used": rows_used,
+                    "objective_note": objective_note,
+                    **row_metrics,
                     **risk_metrics,
                     "error_tail": err_tail,
                     "stdout_tail": out_tail,
@@ -660,8 +936,10 @@ def main() -> None:
                         row["failed_reason"] = "non_finite_objective"
                     elif rows_used <= 0:
                         row["failed_reason"] = "no_objective_rows"
-                    elif not best_rule:
-                        row["failed_reason"] = "empty_best_rule"
+                        if objective_note:
+                            row["failed_reason"] = f"{row['failed_reason']}: {objective_note}"
+                    elif not row_rule:
+                        row["failed_reason"] = "empty_row_rule"
                     else:
                         row["failed_reason"] = "non_finite_objective_or_no_rule"
                     run_rows.append(row)
@@ -670,6 +948,7 @@ def main() -> None:
                     f"[{run}/{args.runs} attempt {attempt}/{args.max_attempts_per_run}] "
                     f"code={proc.returncode} objective={objective:.8g} rows={rows_used} "
                     f"valid={int(valid_result)} sec={sec:.2f} tail_rows={cfg.get('tail_rows')} max_feat={cfg.get('max_features')}"
+                    + (f" note={objective_note[:160]}" if objective_note else "")
                     + (f" err={err_tail[:160]}" if err_tail else "")
                 )
 

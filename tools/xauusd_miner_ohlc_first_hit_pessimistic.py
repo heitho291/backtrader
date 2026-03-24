@@ -29,6 +29,10 @@ Cond = Tuple[str, str, float]
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--features", type=Path, required=True)
+    p.add_argument("--binned-features", type=Path, default=None,
+                   help="Optional parquet/csv with pre-binned candidate features aligned to --features")
+    p.add_argument("--prefilter-bins", type=int, default=20,
+                   help="Used only when --binned-features is not supplied and bins must be built in-process")
     p.add_argument("--tail-rows", type=int, default=0,
                    help="Optional cap: keep only last N rows from features (0=all)")
     p.add_argument("--hold", type=int, default=90)
@@ -49,8 +53,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trail-activate", type=float, default=0.0010, help="x: profit activation threshold")
     p.add_argument("--trail-offset", type=float, default=0.0006, help="y: offset subtracted from max profit before trailing")
     p.add_argument("--trail-factor", type=float, default=0.5, help="z: proportional trailing factor on (max_profit - offset)")
-    p.add_argument("--trail-min-level", type=float, default=0.0,
-                   help="Deprecated: ignored. Miner now qualifies on reaching --trail-activate within hold.")
+    p.add_argument("--trail-min-level", type=float, default=0.0, help=argparse.SUPPRESS)
 
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument("--seed", type=int, default=42, help="Run seed for traceability")
@@ -84,21 +87,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--score-dd-mid", type=float, default=0.175)
     p.add_argument("--score-dd-bad", type=float, default=0.25)
 
-    p.add_argument("--score-sortino-bad", type=float, default=0.5)
-    p.add_argument("--score-sortino-mid", type=float, default=1.0)
-    p.add_argument("--score-sortino-good", type=float, default=1.75)
-
-    p.add_argument("--score-trades-bad-test", type=float, default=0.5)
-    p.add_argument("--score-trades-mid-test", type=float, default=2.0)
-    p.add_argument("--score-trades-good-test", type=float, default=4.5)
-    p.add_argument("--score-trades-bad-train", type=float, default=0.5)
-    p.add_argument("--score-trades-mid-train", type=float, default=1.75)
-    p.add_argument("--score-trades-good-train", type=float, default=3.5)
-
-    p.add_argument("--score-k-low", type=float, default=4.0, help="Lower-tail steepness for asymptotic score mapping")
-    p.add_argument("--score-k-high", type=float, default=1.2, help="Upper-tail steepness for asymptotic score mapping")
+    p.add_argument("--score-profit-factor-bad", type=float, default=1.00)
+    p.add_argument("--score-profit-factor-mid", type=float, default=1.30)
+    p.add_argument("--score-profit-factor-good", type=float, default=1.75)
+    p.add_argument("--score-runner-efficiency-bad", type=float, default=0.50)
+    p.add_argument("--score-runner-efficiency-mid", type=float, default=1.00)
+    p.add_argument("--score-runner-efficiency-good", type=float, default=1.75)
     p.add_argument("--one-trade-at-a-time", action="store_true", default=True)
     p.add_argument("--no-one-trade-at-a-time", dest="one_trade_at_a_time", action="store_false")
+    p.add_argument("--cluster-gap-minutes", type=int, default=5)
+    p.add_argument("--max-entries-per-cluster", type=int, default=1)
+
+    p.add_argument("--account-margin-usd", type=float, default=1000.0)
+    p.add_argument("--broker-leverage", type=float, default=20.0)
+    p.add_argument("--lot-step", type=float, default=0.01)
+    p.add_argument("--contract-units-per-lot", type=float, default=100.0)
+    p.add_argument("--lot-run", type=float, default=float("nan"),
+                   help="Optional fixed lot for the whole run when one-trade-at-a-time is disabled")
+    p.add_argument("--lot-run-min", type=float, default=0.01,
+                   help="Minimum lot used by auto lot sampling when one-trade-at-a-time is disabled")
+    p.add_argument("--lot-run-choices", type=str, default="",
+                   help="Optional comma-separated lot choices; one is selected deterministically per run seed")
+
+    p.add_argument("--prefilter-top-per-family", type=int, default=10)
+    p.add_argument("--prefilter-max-candidates", type=int, default=200)
+    p.add_argument("--prefilter-min-positive-hits", type=int, default=25)
+    p.add_argument("--prefilter-min-pos-rate", type=float, default=0.0)
+    p.add_argument("--prefilter-max-neg-rate", type=float, default=1.0)
+    p.add_argument("--prefilter-min-lift", type=float, default=0.0)
+    p.add_argument("--prefilter-min-coverage", type=float, default=0.001)
+    p.add_argument("--prefilter-max-coverage", type=float, default=0.98)
 
     p.add_argument("--max-features", type=int, default=0, help="Optional cap of candidate features for faster runs (0=all)")
     p.add_argument(
@@ -121,6 +139,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tick-price-column", type=str, default="auto",
                    help="Price column in tick data; auto tries price/last/close or bid+ask mid")
     p.add_argument("--tick-sep", type=str, default=",", help="CSV separator for --tick-data when needed")
+    p.add_argument("--finalist-tick-validation", action="store_true", default=True,
+                   help="Run tick-accurate late validation only on final selected trades when tick data is available")
+    p.add_argument("--no-finalist-tick-validation", dest="finalist_tick_validation", action="store_false")
     return p.parse_args()
 
 
@@ -187,13 +208,51 @@ def load_features(path: Path, tail_rows: int = 0) -> pd.DataFrame:
     return df
 
 
+def load_binned_features(path: Path, tail_rows: int = 0) -> pd.DataFrame:
+    df = load_features(path, tail_rows=tail_rows)
+    num_cols = df.select_dtypes(include=[np.number]).columns
+    for c in num_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(np.uint8)
+    return df
+
+
+def build_binned_feature_frame(df: pd.DataFrame, cols: List[str], bins: int) -> pd.DataFrame:
+    out = pd.DataFrame(index=df.index)
+    bins = max(2, int(bins))
+    dtype = np.uint8 if bins <= np.iinfo(np.uint8).max else np.uint16
+
+    for c in cols:
+        if c not in df.columns:
+            continue
+        s = pd.to_numeric(df[c], errors="coerce")
+        valid = s.notna()
+        if not valid.any():
+            out[c] = pd.Series(0, index=df.index, dtype=dtype)
+            continue
+        vals = s[valid]
+        uniq = int(vals.nunique(dropna=True))
+        if uniq <= 1:
+            encoded = pd.Series(1, index=vals.index, dtype=np.int32)
+        elif uniq <= bins:
+            levels = np.sort(vals.dropna().unique())
+            mapper = {float(v): i + 1 for i, v in enumerate(levels.tolist())}
+            encoded = vals.map(mapper).astype(np.int32)
+        else:
+            ranked = vals.rank(method="first")
+            encoded = pd.qcut(ranked, q=bins, labels=False, duplicates="drop").astype(np.int32) + 1
+        col = pd.Series(0, index=df.index, dtype=np.int32)
+        col.loc[encoded.index] = encoded.to_numpy(dtype=np.int32, copy=False)
+        out[c] = col.astype(dtype)
+    return out
+
+
 def load_tick_minute_map(
     path: Path,
     datetime_col: str = "datetime",
     price_col: str = "auto",
     sep: str = ",",
     cache_parquet: Optional[Path] = None,
-) -> Dict[int, np.ndarray]:
+) -> tuple[np.ndarray, Dict[int, tuple[int, int]]]:
     src = path
     if str(path).lower().endswith(".csv") and cache_parquet is not None:
         if cache_parquet.exists():
@@ -246,10 +305,22 @@ def load_tick_minute_map(
     minute_ns = ticks["datetime"].dt.floor("min").view("int64")
     ticks["minute_ns"] = minute_ns
 
-    out: Dict[int, np.ndarray] = {}
-    for m, g in ticks.groupby("minute_ns", sort=False):
-        out[int(m)] = g["price"].to_numpy(dtype=np.float64, copy=False)
-    return out
+    prices = ticks["price"].to_numpy(dtype=np.float64, copy=False)
+    minute_arr = ticks["minute_ns"].to_numpy(dtype=np.int64, copy=False)
+
+    out: Dict[int, tuple[int, int]] = {}
+    n = len(minute_arr)
+    if n > 0:
+        start = 0
+        cur = int(minute_arr[0])
+        for i in range(1, n):
+            m = int(minute_arr[i])
+            if m != cur:
+                out[cur] = (start, i)
+                start = i
+                cur = m
+        out[cur] = (start, n)
+    return prices, out
 
 
 def build_candidate_features(df: pd.DataFrame, allow_absolute_price: bool, max_features: int) -> List[str]:
@@ -345,6 +416,8 @@ def _parse_feature_meta(col: str) -> dict[str, object]:
 
     if base.startswith("session_"):
         return {"family": base, "scale": None, "tf": None, "delta_w": delta_w}
+    if base.startswith("regime_"):
+        return {"family": base, "scale": None, "tf": None, "delta_w": delta_w}
     m = re.match(r"^(dist_vwap|vol_z)_tf(\d+)$", base)
     if m:
         family = m.group(1)
@@ -393,26 +466,22 @@ def _build_same_reference_groups(df_train: pd.DataFrame, conds: List[Cond]) -> D
 def _rule_extension_allowed(
     current_idxs: List[int],
     cand_idx: int,
-    conds: List[Cond],
+    candidates: list[dict[str, object]],
     same_reference_group: Optional[Dict[str, int]] = None,
 ) -> bool:
-    c_col = conds[cand_idx][0]
-    c_meta = _parse_feature_meta(c_col)
-    fam = str(c_meta["family"])
+    cand = candidates[cand_idx]
+    fam = str(cand.get("family"))
+    c_scale = cand.get("scale")
 
     same_fam = []
-    same_fam_cols = []
     for i in current_idxs:
-        col = conds[i][0]
-        meta = _parse_feature_meta(col)
-        if str(meta["family"]) == fam:
+        meta = candidates[i]
+        if str(meta.get("family")) == fam:
             same_fam.append(meta)
-            same_fam_cols.append(col)
 
     if len(same_fam) >= 2:
         return False
 
-    c_scale = c_meta.get("scale")
     if c_scale is not None:
         for m in same_fam:
             s = m.get("scale")
@@ -424,10 +493,10 @@ def _rule_extension_allowed(
                 return False
 
     if same_reference_group and fam in {"dist_support", "dist_resist"}:
-        cand_gid = int(same_reference_group.get(c_col, 0))
+        cand_gid = int(same_reference_group.get(str(cand.get("primary_col", "")), 0))
         if cand_gid > 0:
-            for col in same_fam_cols:
-                if int(same_reference_group.get(col, 0)) == cand_gid:
+            for meta in same_fam:
+                if int(same_reference_group.get(str(meta.get("primary_col", "")), 0)) == cand_gid:
                     return False
 
     return True
@@ -441,6 +510,98 @@ def quantile_thresholds(train: pd.DataFrame, cols: List[str], qs: List[float]) -
             continue
         out[c] = {q: float(s.quantile(q)) for q in qs}
     return out
+
+
+def build_prefiltered_candidates(
+    df: pd.DataFrame,
+    binned_df: pd.DataFrame,
+    cols: List[str],
+    train_idx: int,
+    y: np.ndarray,
+    realistic_train_mask: np.ndarray,
+    max_features: int,
+    top_per_family: int,
+    max_candidates: int,
+    min_positive_hits: int,
+    min_pos_rate: float,
+    max_neg_rate: float,
+    min_lift: float,
+    min_coverage: float,
+    max_coverage: float,
+) -> list[dict[str, object]]:
+    selected_train = np.asarray(realistic_train_mask[:train_idx], dtype=bool)
+    positive_set = selected_train & (y[:train_idx] == 1)
+    negative_set = selected_train & (y[:train_idx] == 0)
+    pos_total = int(positive_set.sum())
+    neg_total = int(negative_set.sum())
+    sel_total = int(selected_train.sum())
+    if pos_total == 0 or neg_total == 0 or sel_total == 0:
+        return []
+
+    candidates: list[dict[str, object]] = []
+    eps = 1e-12
+
+    for c in cols:
+        if c not in binned_df.columns:
+            continue
+        meta = _parse_feature_meta(c)
+        family = str(meta.get("family", c))
+        bins_arr = pd.to_numeric(binned_df[c], errors="coerce").fillna(0).to_numpy(dtype=np.uint16, copy=False)
+        train_bins = bins_arr[:train_idx]
+        unique_bins = np.unique(train_bins[selected_train])
+        unique_bins = unique_bins[unique_bins > 0]
+        if unique_bins.size == 0:
+            continue
+
+        fam_candidates: list[dict[str, object]] = []
+        for bin_id in unique_bins.tolist():
+            mask = bins_arr == int(bin_id)
+            mask_train = mask[:train_idx]
+            coverage = float(mask_train[selected_train].mean()) if sel_total else 0.0
+            if coverage < min_coverage or coverage > max_coverage:
+                continue
+            pos_hits = int(np.sum(mask_train & positive_set))
+            neg_hits = int(np.sum(mask_train & negative_set))
+            if pos_hits < min_positive_hits:
+                continue
+            pos_rate = pos_hits / max(1, pos_total)
+            neg_rate = neg_hits / max(1, neg_total)
+            lift = pos_rate / max(neg_rate, eps)
+            if pos_rate < min_pos_rate or neg_rate > max_neg_rate or lift < min_lift:
+                continue
+
+            fam_candidates.append({
+                "name": f"{c}_bin == {int(bin_id)}",
+                "conds": [(c, "==", float(bin_id))],
+                "mask": mask,
+                "family": family,
+                "scale": meta.get("scale"),
+                "prefilter_score": float(pos_rate * np.log1p(lift)),
+                "primary_col": c,
+                "prefilter_pos_rate": float(pos_rate),
+                "prefilter_neg_rate": float(neg_rate),
+                "prefilter_lift": float(lift),
+                "prefilter_coverage": float(coverage),
+            })
+
+        fam_candidates = sorted(fam_candidates, key=lambda x: float(x["prefilter_score"]), reverse=True)[:top_per_family]
+        candidates.extend(fam_candidates)
+
+    candidates = sorted(candidates, key=lambda x: float(x["prefilter_score"]), reverse=True)
+    deduped: list[dict[str, object]] = []
+    seen_names: set[str] = set()
+    for cand in candidates:
+        name = str(cand["name"])
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        deduped.append(cand)
+        if len(deduped) >= max_candidates:
+            break
+
+    if max_features > 0:
+        deduped = deduped[:max_features]
+    return deduped
 
 
 def parse_tp_weights(tps: List[float], w_str: str) -> np.ndarray:
@@ -484,7 +645,8 @@ def simulate_multitp_trailing_pessimistic(
     trail_min_level: float,
     include_unrealized_at_test_end: bool,
     bar_time_ns: Optional[np.ndarray] = None,
-    tick_map: Optional[Dict[int, np.ndarray]] = None,
+    tick_prices_all: Optional[np.ndarray] = None,
+    tick_minute_bounds: Optional[Dict[int, tuple[int, int]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n = close.shape[0]
     pnl = np.full(n, np.nan, dtype=np.float64)
@@ -519,16 +681,18 @@ def simulate_multitp_trailing_pessimistic(
             l = low[j]
 
             tick_prices = None
-            if tick_map is not None and bar_time_ns is not None:
+            if tick_minute_bounds is not None and tick_prices_all is not None and bar_time_ns is not None:
                 minute_ns = int(bar_time_ns[j])
-                if minute_ns in tick_map:
+                bounds = tick_minute_bounds.get(minute_ns)
+                if bounds is not None:
                     critical = (
                         (l <= stop_level)
                         or (tp_enabled and hits < k_max and h >= tp_levels[hits])
                         or (trail and (not trailing_active) and ((h / entry) - 1.0) >= trail_activate)
                     )
                     if critical:
-                        tick_prices = tick_map[minute_ns]
+                        s_idx, e_idx = bounds
+                        tick_prices = tick_prices_all[s_idx:e_idx]
 
             if tick_prices is not None and tick_prices.size > 0:
                 for px in tick_prices:
@@ -637,6 +801,152 @@ def simulate_multitp_trailing_pessimistic(
     return pnl, y, t_exit, t_qual, tp_hits
 
 
+def simulate_selected_entries_with_ticks(
+    entry_indices: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    tps: List[float],
+    tp_w: np.ndarray,
+    tp_enabled: bool,
+    sl: float,
+    hold: int,
+    slippage_bps: float,
+    spread_bps: float,
+    trail: bool,
+    trail_activate: float,
+    trail_offset: float,
+    trail_factor: float,
+    include_unrealized_at_test_end: bool,
+    bar_time_ns: np.ndarray,
+    tick_prices_all: Optional[np.ndarray],
+    tick_minute_bounds: Optional[Dict[int, tuple[int, int]]],
+) -> dict[int, dict[str, float]]:
+    if tick_prices_all is None or tick_minute_bounds is None or entry_indices.size == 0:
+        return {}
+
+    slip = (slippage_bps + spread_bps) / 10000.0
+    tps_arr = np.asarray(tps, dtype=np.float64)
+    k_max = len(tps_arr)
+    out: dict[int, dict[str, float]] = {}
+
+    for i in entry_indices.tolist():
+        if i >= len(close) - 1:
+            continue
+        entry = float(close[i]) * (1.0 + slip)
+        stop_ret = -sl
+        stop_level = entry * (1.0 + stop_ret)
+        tp_levels = entry * (1.0 + tps_arr)
+        remaining = 1.0
+        realized = 0.0
+        hits = 0
+        max_profit_ret = 0.0
+        trailing_active = (not trail)
+        qualified = False
+        qual_k = -1
+        exit_k = -1
+        y_i = -1
+        pnl_i = float("nan")
+
+        for k in range(1, len(close) - i):
+            j = i + k
+            h = float(high[j])
+            l = float(low[j])
+            minute_ns = int(bar_time_ns[j])
+            tick_prices = None
+            bounds = tick_minute_bounds.get(minute_ns)
+            if bounds is not None:
+                critical = (
+                    (l <= stop_level)
+                    or (tp_enabled and hits < k_max and h >= tp_levels[hits])
+                    or (trail and (not trailing_active) and ((h / entry) - 1.0) >= trail_activate)
+                )
+                if critical:
+                    s_idx, e_idx = bounds
+                    tick_prices = tick_prices_all[s_idx:e_idx]
+
+            if tick_prices is not None and len(tick_prices) > 0:
+                for px in tick_prices:
+                    px = float(px)
+                    curr_profit_ret = (px / entry) - 1.0
+                    if curr_profit_ret > max_profit_ret:
+                        max_profit_ret = curr_profit_ret
+                    if trail and (not trailing_active) and max_profit_ret >= trail_activate:
+                        trailing_active = True
+                    if trail and trailing_active:
+                        cand = (max_profit_ret - trail_offset) * trail_factor
+                        if cand > stop_ret:
+                            stop_ret = cand
+                            stop_level = entry * (1.0 + stop_ret)
+                    if (not qualified) and trail and k <= hold and max_profit_ret >= trail_activate:
+                        qualified = True
+                        qual_k = k
+                    if px <= stop_level:
+                        realized += remaining * stop_ret
+                        pnl_i = realized
+                        y_i = 1 if qualified else (1 if realized > 0 else 0)
+                        exit_k = k
+                        break
+                    if tp_enabled:
+                        while hits < k_max and px >= tp_levels[hits]:
+                            w = min(float(tp_w[hits]), remaining)
+                            if w > 0:
+                                realized += w * float(tps_arr[hits])
+                                remaining -= w
+                            hits += 1
+                            if remaining <= 1e-12:
+                                pnl_i = realized
+                                y_i = 1 if qualified else (1 if realized > 0 else 0)
+                                exit_k = k
+                                break
+                        if y_i != -1:
+                            break
+                if y_i != -1:
+                    out[i] = {"pnl": pnl_i, "y": y_i, "t_exit": exit_k, "t_qual": qual_k, "tp_hits": hits}
+                    continue
+
+            curr_profit_ret = (h / entry) - 1.0
+            if curr_profit_ret > max_profit_ret:
+                max_profit_ret = curr_profit_ret
+            if trail and (not trailing_active) and max_profit_ret >= trail_activate:
+                trailing_active = True
+            if trail and trailing_active:
+                cand = (max_profit_ret - trail_offset) * trail_factor
+                if cand > stop_ret:
+                    stop_ret = cand
+                    stop_level = entry * (1.0 + stop_ret)
+            if (not qualified) and trail and k <= hold and max_profit_ret >= trail_activate:
+                qualified = True
+                qual_k = k
+            if l <= stop_level:
+                realized += remaining * stop_ret
+                pnl_i = realized
+                y_i = 1 if qualified else (1 if realized > 0 else 0)
+                exit_k = k
+                out[i] = {"pnl": pnl_i, "y": y_i, "t_exit": exit_k, "t_qual": qual_k, "tp_hits": hits}
+                break
+            if tp_enabled and hits < k_max and h >= tp_levels[hits]:
+                w = min(float(tp_w[hits]), remaining)
+                if w > 0:
+                    realized += w * float(tps_arr[hits])
+                    remaining -= w
+                hits += 1
+                if remaining <= 1e-12:
+                    pnl_i = realized
+                    y_i = 1 if qualified else (1 if realized > 0 else 0)
+                    exit_k = k
+                    out[i] = {"pnl": pnl_i, "y": y_i, "t_exit": exit_k, "t_qual": qual_k, "tp_hits": hits}
+                    break
+        else:
+            if include_unrealized_at_test_end:
+                final_ret = (float(close[-1]) / entry) - 1.0
+                out[i] = {"pnl": final_ret, "y": (1 if qualified else (1 if final_ret > 0 else 0)), "t_exit": len(close) - 1 - i, "t_qual": qual_k, "tp_hits": hits}
+            elif qualified:
+                out[i] = {"pnl": trail_activate, "y": 1, "t_exit": len(close) - 1 - i, "t_qual": qual_k, "tp_hits": hits}
+
+    return out
+
+
 def one_trade_at_a_time_from_masks(time_min: np.ndarray, candidate_mask: np.ndarray, minutes_to_exit: np.ndarray) -> np.ndarray:
     out = np.zeros_like(candidate_mask, dtype=bool)
     pos = np.flatnonzero(candidate_mask)
@@ -701,29 +1011,290 @@ def annualized_return_from_factor(ret_factor: float, years: float, eps: float = 
     return float(capital ** (1.0 / years) - 1.0)
 
 
-def _score_higher_better(x: float, bad: float, mid: float, good: float, k_low: float, k_high: float, eps: float = 1e-12) -> float:
+def compounded_return_safe(x: np.ndarray, eps: float = 1e-12) -> float:
+    """Stable compounded return for arrays of per-trade returns.
+
+    Uses sum(log1p(r)) to avoid overflow in np.prod(1+r) for very long vectors.
+    Returns NaN when any trade return is <= -100%.
+    """
+    if x.size == 0:
+        return float("nan")
+    x = np.asarray(x, dtype=np.float64)
+    if np.any(~np.isfinite(x)):
+        return float("nan")
+    if np.any(x <= -1.0 + eps):
+        return float("nan")
+
+    s = float(np.sum(np.log1p(x)))
+    # clamp to finite exp domain to avoid warnings and inf
+    s = max(min(s, 700.0), -745.0)
+    return float(np.expm1(s))
+
+
+def linear_annual_return(sum_return: float, years: float, eps: float = 1e-12) -> float:
+    if not np.isfinite(sum_return) or years <= eps:
+        return float("nan")
+    return float(sum_return / years)
+
+
+def profit_factor(x: np.ndarray, eps: float = 1e-12) -> float:
+    if x.size == 0:
+        return float("nan")
+    pos = float(np.sum(x[x > 0]))
+    neg = float(-np.sum(x[x < 0]))
+    if neg <= eps:
+        return float("inf") if pos > eps else float("nan")
+    return float(pos / neg)
+
+
+def positive_trade_diagnostics(x: np.ndarray) -> dict[str, float]:
+    pos = np.asarray(x[x > 0], dtype=np.float64)
+    if pos.size == 0:
+        return {
+            "avg_positive_pnl": float("nan"),
+            "median_positive_pnl": float("nan"),
+            "p90_positive_pnl": float("nan"),
+            "runner_outlier_share": float("nan"),
+        }
+    k = max(1, int(np.ceil(pos.size * 0.10)))
+    top = np.sort(pos)[-k:]
+    total = float(pos.sum())
+    return {
+        "avg_positive_pnl": float(np.mean(pos)),
+        "median_positive_pnl": float(np.median(pos)),
+        "p90_positive_pnl": float(np.quantile(pos, 0.90)),
+        "runner_outlier_share": float(top.sum() / total) if total > 0 else float("nan"),
+    }
+
+
+def compute_balance_drawdowns(sum_returns: np.ndarray, start_balance: float = 1.0) -> dict[str, float]:
+    if sum_returns.size == 0:
+        return {
+            "absolute_dd_pct": float("nan"),
+            "max_dd_pct": float("nan"),
+            "relative_dd_pct": float("nan"),
+        }
+    bal = start_balance + np.cumsum(np.asarray(sum_returns, dtype=np.float64))
+    min_bal = float(np.min(bal))
+    absolute_dd = max(0.0, (start_balance - min_bal) / start_balance)
+
+    peak = start_balance
+    max_dd_abs = 0.0
+    max_dd_rel = 0.0
+    for b in bal:
+        if b > peak:
+            peak = float(b)
+        dd_abs = (peak - float(b)) / start_balance
+        dd_rel = (peak - float(b)) / peak if peak > 0 else float("nan")
+        if np.isfinite(dd_abs):
+            max_dd_abs = max(max_dd_abs, dd_abs)
+        if np.isfinite(dd_rel):
+            max_dd_rel = max(max_dd_rel, dd_rel)
+    return {
+        "absolute_dd_pct": float(absolute_dd),
+        "max_dd_pct": float(max_dd_abs),
+        "relative_dd_pct": float(max_dd_rel),
+    }
+
+
+def estimate_lot_scenarios(
+    close_test: pd.Series,
+    account_margin_usd: float,
+    broker_leverage: float,
+    lot_step: float,
+    contract_units_per_lot: float,
+) -> dict[str, float]:
+    px_max = float(close_test.max()) if len(close_test) else float("nan")
+    if not np.isfinite(px_max) or px_max <= 0 or account_margin_usd <= 0 or broker_leverage <= 0:
+        return {"lot_small": 0.01, "lot_max_single": float("nan")}
+
+    max_lot = (account_margin_usd * broker_leverage) / (contract_units_per_lot * px_max)
+    max_lot = max(0.0, np.floor(max_lot / lot_step) * lot_step)
+    lot_small = max(lot_step, 0.01)
+    return {
+        "lot_small": float(lot_small),
+        "lot_max_single": float(max_lot),
+    }
+
+
+def resolve_lot_run(
+    lot_scenarios: dict[str, float],
+    one_trade_at_a_time: bool,
+    lot_step: float,
+    seed: int,
+    lot_run: float,
+    lot_run_min: float,
+    lot_run_choices: str,
+) -> float:
+    lot_max_single = float(lot_scenarios.get("lot_max_single", float("nan")))
+    if not np.isfinite(lot_max_single) or lot_max_single <= 0:
+        return float("nan")
+    if one_trade_at_a_time:
+        return lot_max_single
+
+    parsed_choices = [float(x) for x in str(lot_run_choices).split(",") if str(x).strip()]
+    if parsed_choices:
+        choice = parsed_choices[abs(int(seed)) % len(parsed_choices)]
+        chosen = min(choice, lot_max_single)
+        return float(np.floor(chosen / lot_step) * lot_step)
+
+    if np.isfinite(lot_run) and lot_run > 0:
+        chosen = min(float(lot_run), lot_max_single)
+        return float(np.floor(chosen / lot_step) * lot_step)
+
+    lo = max(float(lot_run_min), lot_step, 0.01)
+    hi = lot_max_single
+    if hi < lo:
+        return float(np.floor(max(0.0, hi) / lot_step) * lot_step)
+    rng = np.random.default_rng(abs(int(seed)) + 17)
+    chosen = float(rng.uniform(lo, hi))
+    return float(np.floor(chosen / lot_step) * lot_step)
+
+
+def max_open_trades_for_lot(
+    lot: float,
+    reference_price: float,
+    account_margin_usd: float,
+    broker_leverage: float,
+    contract_units_per_lot: float,
+) -> int:
+    if lot <= 0 or reference_price <= 0 or account_margin_usd <= 0 or broker_leverage <= 0:
+        return 0
+    margin_per_trade = lot * contract_units_per_lot * reference_price / broker_leverage
+    if margin_per_trade <= 0:
+        return 0
+    return max(0, int(np.floor(account_margin_usd / margin_per_trade)))
+
+
+def select_trade_mask(
+    time_min: np.ndarray,
+    candidate_mask: np.ndarray,
+    minutes_to_exit: np.ndarray,
+    max_open_trades: int,
+    cluster_gap_minutes: int,
+    max_entries_per_cluster: int,
+) -> np.ndarray:
+    out = np.zeros_like(candidate_mask, dtype=bool)
+    if max_open_trades <= 0 or max_entries_per_cluster <= 0:
+        return out
+    pos = np.flatnonzero(candidate_mask)
+    if pos.size == 0:
+        return out
+
+    active_until: list[int] = []
+    last_candidate_t: Optional[int] = None
+    cluster_entries = 0
+
+    for p in pos:
+        t = int(time_min[p])
+        m = int(minutes_to_exit[p])
+        if m < 1:
+            continue
+
+        active_until = [x for x in active_until if x > t]
+
+        if last_candidate_t is None or (t - last_candidate_t) > cluster_gap_minutes:
+            cluster_entries = 0
+        last_candidate_t = t
+
+        if cluster_entries >= max_entries_per_cluster:
+            continue
+        if len(active_until) >= max_open_trades:
+            continue
+
+        out[p] = True
+        active_until.append(t + m)
+        cluster_entries += 1
+
+    return out
+
+
+def is_binary_feature(s: pd.Series) -> bool:
+    vals = pd.unique(pd.to_numeric(s.dropna(), errors="coerce"))
+    vals = vals[pd.notna(vals)]
+    if vals.size == 0:
+        return False
+    vals = np.unique(np.asarray(vals, dtype=np.float64))
+    return vals.size <= 2 and set(np.round(vals, 8).tolist()).issubset({0.0, 1.0})
+
+
+def _normalize_higher_better(x: float, bad: float, mid: float, good: float, eps: float = 1e-12) -> float:
     if not np.isfinite(x):
-        return eps
-    bad = float(bad); mid = float(mid); good = float(good)
+        return 0.0
+    bad = float(bad)
+    mid = float(mid)
+    good = float(good)
     if not (bad < mid < good):
-        return eps
+        return 0.0
     if x <= bad:
-        return float(max(eps, 0.25 * np.exp(-max(eps, k_low) * (bad - x))))
-    if x < mid:
-        u = (x - bad) / (mid - bad)
-        return float(min(1.0 - eps, max(eps, 0.25 + 0.25 * u)))
-    if x < good:
-        u = (x - mid) / (good - mid)
-        return float(min(1.0 - eps, max(eps, 0.50 + 0.25 * u)))
-    v = 1.0 - np.exp(-max(eps, k_high) * (x - good))
-    return float(min(1.0 - eps, max(eps, 0.75 + 0.25 * v)))
+        return 0.0
+    if x >= good:
+        return 1.0
+    if x <= mid:
+        return float(max(eps, 0.5 * ((x - bad) / (mid - bad))))
+    return float(min(1.0, 0.5 + 0.5 * ((x - mid) / (good - mid))))
 
 
-def _score_lower_better(x: float, good: float, mid: float, bad: float, k_low: float, k_high: float, eps: float = 1e-12) -> float:
+def _normalize_lower_better(x: float, good: float, mid: float, bad: float, eps: float = 1e-12) -> float:
     if not np.isfinite(x):
-        return eps
-    # invert by mapping -x as higher-better with mirrored anchors
-    return _score_higher_better(-float(x), -float(bad), -float(mid), -float(good), k_low=k_low, k_high=k_high, eps=eps)
+        return 0.0
+    return _normalize_higher_better(-float(x), -float(bad), -float(mid), -float(good), eps=eps)
+
+
+def compute_regime_breakdown(
+    df: pd.DataFrame,
+    selected_mask: np.ndarray,
+    pnl_values: np.ndarray,
+    score_cfg: dict,
+    sl: float,
+    trail_activate: float,
+    trail_offset: float,
+    trail_factor: float,
+    prefix: str,
+) -> dict[str, float]:
+    out: dict[str, float] = {}
+    regime_cols = [
+        "regime_dir_bull",
+        "regime_dir_bear",
+        "regime_dir_sideways",
+        "regime_vol_high",
+        "regime_vol_normal",
+        "regime_vol_low",
+    ]
+    total_hits = int(np.sum(selected_mask))
+    if total_hits <= 0:
+        return out
+    trail_floor = max(0.0, (trail_activate - trail_offset) * trail_factor)
+
+    for regime_col in regime_cols:
+        if regime_col not in df.columns:
+            continue
+        regime_arr = pd.to_numeric(df[regime_col], errors="coerce").fillna(0).to_numpy(dtype=np.float32, copy=False)
+        regime_sel = selected_mask & (regime_arr > 0.5)
+        hits = int(np.sum(regime_sel))
+        key = f"{prefix}_{regime_col}"
+        out[f"{key}_trade_share"] = float(hits / total_hits) if total_hits else float("nan")
+        out[f"{key}_activity_share"] = out[f"{key}_trade_share"]
+        if hits <= 0:
+            out[f"{key}_sum_return"] = float("nan")
+            out[f"{key}_relative_dd_pct"] = float("nan")
+            out[f"{key}_score"] = float("nan")
+            continue
+
+        pp = np.asarray(pnl_values[regime_sel], dtype=np.float64)
+        sum_return = float(np.sum(pp))
+        dd = compute_balance_drawdowns(pp)
+        pf = profit_factor(pp)
+        runner_eff = float(np.quantile(np.maximum(0.0, pp - trail_floor), 0.90) / max(sl, 1e-12))
+        R = _normalize_higher_better(sum_return, score_cfg["ret_bad_test"], score_cfg["ret_mid_test"], score_cfg["ret_good_test"])
+        DD = _normalize_lower_better(dd["relative_dd_pct"], score_cfg["dd_good"], score_cfg["dd_mid"], score_cfg["dd_bad"])
+        PF = _normalize_higher_better(pf, score_cfg["pf_bad"], score_cfg["pf_mid"], score_cfg["pf_good"])
+        RE = _normalize_higher_better(runner_eff, score_cfg["re_bad"], score_cfg["re_mid"], score_cfg["re_good"])
+        score = 100.0 * (0.325 * R + 0.275 * DD + 0.225 * PF + 0.175 * RE) * np.sqrt(max(1e-9, min(R, DD, PF, RE)))
+        out[f"{key}_sum_return"] = sum_return
+        out[f"{key}_relative_dd_pct"] = dd["relative_dd_pct"]
+        out[f"{key}_score"] = float(score)
+    return out
 
 
 def walk_forward_test_stats(
@@ -773,8 +1344,8 @@ def walk_forward_test_stats(
 
 def mine_best_rule(
     df: pd.DataFrame,
+    binned_df: pd.DataFrame,
     cols: List[str],
-    thresholds: Dict[str, Dict[float, float]],
     train_idx: int,
     y: np.ndarray,
     pnl: np.ndarray,
@@ -794,6 +1365,43 @@ def mine_best_rule(
     two_starts_topk: int,
     two_starts_family_topn: int,
     score_cfg: dict,
+    sl: float,
+    trail_activate: float,
+    trail_offset: float,
+    trail_factor: float,
+    cluster_gap_minutes: int,
+    max_entries_per_cluster: int,
+    account_margin_usd: float,
+    broker_leverage: float,
+    lot_step: float,
+    contract_units_per_lot: float,
+    lot_run: float,
+    lot_run_min: float,
+    lot_run_choices: str,
+    prefilter_top_per_family: int,
+    prefilter_max_candidates: int,
+    prefilter_min_positive_hits: int,
+    prefilter_min_pos_rate: float,
+    prefilter_max_neg_rate: float,
+    prefilter_min_lift: float,
+    prefilter_min_coverage: float,
+    prefilter_max_coverage: float,
+    seed: int,
+    final_tick_validation: bool,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    tps: List[float],
+    tp_w: np.ndarray,
+    tp_enabled: bool,
+    trail: bool,
+    hold: int,
+    slippage_bps: float,
+    spread_bps: float,
+    include_unrealized_at_test_end: bool,
+    bar_time_ns: np.ndarray,
+    tick_prices_all: Optional[np.ndarray] = None,
+    tick_minute_bounds: Optional[Dict[int, tuple[int, int]]] = None,
 ) -> Tuple[dict, pd.DataFrame]:
     n = len(df)
     y_test = y[train_idx:]
@@ -819,12 +1427,59 @@ def mine_best_rule(
         m = (yy == 0) | (yy == 1)
         return float(np.mean(pp[m])) if m.any() else float("nan")
 
-    conds: List[Cond] = []
-    for c in cols:
-        if c not in thresholds:
-            continue
-        for q, thr in thresholds[c].items():
-            conds.append((c, "<=" if q <= 0.5 else ">=", thr))
+    close_test_series = df["close"].iloc[train_idx:].astype(float)
+    lot_scenarios = estimate_lot_scenarios(
+        close_test=close_test_series,
+        account_margin_usd=account_margin_usd,
+        broker_leverage=broker_leverage,
+        lot_step=lot_step,
+        contract_units_per_lot=contract_units_per_lot,
+    )
+    reference_price_test = float(close_test_series.max()) if len(close_test_series) else float("nan")
+    lot_run_resolved = resolve_lot_run(
+        lot_scenarios=lot_scenarios,
+        one_trade_at_a_time=one_trade_at_a_time,
+        lot_step=lot_step,
+        seed=seed,
+        lot_run=lot_run,
+        lot_run_min=lot_run_min,
+        lot_run_choices=lot_run_choices,
+    )
+    max_open_run = 1 if one_trade_at_a_time else max_open_trades_for_lot(
+        lot_run_resolved,
+        reference_price_test,
+        account_margin_usd,
+        broker_leverage,
+        contract_units_per_lot,
+    )
+    max_open_run = max(1, max_open_run) if one_trade_at_a_time else max_open_run
+
+    realistic_train_mask = select_trade_mask(
+        time_min=time_min[:train_idx],
+        candidate_mask=tradable_train,
+        minutes_to_exit=t_exit[:train_idx],
+        max_open_trades=max_open_run,
+        cluster_gap_minutes=cluster_gap_minutes,
+        max_entries_per_cluster=max_entries_per_cluster,
+    )
+
+    candidates = build_prefiltered_candidates(
+        df=df,
+        binned_df=binned_df,
+        cols=cols,
+        train_idx=train_idx,
+        y=y,
+        realistic_train_mask=realistic_train_mask,
+        max_features=max(len(cols), prefilter_max_candidates),
+        top_per_family=prefilter_top_per_family,
+        max_candidates=prefilter_max_candidates,
+        min_positive_hits=prefilter_min_positive_hits,
+        min_pos_rate=prefilter_min_pos_rate,
+        max_neg_rate=prefilter_max_neg_rate,
+        min_lift=prefilter_min_lift,
+        min_coverage=prefilter_min_coverage,
+        max_coverage=prefilter_max_coverage,
+    )
 
     summary_empty = {
         "rule": "",
@@ -834,7 +1489,6 @@ def mine_best_rule(
         "test_base_ev": base_ev(pnl_test, y_test),
         "test_ev": float("nan"),
         "test_win": float("nan"),
-        "test_sharpe_proxy": float("nan"),
         "test_hits": 0,
         "test_median_signals_day": 0.0,
         "test_median_minutes_to_exit": float("nan"),
@@ -851,43 +1505,53 @@ def mine_best_rule(
         "test_cumulative_return": float("nan"),
         "train_hits": 0,
     }
-    if not conds:
+    if not candidates:
         return summary_empty, pd.DataFrame()
 
     two_starts_topk = max(2, int(two_starts_topk))
     two_starts_family_topn = max(1, int(two_starts_family_topn))
-    same_reference_group = {} if disable_same_reference_check else _build_same_reference_groups(df.iloc[:train_idx], conds)
-
-    col_values = {c: df[c].to_numpy(copy=False) for c in cols}
+    fake_conds = [(str(c["primary_col"]), ">=", 0.0) for c in candidates]
+    same_reference_group = {} if disable_same_reference_check else _build_same_reference_groups(df.iloc[:train_idx], fake_conds)
     test_weekdays = max(1, int((df.index[train_idx:].dayofweek < 5).sum()))
     train_weekdays = max(1, int((df.index[:train_idx].dayofweek < 5).sum()))
     test_years = test_weekdays / 252.0
     train_years = train_weekdays / 252.0
-    cond_masks = []
-    for c, op, thr in conds:
-        x = col_values[c]
-        m = (x <= thr) if op == "<=" else (x >= thr)
-        cond_masks.append(m)
 
     def score(mask_full: np.ndarray, required_hits: int = min_test_hits) -> Optional[dict]:
         cand_train = mask_full[:train_idx] & tradable_train
         if not cand_train.any():
             return None
-        sel_train = one_trade_at_a_time_from_masks(time_min[:train_idx], cand_train, t_exit[:train_idx]) if one_trade_at_a_time else cand_train.copy()
+        max_open_train = max_open_run
+        sel_train = select_trade_mask(
+            time_min=time_min[:train_idx],
+            candidate_mask=cand_train,
+            minutes_to_exit=t_exit[:train_idx],
+            max_open_trades=max_open_train,
+            cluster_gap_minutes=cluster_gap_minutes,
+            max_entries_per_cluster=max_entries_per_cluster,
+        )
         train_hits = int(sel_train.sum())
         if train_hits == 0:
             return None
         train_pp = pnl[:train_idx][sel_train]
-        train_cum = float(np.prod(1.0 + train_pp) - 1.0) if train_hits else float("nan")
+        train_sum_return = float(np.sum(train_pp)) if train_hits else float("nan")
         min_hits_ok = train_hits >= required_hits
-        override_ok = (min_hits_return_override > 0) and (train_cum >= min_hits_return_override)
+        override_ok = (min_hits_return_override > 0) and (train_sum_return >= min_hits_return_override)
         if not (min_hits_ok or override_ok):
             return None
 
         cand_test = mask_full[train_idx:] & tradable_test
         if not cand_test.any():
             return None
-        sel = one_trade_at_a_time_from_masks(time_min_test, cand_test, t_exit_test) if one_trade_at_a_time else cand_test.copy()
+        max_open_test = max_open_run
+        sel = select_trade_mask(
+            time_min=time_min_test,
+            candidate_mask=cand_test,
+            minutes_to_exit=t_exit_test,
+            max_open_trades=max_open_test,
+            cluster_gap_minutes=cluster_gap_minutes,
+            max_entries_per_cluster=max_entries_per_cluster,
+        )
         hits = int(sel.sum())
         if hits == 0:
             return None
@@ -898,48 +1562,50 @@ def mine_best_rule(
         _ = u
         med_per_day = float(np.median(counts)) if counts.size else 0.0
 
-        # score components (test side) using annualized return and trading-day activity
-        test_ret_factor = float(np.prod(1.0 + pp) - 1.0)
-        test_ann = annualized_return_from_factor(test_ret_factor, test_years)
-        test_sortino = sortino_proxy(pp)
-        test_trades_day = float(hits / test_weekdays)
-
-        train_ann = annualized_return_from_factor(train_cum, train_years)
+        test_sum_return = float(np.sum(pp))
+        test_ann = linear_annual_return(test_sum_return, test_years)
+        train_ann = linear_annual_return(train_sum_return, train_years)
+        dd_test = compute_balance_drawdowns(pp)
+        dd_train = compute_balance_drawdowns(train_pp)
+        pf_test = profit_factor(pp)
+        pf_train = profit_factor(train_pp)
+        trail_floor = max(0.0, (trail_activate - trail_offset) * trail_factor)
+        runner_eff_test = float(np.quantile(np.maximum(0.0, pp - trail_floor), 0.90) / max(sl, 1e-12)) if hits else float("nan")
+        runner_eff_train = float(np.quantile(np.maximum(0.0, train_pp - trail_floor), 0.90) / max(sl, 1e-12)) if train_hits else float("nan")
+        rar_test = float(test_sum_return / max(dd_test["relative_dd_pct"], 1e-9)) if np.isfinite(dd_test["relative_dd_pct"]) else float("nan")
+        rar_train = float(train_sum_return / max(dd_train["relative_dd_pct"], 1e-9)) if np.isfinite(dd_train["relative_dd_pct"]) else float("nan")
 
         ret_bad_train = float(score_cfg["ret_bad_train"])
         ret_mid_train = float(score_cfg["ret_mid_train"])
         ret_good_train = float(score_cfg["ret_good_train"])
 
-        R_test = _score_higher_better(test_ann, score_cfg["ret_bad_test"], score_cfg["ret_mid_test"], score_cfg["ret_good_test"], score_cfg["k_low"], score_cfg["k_high"])
-        eq_score = np.cumprod(1.0 + pp)
-        dd_raw = abs(float(np.min((eq_score / np.maximum.accumulate(eq_score)) - 1.0))) if hits else float("nan")
-        DD_test = _score_lower_better(dd_raw, score_cfg["dd_good"], score_cfg["dd_mid"], score_cfg["dd_bad"], score_cfg["k_low"], score_cfg["k_high"])
-        So_test = _score_higher_better(test_sortino, score_cfg["so_bad"], score_cfg["so_mid"], score_cfg["so_good"], score_cfg["k_low"], score_cfg["k_high"])
-        T_test = _score_higher_better(test_trades_day, score_cfg["tr_bad_test"], score_cfg["tr_mid_test"], score_cfg["tr_good_test"], score_cfg["k_low"], score_cfg["k_high"])
+        R_test = _normalize_higher_better(test_sum_return, score_cfg["ret_bad_test"], score_cfg["ret_mid_test"], score_cfg["ret_good_test"])
+        DD_test = _normalize_lower_better(dd_test["relative_dd_pct"], score_cfg["dd_good"], score_cfg["dd_mid"], score_cfg["dd_bad"])
+        PF_test = _normalize_higher_better(pf_test, score_cfg["pf_bad"], score_cfg["pf_mid"], score_cfg["pf_good"])
+        RE_test = _normalize_higher_better(runner_eff_test, score_cfg["re_bad"], score_cfg["re_mid"], score_cfg["re_good"])
 
-        R_train = _score_higher_better(train_ann, ret_bad_train, ret_mid_train, ret_good_train, score_cfg["k_low"], score_cfg["k_high"])
-        So_train = So_test
-        T_train = _score_higher_better(float(train_hits / train_weekdays), score_cfg["tr_bad_train"], score_cfg["tr_mid_train"], score_cfg["tr_good_train"], score_cfg["k_low"], score_cfg["k_high"])
-        DD_train = DD_test
+        R_train = _normalize_higher_better(train_sum_return, ret_bad_train, ret_mid_train, ret_good_train)
+        DD_train = _normalize_lower_better(dd_train["relative_dd_pct"], score_cfg["dd_good"], score_cfg["dd_mid"], score_cfg["dd_bad"])
+        PF_train = _normalize_higher_better(pf_train, score_cfg["pf_bad"], score_cfg["pf_mid"], score_cfg["pf_good"])
+        RE_train = _normalize_higher_better(runner_eff_train, score_cfg["re_bad"], score_cfg["re_mid"], score_cfg["re_good"])
 
-        score_test = 0.45 * R_test + 0.30 * DD_test + 0.10 * So_test + 0.15 * T_test
-        score_train = 0.40 * R_train + 0.25 * DD_train + 0.10 * So_train + 0.25 * T_train
+        score_test = 0.325 * R_test + 0.275 * DD_test + 0.225 * PF_test + 0.175 * RE_test
+        score_train = 0.325 * R_train + 0.275 * DD_train + 0.225 * PF_train + 0.175 * RE_train
         base_score = 0.75 * score_test + 0.25 * score_train
-        penalty = float(np.sqrt(max(1e-9, min(R_test, DD_test, So_test, T_test))))
+        penalty = float(np.sqrt(max(1e-9, min(R_test, DD_test, PF_test, RE_test))))
         score_visible = float(100.0 * base_score * penalty)
 
         return {
             "ev": float(np.mean(pp)),
             "win": float((yy == 1).mean()),
-            "sharpe": sharpe_proxy(pp),
             "hits": hits,
             "train_hits": train_hits,
             "median_per_day": med_per_day,
             "median_exit": float(np.median(t_exit_test[sel])) if hits else float("nan"),
             "median_qualify": float(np.median(t_qual_test[sel][t_qual_test[sel] >= 0])) if hits and np.any(t_qual_test[sel] >= 0) else float("nan"),
             "median_tp_hits": float(np.median(tp_hits_test[sel])) if hits else float("nan"),
-            "cumulative_return": float(np.prod(1.0 + pp) - 1.0),
-            "train_cumulative_return": train_cum,
+            "test_sum_return": test_sum_return,
+            "train_sum_return": train_sum_return,
             "min_hits_override_used": int((not min_hits_ok) and override_ok),
             "score": score_visible,
             "score_test": score_test,
@@ -947,8 +1613,18 @@ def mine_best_rule(
             "score_penalty": penalty,
             "test_ann_return": test_ann,
             "train_ann_return": train_ann,
-            "test_sortino_proxy": test_sortino,
-            "test_trades_per_day": test_trades_day,
+            "test_profit_factor": pf_test,
+            "train_profit_factor": pf_train,
+            "test_runner_efficiency_p90": runner_eff_test,
+            "train_runner_efficiency_p90": runner_eff_train,
+            "test_profit_factor_norm": PF_test,
+            "train_profit_factor_norm": PF_train,
+            "test_runner_efficiency_norm": RE_test,
+            "train_runner_efficiency_norm": RE_train,
+            "test_drawdowns": dd_test,
+            "train_drawdowns": dd_train,
+            "test_risk_adjusted_return": rar_test,
+            "train_risk_adjusted_return": rar_train,
             "mask": mask_full,
             "sel": sel,
         }
@@ -967,8 +1643,6 @@ def mine_best_rule(
             b_main = b.get("score", float("nan"))
         if a_main != b_main:
             return a_main > b_main
-        if np.isfinite(a["sharpe"]) and np.isfinite(b["sharpe"]) and a["sharpe"] != b["sharpe"]:
-            return a["sharpe"] > b["sharpe"]
         if a["hits"] != b["hits"]:
             return a["hits"] > b["hits"]
         return a["win"] > b["win"]
@@ -989,7 +1663,8 @@ def mine_best_rule(
         best: Optional[dict] = None
         best_idxs: List[int] = []
         single_scores: List[Tuple[int, dict]] = []
-        for i, m in enumerate(cond_masks):
+        for i, cand in enumerate(candidates):
+            m = np.asarray(cand["mask"], dtype=bool)
             sc = score(m, required_hits=req_hits)
             if sc is None:
                 continue
@@ -1007,13 +1682,13 @@ def mine_best_rule(
 
                 best_ext = None
                 best_ext_idxs: Optional[List[int]] = None
-                used_feat = {conds[base_i][0]}
-                for j, (c, _, _) in enumerate(conds):
-                    if j == base_i or c in used_feat:
+                used_feat = {str(candidates[base_i]["primary_col"])}
+                for j, cand in enumerate(candidates):
+                    if j == base_i or str(cand["primary_col"]) in used_feat:
                         continue
-                    if not _rule_extension_allowed([base_i], j, conds, same_reference_group):
+                    if not _rule_extension_allowed([base_i], j, candidates, same_reference_group):
                         continue
-                    sc = score(cond_masks[base_i] & cond_masks[j], required_hits=req_hits)
+                    sc = score(np.asarray(candidates[base_i]["mask"], dtype=bool) & np.asarray(candidates[j]["mask"], dtype=bool), required_hits=req_hits)
                     if sc is not None and better(sc, best_ext):
                         best_ext = sc
                         best_ext_idxs = [base_i, j]
@@ -1023,7 +1698,7 @@ def mine_best_rule(
                 pair_seed_idxs = [i for i, _ in singles_sorted[:two_starts_topk]]
                 fam_buckets: Dict[str, List[Tuple[int, dict]]] = {}
                 for i0, sc0 in single_scores:
-                    fam = str(_parse_feature_meta(conds[i0][0]).get("family", conds[i0][0]))
+                    fam = str(candidates[i0].get("family", candidates[i0]["name"]))
                     fam_buckets.setdefault(fam, []).append((i0, sc0))
                 fam_idxs: List[int] = []
                 for _, arr in fam_buckets.items():
@@ -1038,11 +1713,11 @@ def mine_best_rule(
                     i = pair_seed_idxs[a]
                     for b in range(a + 1, len(pair_seed_idxs)):
                         j = pair_seed_idxs[b]
-                        if conds[i][0] == conds[j][0]:
+                        if candidates[i]["primary_col"] == candidates[j]["primary_col"]:
                             continue
-                        if not _rule_extension_allowed([i], j, conds, same_reference_group):
+                        if not _rule_extension_allowed([i], j, candidates, same_reference_group):
                             continue
-                        sc = score(cond_masks[i] & cond_masks[j], required_hits=req_hits)
+                        sc = score(np.asarray(candidates[i]["mask"], dtype=bool) & np.asarray(candidates[j]["mask"], dtype=bool), required_hits=req_hits)
                         if sc is not None and better(sc, best_pair):
                             best_pair = sc
                             best_pair_idxs = [i, j]
@@ -1060,16 +1735,16 @@ def mine_best_rule(
                 current_idxs = chosen_idxs[:]
 
             while len(current_idxs) < max_conds:
-                used_feat = {conds[i][0] for i in current_idxs}
+                used_feat = {str(candidates[i]["primary_col"]) for i in current_idxs}
                 best_cand = None
                 best_idx = None
                 cm = current["mask"]
-                for i, (c, _, _) in enumerate(conds):
-                    if i in current_idxs or c in used_feat:
+                for i, cand in enumerate(candidates):
+                    if i in current_idxs or str(cand["primary_col"]) in used_feat:
                         continue
-                    if not _rule_extension_allowed(current_idxs, i, conds, same_reference_group):
+                    if not _rule_extension_allowed(current_idxs, i, candidates, same_reference_group):
                         continue
-                    sc = score(cm & cond_masks[i], required_hits=req_hits)
+                    sc = score(cm & np.asarray(candidates[i]["mask"], dtype=bool), required_hits=req_hits)
                     if sc is not None and better(sc, best_cand):
                         best_cand = sc
                         best_idx = i
@@ -1089,16 +1764,16 @@ def mine_best_rule(
                 current = best_cand
 
             while len(current_idxs) < min_conds:
-                used_feat = {conds[i][0] for i in current_idxs}
+                used_feat = {str(candidates[i]["primary_col"]) for i in current_idxs}
                 best_cand = None
                 best_idx = None
                 cm = current["mask"]
-                for i, (c, _, _) in enumerate(conds):
-                    if i in current_idxs or c in used_feat:
+                for i, cand in enumerate(candidates):
+                    if i in current_idxs or str(cand["primary_col"]) in used_feat:
                         continue
-                    if not _rule_extension_allowed(current_idxs, i, conds, same_reference_group):
+                    if not _rule_extension_allowed(current_idxs, i, candidates, same_reference_group):
                         continue
-                    sc = score(cm & cond_masks[i], required_hits=req_hits)
+                    sc = score(cm & np.asarray(candidates[i]["mask"], dtype=bool), required_hits=req_hits)
                     if sc is not None and better(sc, best_cand):
                         best_cand = sc
                         best_idx = i
@@ -1115,11 +1790,18 @@ def mine_best_rule(
             return summary_empty, pd.DataFrame()
         req_hits = decay_hits_threshold(req_hits)
 
-    rule = simplify_rule([conds[i] for i in current_idxs])
+    rule_parts: list[Cond] = []
+    for i in current_idxs:
+        rule_parts.extend(candidates[i]["conds"])
+    rule = simplify_rule([(c, op, thr) for c, op, thr in rule_parts if op in {"<=", ">="}])
+    binary_rule = [(c, op, thr) for c, op, thr in rule_parts if op == "=="]
     mask = np.ones(n, dtype=bool)
     for c, op, thr in rule:
-        x = col_values[c]
+        x = pd.to_numeric(df[c], errors="coerce").to_numpy(copy=False)
         mask &= (x <= thr) if op == "<=" else (x >= thr)
+    for c, op, thr in binary_rule:
+        x = pd.to_numeric(binned_df[c], errors="coerce").to_numpy(copy=False)
+        mask &= np.isfinite(x) & (np.abs(x - thr) <= 1e-6)
 
     final = score(mask, required_hits=req_hits)
     if final is None:
@@ -1127,7 +1809,14 @@ def mine_best_rule(
         mask = current["mask"]
 
     cand_test_final = mask[train_idx:] & tradable_test
-    sel_test = one_trade_at_a_time_from_masks(time_min_test, cand_test_final, t_exit_test) if one_trade_at_a_time else cand_test_final.copy()
+    sel_test = select_trade_mask(
+        time_min=time_min_test,
+        candidate_mask=cand_test_final,
+        minutes_to_exit=t_exit_test,
+        max_open_trades=max_open_run,
+        cluster_gap_minutes=cluster_gap_minutes,
+        max_entries_per_cluster=max_entries_per_cluster,
+    )
 
     dt_idx = df.index[train_idx:][sel_test]
     sig = pd.DataFrame(index=dt_idx)
@@ -1136,6 +1825,11 @@ def mine_best_rule(
     sig["outcome"] = np.where(y_test[sel_test] == 1, "TP", "SL")
     sig["minutes_to_hit"] = t_exit_test[sel_test].astype(int)
     sig["tp_hits"] = tp_hits_test[sel_test].astype(int)
+    sig["row_close"] = sig["close"]
+    sig["row_pnl"] = sig["pnl"]
+    sig["row_outcome"] = sig["outcome"]
+    sig["row_minutes_to_hit"] = sig["minutes_to_hit"]
+    sig["row_tp_hits"] = sig["tp_hits"]
 
     wf_mean_win, wf_min_win, wf_mean_ev, wf_total_hits = walk_forward_test_stats(
         time_min_test=time_min_test,
@@ -1144,13 +1838,16 @@ def mine_best_rule(
         pnl_test=pnl_test,
         y_test=y_test,
         wf_folds=wf_folds,
-        one_trade_at_a_time=one_trade_at_a_time,
+        one_trade_at_a_time=False,
     )
 
     yy = y_test[sel_test]
     pp = pnl_test[sel_test]
     hits = int(sel_test.sum())
-    rule_str = " & ".join([f"{c} {op} {thr:.6g}" for c, op, thr in rule])
+    rule_str = " & ".join(
+        [f"{c} {op} {thr:.6g}" for c, op, thr in rule] +
+        [f"{c} == {int(thr)}" for c, _, thr in binary_rule]
+    )
 
     # Train-side rule metrics (same gating logic as test)
     y_train = y[:train_idx]
@@ -1160,29 +1857,121 @@ def mine_best_rule(
     tradable_train = tradable[:train_idx]
     time_min_train = time_min[:train_idx]
     cand_train = mask[:train_idx] & tradable_train
-    sel_train = one_trade_at_a_time_from_masks(time_min_train, cand_train, t_exit_train) if one_trade_at_a_time else cand_train.copy()
+    sel_train = select_trade_mask(
+        time_min=time_min_train,
+        candidate_mask=cand_train,
+        minutes_to_exit=t_exit_train,
+        max_open_trades=max_open_run,
+        cluster_gap_minutes=cluster_gap_minutes,
+        max_entries_per_cluster=max_entries_per_cluster,
+    )
+    late_tick_train_count = 0
+    late_tick_test_count = 0
+    if final_tick_validation and tick_prices_all is not None and tick_minute_bounds is not None:
+        train_abs_idx = np.flatnonzero(sel_train)
+        test_abs_idx = np.flatnonzero(sel_test) + train_idx
+        refined_train = simulate_selected_entries_with_ticks(
+            entry_indices=train_abs_idx.astype(np.int64, copy=False),
+            high=high,
+            low=low,
+            close=close,
+            tps=tps,
+            tp_w=tp_w,
+            tp_enabled=tp_enabled,
+            sl=sl,
+            hold=hold,
+            slippage_bps=slippage_bps,
+            spread_bps=spread_bps,
+            trail=trail,
+            trail_activate=trail_activate,
+            trail_offset=trail_offset,
+            trail_factor=trail_factor,
+            include_unrealized_at_test_end=include_unrealized_at_test_end,
+            bar_time_ns=bar_time_ns,
+            tick_prices_all=tick_prices_all,
+            tick_minute_bounds=tick_minute_bounds,
+        )
+        refined_test = simulate_selected_entries_with_ticks(
+            entry_indices=test_abs_idx.astype(np.int64, copy=False),
+            high=high,
+            low=low,
+            close=close,
+            tps=tps,
+            tp_w=tp_w,
+            tp_enabled=tp_enabled,
+            sl=sl,
+            hold=hold,
+            slippage_bps=slippage_bps,
+            spread_bps=spread_bps,
+            trail=trail,
+            trail_activate=trail_activate,
+            trail_offset=trail_offset,
+            trail_factor=trail_factor,
+            include_unrealized_at_test_end=include_unrealized_at_test_end,
+            bar_time_ns=bar_time_ns,
+            tick_prices_all=tick_prices_all,
+            tick_minute_bounds=tick_minute_bounds,
+        )
+        for local_idx, abs_idx in enumerate(train_abs_idx.tolist()):
+            upd = refined_train.get(abs_idx)
+            if upd is None:
+                continue
+            train_yy_val = int(upd["y"])
+            pnl_train[abs_idx] = float(upd["pnl"])
+            y_train[abs_idx] = train_yy_val
+            t_exit_train[abs_idx] = int(upd["t_exit"])
+            tp_hits_train[abs_idx] = int(upd["tp_hits"])
+            late_tick_train_count += 1
+        for local_idx, abs_idx in enumerate(test_abs_idx.tolist()):
+            upd = refined_test.get(abs_idx)
+            if upd is None:
+                continue
+            rel = abs_idx - train_idx
+            pnl_test[rel] = float(upd["pnl"])
+            y_test[rel] = int(upd["y"])
+            t_exit_test[rel] = int(upd["t_exit"])
+            tp_hits_test[rel] = int(upd["tp_hits"])
+            late_tick_test_count += 1
+        # refresh signal-side views after late validation
+        sig["pnl"] = pnl_test[sel_test].astype(float)
+        sig["outcome"] = np.where(y_test[sel_test] == 1, "TP", "SL")
+        sig["minutes_to_hit"] = t_exit_test[sel_test].astype(int)
+        sig["tp_hits"] = tp_hits_test[sel_test].astype(int)
+        sig["row_pnl"] = sig["pnl"]
+        sig["row_outcome"] = sig["outcome"]
+        sig["row_minutes_to_hit"] = sig["minutes_to_hit"]
+        sig["row_tp_hits"] = sig["tp_hits"]
     train_hits = int(sel_train.sum())
     train_yy = y_train[sel_train] if train_hits else np.array([], dtype=np.int8)
     train_pp = pnl_train[sel_train] if train_hits else np.array([], dtype=np.float64)
 
-    # Test equity drawdown from sequential selected trades
-    if hits:
-        eq = np.cumprod(1.0 + pp)
-        peak = np.maximum.accumulate(eq)
-        dd = (eq / peak) - 1.0
-        test_max_drawdown_pct = float(np.min(dd))
-    else:
-        test_max_drawdown_pct = float("nan")
+    dd_test_all = compute_balance_drawdowns(pp) if hits else compute_balance_drawdowns(np.array([], dtype=np.float64))
+    dd_train_all = compute_balance_drawdowns(train_pp) if train_hits else compute_balance_drawdowns(np.array([], dtype=np.float64))
 
-    # HODL annualized baselines
     close_train = df["close"].iloc[:train_idx].astype(float)
     close_test = df["close"].iloc[train_idx:].astype(float)
     hodl_train_factor = float(close_train.iloc[-1] / close_train.iloc[0] - 1.0) if len(close_train) > 1 and close_train.iloc[0] != 0 else float("nan")
     hodl_test_factor = float(close_test.iloc[-1] / close_test.iloc[0] - 1.0) if len(close_test) > 1 and close_test.iloc[0] != 0 else float("nan")
-    train_weekdays_all = max(1, int((pd.Index(df.index[:train_idx]).dayofweek < 5).sum()))
-    test_weekdays_all = max(1, int((pd.Index(df.index[train_idx:]).dayofweek < 5).sum()))
-    hodl_train_ann = annualized_return_from_factor(hodl_train_factor, train_weekdays_all / 252.0)
-    hodl_test_ann = annualized_return_from_factor(hodl_test_factor, test_weekdays_all / 252.0)
+    train_cal_days = max(1, int((df.index[train_idx - 1] - df.index[0]).total_seconds() / 86400.0)) if train_idx > 0 else 1
+    test_cal_days = max(1, int((df.index[-1] - df.index[train_idx]).total_seconds() / 86400.0)) if train_idx < len(df.index) else 1
+    hodl_train_ann = float((1.0 + hodl_train_factor) ** (365.0 / train_cal_days) - 1.0) if np.isfinite(hodl_train_factor) and hodl_train_factor > -1.0 else float("nan")
+    hodl_test_ann = float((1.0 + hodl_test_factor) ** (365.0 / test_cal_days) - 1.0) if np.isfinite(hodl_test_factor) and hodl_test_factor > -1.0 else float("nan")
+
+    pos_diag = positive_trade_diagnostics(pp) if hits else positive_trade_diagnostics(np.array([], dtype=np.float64))
+    test_sum_return = float(np.sum(pp)) if hits else float("nan")
+    train_sum_return = float(np.sum(train_pp)) if train_hits else float("nan")
+    test_pf = profit_factor(pp) if hits else float("nan")
+    train_pf = profit_factor(train_pp) if train_hits else float("nan")
+    test_rar = float(test_sum_return / max(dd_test_all["relative_dd_pct"], 1e-9)) if hits else float("nan")
+    train_rar = float(train_sum_return / max(dd_train_all["relative_dd_pct"], 1e-9)) if train_hits else float("nan")
+    trail_floor = max(0.0, (trail_activate - trail_offset) * trail_factor)
+    runner_eff = float(np.quantile(np.maximum(0.0, pp - trail_floor), 0.90) / max(1e-12, sl)) if hits else float("nan")
+    dd_scaling_factor_to_10pct = float(0.10 / dd_test_all["relative_dd_pct"]) if hits and np.isfinite(dd_test_all["relative_dd_pct"]) and dd_test_all["relative_dd_pct"] > 0 else float("nan")
+    projected_sum_pnl_usd_at_10pct_dd = (
+        test_sum_return * reference_price_test * contract_units_per_lot * lot_run_resolved * dd_scaling_factor_to_10pct
+        if hits and np.isfinite(dd_scaling_factor_to_10pct) and np.isfinite(reference_price_test)
+        else float("nan")
+    )
 
     summary = {
         "rule": rule_str,
@@ -1195,29 +1984,27 @@ def mine_best_rule(
         "train_win": float((train_yy == 1).mean()) if train_hits else float("nan"),
         "test_ev": float(np.mean(pp)) if hits else float("nan"),
         "test_win": float((yy == 1).mean()) if hits else float("nan"),
-        "test_sharpe_proxy": sharpe_proxy(pp) if hits else float("nan"),
-        "test_sortino_proxy": sortino_proxy(pp) if hits else float("nan"),
         "train_hits": train_hits,
         "test_hits": hits,
         "test_median_signals_day": final["median_per_day"] if hits else 0.0,
         "test_median_minutes_to_exit": final.get("median_exit", float("nan")) if hits else float("nan"),
         "test_median_minutes_to_qualify": final.get("median_qualify", float("nan")) if hits else float("nan"),
         "test_median_tp_hits": float(np.median(tp_hits_test[sel_test])) if hits else float("nan"),
-        # Keep legacy column names, but compute realized compounded return for consistency
-        # with the objective/override logic and sequential trade accounting.
-        "test_return": float(np.prod(1.0 + pp) - 1.0) if hits else float("nan"),
-        "train_return": float(np.prod(1.0 + train_pp) - 1.0) if train_hits else float("nan"),
-        "test_max_drawdown_pct": test_max_drawdown_pct,
-        "conds": len(rule),
+        "test_return": test_sum_return,
+        "train_return": train_sum_return,
+        "test_max_drawdown_pct": dd_test_all["max_dd_pct"],
+        "conds": len(rule) + len(binary_rule),
         "min_test_hits_used": used_min_test_hits,
         "min_train_hits_used": used_min_test_hits,
         "min_hits_override_used": int(final.get("min_hits_override_used", 0)) if hits else 0,
-        "test_cumulative_return": float(np.prod(1.0 + pp) - 1.0) if hits else float("nan"),
-        "train_cumulative_return": float(np.prod(1.0 + train_pp) - 1.0) if train_hits else float("nan"),
-        "test_trades_per_day": final.get("test_trades_per_day", float("nan")) if hits else float("nan"),
-        "train_trades_per_day": float(train_hits / max(1, int((pd.Index(df.index[:train_idx]).dayofweek < 5).sum()))) if train_hits else float("nan"),
+        "test_cumulative_return": test_sum_return,
+        "train_cumulative_return": train_sum_return,
         "test_annualized_return": final.get("test_ann_return", float("nan")) if hits else float("nan"),
-        "train_annualized_return": annualized_return_from_factor(float(np.prod(1.0 + train_pp) - 1.0), max(1e-9, max(1, int((pd.Index(df.index[:train_idx]).dayofweek < 5).sum()))/252.0)) if train_hits else float("nan"),
+        "train_annualized_return": final.get("train_ann_return", float("nan")) if train_hits else float("nan"),
+        "test_sum_return": test_sum_return,
+        "train_sum_return": train_sum_return,
+        "test_annual_return": final.get("test_ann_return", float("nan")) if hits else float("nan"),
+        "train_annual_return": final.get("train_ann_return", float("nan")) if train_hits else float("nan"),
         "test_score": final.get("score", float("nan")) if hits else float("nan"),
         "score_test_component": final.get("score_test", float("nan")) if hits else float("nan"),
         "score_train_component": final.get("score_train", float("nan")) if hits else float("nan"),
@@ -1232,15 +2019,83 @@ def mine_best_rule(
         "hodl_test_return": hodl_test_factor,
         "hodl_train_annualized_return": hodl_train_ann,
         "hodl_test_annualized_return": hodl_test_ann,
+        "profit_factor": test_pf,
+        "train_profit_factor": train_pf,
+        "test_risk_adjusted_return": test_rar,
+        "train_risk_adjusted_return": train_rar,
+        "avg_positive_pnl": pos_diag["avg_positive_pnl"],
+        "median_positive_pnl": pos_diag["median_positive_pnl"],
+        "p90_positive_pnl": pos_diag["p90_positive_pnl"],
+        "runner_outlier_share": pos_diag["runner_outlier_share"],
+        "runner_efficiency_p90": runner_eff,
+        "runner_efficiency_norm": final.get("test_runner_efficiency_norm", float("nan")) if hits else float("nan"),
+        "absolute_dd_pct": dd_test_all["absolute_dd_pct"],
+        "max_dd_pct": dd_test_all["max_dd_pct"],
+        "relative_dd_pct": dd_test_all["relative_dd_pct"],
+        "dd_scaling_factor_to_10pct": dd_scaling_factor_to_10pct,
+        "lot_small_at_10pct_dd": lot_scenarios["lot_small"] * dd_scaling_factor_to_10pct if np.isfinite(dd_scaling_factor_to_10pct) else float("nan"),
+        "lot_run_at_10pct_dd": lot_run_resolved * dd_scaling_factor_to_10pct if np.isfinite(dd_scaling_factor_to_10pct) else float("nan"),
+        "projected_sum_pnl_usd_at_10pct_dd": projected_sum_pnl_usd_at_10pct_dd,
+        "lot_small": lot_scenarios["lot_small"],
+        "lot_run": lot_run_resolved,
+        "lot_max_single": lot_scenarios["lot_max_single"],
+        "prefilter_candidates": len(candidates),
+        "prefilter_realistic_train_rows": int(realistic_train_mask.sum()),
+        "cluster_gap_minutes": cluster_gap_minutes,
+        "max_entries_per_cluster": max_entries_per_cluster,
     }
+    summary.update({
+        "agg_train_hits": summary["train_hits"],
+        "agg_test_hits": summary["test_hits"],
+        "agg_train_sum_return": summary["train_sum_return"],
+        "agg_test_sum_return": summary["test_sum_return"],
+        "agg_test_profit_factor": summary["profit_factor"],
+        "agg_test_runner_efficiency": summary["runner_efficiency_p90"],
+        "risk_test_absolute_dd_pct": summary["absolute_dd_pct"],
+        "risk_test_max_dd_pct": summary["max_dd_pct"],
+        "risk_test_relative_dd_pct": summary["relative_dd_pct"],
+        "risk_dd_scale_to_10pct": summary["dd_scaling_factor_to_10pct"],
+        "row_mean_test_pnl": summary["test_ev"],
+        "row_mean_train_pnl": summary["ev_train"],
+    })
+    summary["row_finalist_tick_validation"] = int(final_tick_validation)
+    summary["row_finalist_tick_train_trades"] = late_tick_train_count
+    summary["row_finalist_tick_test_trades"] = late_tick_test_count
+    summary["row_tick_validation_scope"] = "late_finalists_exit_only"
+    summary.update(
+        compute_regime_breakdown(
+            df=df.iloc[:train_idx],
+            selected_mask=sel_train,
+            pnl_values=pnl_train[:train_idx],
+            score_cfg=score_cfg,
+            sl=sl,
+            trail_activate=trail_activate,
+            trail_offset=trail_offset,
+            trail_factor=trail_factor,
+            prefix="regime_train",
+        )
+    )
+    summary.update(
+        compute_regime_breakdown(
+            df=df.iloc[train_idx:],
+            selected_mask=sel_test,
+            pnl_values=pnl_test,
+            score_cfg=score_cfg,
+            sl=sl,
+            trail_activate=trail_activate,
+            trail_offset=trail_offset,
+            trail_factor=trail_factor,
+            prefix="regime_test",
+        )
+    )
     return summary, sig
 
 
 def run_single_config(
     df: pd.DataFrame,
+    binned_df: pd.DataFrame,
     train_idx: int,
     cols: List[str],
-    thresholds: Dict[str, Dict[float, float]],
     tps: List[float],
     tp_w: np.ndarray,
     tp_enabled: bool,
@@ -1267,14 +2122,33 @@ def run_single_config(
     two_starts_topk: int,
     two_starts_family_topn: int,
     score_cfg: dict,
+    cluster_gap_minutes: int,
+    max_entries_per_cluster: int,
+    account_margin_usd: float,
+    broker_leverage: float,
+    lot_step: float,
+    contract_units_per_lot: float,
+    lot_run: float,
+    lot_run_min: float,
+    lot_run_choices: str,
+    prefilter_top_per_family: int,
+    prefilter_max_candidates: int,
+    prefilter_min_positive_hits: int,
+    prefilter_min_pos_rate: float,
+    prefilter_max_neg_rate: float,
+    prefilter_min_lift: float,
+    prefilter_min_coverage: float,
+    prefilter_max_coverage: float,
+    finalist_tick_validation: bool,
     tp_summary_value: float,
     seed: int,
-    tick_map: Optional[Dict[int, np.ndarray]] = None,
+    tick_prices_all: Optional[np.ndarray] = None,
+    tick_minute_bounds: Optional[Dict[int, tuple[int, int]]] = None,
 ) -> Tuple[dict, pd.DataFrame]:
     high = df["high"].to_numpy(dtype=np.float32, copy=False)
     low = df["low"].to_numpy(dtype=np.float32, copy=False)
     close = df["close"].to_numpy(dtype=np.float32, copy=False)
-    bar_time_ns = pd.DatetimeIndex(df.index).floor("min").view("int64").to_numpy(dtype=np.int64, copy=False)
+    bar_time_ns = np.asarray(pd.DatetimeIndex(df.index).floor("min").view("int64"), dtype=np.int64)
 
     pnl, y, t_exit, t_qual, tp_hits = simulate_multitp_trailing_pessimistic(
         high=high,
@@ -1294,13 +2168,14 @@ def run_single_config(
         trail_min_level=trail_min_level,
         include_unrealized_at_test_end=include_unrealized_at_test_end,
         bar_time_ns=bar_time_ns,
-        tick_map=tick_map,
+        tick_prices_all=tick_prices_all,
+        tick_minute_bounds=tick_minute_bounds,
     )
 
     summary, sig = mine_best_rule(
         df=df,
+        binned_df=binned_df,
         cols=cols,
-        thresholds=thresholds,
         train_idx=train_idx,
         y=y,
         pnl=pnl,
@@ -1320,6 +2195,43 @@ def run_single_config(
         two_starts_topk=two_starts_topk,
         two_starts_family_topn=two_starts_family_topn,
         score_cfg=score_cfg,
+        sl=sl,
+        trail_activate=trail_activate,
+        trail_offset=trail_offset,
+        trail_factor=trail_factor,
+        cluster_gap_minutes=cluster_gap_minutes,
+        max_entries_per_cluster=max_entries_per_cluster,
+        account_margin_usd=account_margin_usd,
+        broker_leverage=broker_leverage,
+        lot_step=lot_step,
+        contract_units_per_lot=contract_units_per_lot,
+        lot_run=lot_run,
+        lot_run_min=lot_run_min,
+        lot_run_choices=lot_run_choices,
+        prefilter_top_per_family=prefilter_top_per_family,
+        prefilter_max_candidates=prefilter_max_candidates,
+        prefilter_min_positive_hits=prefilter_min_positive_hits,
+        prefilter_min_pos_rate=prefilter_min_pos_rate,
+        prefilter_max_neg_rate=prefilter_max_neg_rate,
+        prefilter_min_lift=prefilter_min_lift,
+        prefilter_min_coverage=prefilter_min_coverage,
+        prefilter_max_coverage=prefilter_max_coverage,
+        seed=seed,
+        final_tick_validation=bool(finalist_tick_validation and tick_prices_all is not None and tick_minute_bounds is not None),
+        high=high,
+        low=low,
+        close=close,
+        tps=tps,
+        tp_w=tp_w,
+        tp_enabled=tp_enabled,
+        trail=trail,
+        hold=hold,
+        slippage_bps=slippage_bps,
+        spread_bps=spread_bps,
+        include_unrealized_at_test_end=include_unrealized_at_test_end,
+        bar_time_ns=bar_time_ns,
+        tick_prices_all=tick_prices_all,
+        tick_minute_bounds=tick_minute_bounds,
     )
 
     summary["tp"] = tp_summary_value
@@ -1335,12 +2247,16 @@ def run_single_config(
     summary["trail_activate"] = trail_activate
     summary["trail_offset"] = trail_offset
     summary["trail_factor"] = trail_factor
-    summary["trail_min_level"] = trail_min_level
-    summary["trail_min_level_ignored"] = 1
     summary["include_unrealized_at_test_end"] = int(include_unrealized_at_test_end)
     summary["slippage_bps"] = slippage_bps
     summary["spread_bps"] = spread_bps
     summary["seed"] = seed
+    summary["cluster_gap_minutes"] = cluster_gap_minutes
+    summary["max_entries_per_cluster"] = max_entries_per_cluster
+    summary["account_margin_usd"] = account_margin_usd
+    summary["broker_leverage"] = broker_leverage
+    summary["lot_step"] = lot_step
+    summary["contract_units_per_lot"] = contract_units_per_lot
     summary["test_start"] = str(df.index[train_idx]) if train_idx < len(df.index) else ""
     summary["test_end"] = str(df.index[-1]) if len(df.index) else ""
 
@@ -1369,9 +2285,6 @@ def main() -> None:
         if args.trail_offset >= args.trail_activate:
             raise ValueError("--trail-offset must be < --trail-activate when --trail is enabled")
 
-    if args.trail_min_level != 0:
-        print("[WARN] --trail-min-level is deprecated/ignored; qualification uses --trail-activate.")
-
     if not (0.0 <= args.min_test_hits_reduce_step < 1.0):
         raise ValueError("--min-test-hits-reduce-step must be in [0,1)")
     if args.min_hits_return_override < 0:
@@ -1380,6 +2293,16 @@ def main() -> None:
         raise ValueError("--two-starts-topk must be >= 2")
     if args.two_starts_family_topn < 1:
         raise ValueError("--two-starts-family-topn must be >= 1")
+    if args.cluster_gap_minutes < 0:
+        raise ValueError("--cluster-gap-minutes must be >= 0")
+    if args.max_entries_per_cluster < 1:
+        raise ValueError("--max-entries-per-cluster must be >= 1")
+    if args.account_margin_usd <= 0 or args.broker_leverage <= 0:
+        raise ValueError("--account-margin-usd and --broker-leverage must be > 0")
+    if args.lot_run_min <= 0:
+        raise ValueError("--lot-run-min must be > 0")
+    if args.prefilter_bins < 2:
+        raise ValueError("--prefilter-bins must be >= 2")
 
     df = load_features(args.features, args.tail_rows)
     if args.tail_rows > 0 and len(df) > args.tail_rows:
@@ -1392,13 +2315,16 @@ def main() -> None:
     tps_all = [float(x) for x in args.tps.split(",") if x.strip()]
     if not tps_all:
         raise ValueError("Need at least one TP value")
-    qs = [float(x) for x in args.quantiles.split(",") if x.strip()]
-    if not qs:
-        raise ValueError("Need at least one quantile")
-
     cols = build_candidate_features(df, args.allow_absolute_price_features, args.max_features)
     print(f"Candidate features: {len(cols)}")
-    thresholds = quantile_thresholds(df.iloc[:train_idx], cols, qs)
+    if args.binned_features is not None:
+        binned_df = load_binned_features(args.binned_features, args.tail_rows)
+        if args.tail_rows > 0 and len(binned_df) > args.tail_rows:
+            binned_df = binned_df.tail(int(args.tail_rows))
+    else:
+        print(f"Building fallback binned features in-process (bins={args.prefilter_bins})")
+        binned_df = build_binned_feature_frame(df, cols, args.prefilter_bins)
+    binned_df = binned_df.reindex(df.index)
 
     score_cfg = {
         "ret_bad_test": args.score_return_bad_test,
@@ -1410,30 +2336,26 @@ def main() -> None:
         "dd_good": args.score_dd_good,
         "dd_mid": args.score_dd_mid,
         "dd_bad": args.score_dd_bad,
-        "so_bad": args.score_sortino_bad,
-        "so_mid": args.score_sortino_mid,
-        "so_good": args.score_sortino_good,
-        "tr_bad_test": args.score_trades_bad_test,
-        "tr_mid_test": args.score_trades_mid_test,
-        "tr_good_test": args.score_trades_good_test,
-        "tr_bad_train": args.score_trades_bad_train,
-        "tr_mid_train": args.score_trades_mid_train,
-        "tr_good_train": args.score_trades_good_train,
-        "k_low": args.score_k_low,
-        "k_high": args.score_k_high,
+        "pf_bad": args.score_profit_factor_bad,
+        "pf_mid": args.score_profit_factor_mid,
+        "pf_good": args.score_profit_factor_good,
+        "re_bad": args.score_runner_efficiency_bad,
+        "re_mid": args.score_runner_efficiency_mid,
+        "re_good": args.score_runner_efficiency_good,
     }
 
-    tick_map: Optional[Dict[int, np.ndarray]] = None
+    tick_prices_all: Optional[np.ndarray] = None
+    tick_minute_bounds: Optional[Dict[int, tuple[int, int]]] = None
     if args.tick_data is not None:
         print(f"Loading tick data: {args.tick_data}")
-        tick_map = load_tick_minute_map(
+        tick_prices_all, tick_minute_bounds = load_tick_minute_map(
             path=args.tick_data,
             datetime_col=args.tick_datetime_column,
             price_col=args.tick_price_column,
             sep=args.tick_sep,
             cache_parquet=args.tick_cache_parquet,
         )
-        print(f"Tick minutes loaded: {len(tick_map)}")
+        print(f"Tick minutes loaded: {len(tick_minute_bounds)} | ticks loaded: {len(tick_prices_all)}")
 
     summaries: List[dict] = []
     signals: List[pd.DataFrame] = []
@@ -1447,13 +2369,13 @@ def main() -> None:
         min_hits = args.min_test_hits
 
         print("\n===================================")
-        print(f"run tp={tp:.6g} sl={sl:.6g} hold={args.hold} tp_exits={args.use_multi_tp} trail={args.trail} trail_min_level={args.trail_min_level:.6g} include_unrealized={int(args.include_unrealized_at_test_end)}")
+        print(f"run tp={tp:.6g} sl={sl:.6g} hold={args.hold} tp_exits={args.use_multi_tp} trail={args.trail} include_unrealized={int(args.include_unrealized_at_test_end)}")
 
         summary, sig = run_single_config(
             df=df,
+            binned_df=binned_df,
             train_idx=train_idx,
             cols=cols,
-            thresholds=thresholds,
             tps=tps,
             tp_w=tp_w,
             tp_enabled=args.use_multi_tp,
@@ -1480,9 +2402,28 @@ def main() -> None:
             two_starts_topk=args.two_starts_topk,
             two_starts_family_topn=args.two_starts_family_topn,
             score_cfg=score_cfg,
+            cluster_gap_minutes=args.cluster_gap_minutes,
+            max_entries_per_cluster=args.max_entries_per_cluster,
+            account_margin_usd=args.account_margin_usd,
+            broker_leverage=args.broker_leverage,
+            lot_step=args.lot_step,
+            contract_units_per_lot=args.contract_units_per_lot,
+            lot_run=args.lot_run,
+            lot_run_min=args.lot_run_min,
+            lot_run_choices=args.lot_run_choices,
+            prefilter_top_per_family=args.prefilter_top_per_family,
+            prefilter_max_candidates=args.prefilter_max_candidates,
+            prefilter_min_positive_hits=args.prefilter_min_positive_hits,
+            prefilter_min_pos_rate=args.prefilter_min_pos_rate,
+            prefilter_max_neg_rate=args.prefilter_max_neg_rate,
+            prefilter_min_lift=args.prefilter_min_lift,
+            prefilter_min_coverage=args.prefilter_min_coverage,
+            prefilter_max_coverage=args.prefilter_max_coverage,
+            finalist_tick_validation=args.finalist_tick_validation,
             tp_summary_value=tp,
             seed=args.seed,
-            tick_map=tick_map,
+            tick_prices_all=tick_prices_all,
+            tick_minute_bounds=tick_minute_bounds,
         )
 
         print(f"Best rule: {summary['rule']}")

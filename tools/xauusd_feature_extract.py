@@ -320,8 +320,13 @@ def compute_price_action_features(
         f[f"ms_ll_bars_since_tf{tf}"] = _bars_since_event(ll)
 
     if with_orderblock_proximity:
-        bull_ob = l.rolling(20).min().shift(1)
-        bear_ob = h.rolling(20).max().shift(1)
+        atr20 = (h - l).rolling(20).mean().replace(0, np.nan)
+        bearish_ref = l.where(c < o)
+        bullish_ref = h.where(c > o)
+        bull_impulse = ((c / c.shift(1)) - 1.0) > ((atr20 / c).fillna(0.0))
+        bear_impulse = ((c.shift(1) / c) - 1.0) > ((atr20 / c).fillna(0.0))
+        bull_ob = bearish_ref.where(bull_impulse.shift(-1, fill_value=False)).ffill().shift(1)
+        bear_ob = bullish_ref.where(bear_impulse.shift(-1, fill_value=False)).ffill().shift(1)
         f[f"dist_orderblock_bull_tf{tf}"] = (c / bull_ob) - 1.0
         f[f"dist_orderblock_bear_tf{tf}"] = (bear_ob / c) - 1.0
 
@@ -342,7 +347,20 @@ def add_session_features(df: pd.DataFrame, with_weekend: bool = False) -> pd.Dat
     sess["session_is_ldn_ny_overlap"] = ((hour >= 13.0) & (hour < 16.0)).astype(np.float32)
     if with_weekend:
         sess["session_is_weekend"] = (dow >= 5).astype(np.float32)
+    if "close" in df.columns:
+        close = pd.to_numeric(df["close"], errors="coerce")
+        ret60 = close.pct_change(60)
+        vol = close.pct_change().rolling(120, min_periods=30).std()
+        vol_ref = vol.rolling(1440, min_periods=120).median()
+        sess["regime_dir_bull"] = (ret60 > 0.0010).astype(np.float32)
+        sess["regime_dir_bear"] = (ret60 < -0.0010).astype(np.float32)
+        sess["regime_dir_sideways"] = (ret60.abs() <= 0.0007).astype(np.float32)
+        sess["regime_vol_high"] = (vol > (vol_ref * 1.25)).astype(np.float32)
+        sess["regime_vol_normal"] = ((vol >= (vol_ref * 0.75)) & (vol <= (vol_ref * 1.25))).astype(np.float32)
+        sess["regime_vol_low"] = (vol < (vol_ref * 0.75)).astype(np.float32)
     return pd.concat([df, sess], axis=1)
+
+
 def daily_vwap_features(tf_df: pd.DataFrame) -> pd.DataFrame:
     """Daily VWAP using typical price (H+L+C)/3 and provided volume (often tick volume)."""
     tp = (tf_df["high"] + tf_df["low"] + tf_df["close"]) / 3.0
@@ -358,6 +376,21 @@ def daily_vwap_features(tf_df: pd.DataFrame) -> pd.DataFrame:
     out["vwap"] = vwap
     out["dist_vwap"] = (tf_df["close"] / vwap) - 1.0
     out["vwap_d5"] = vwap - vwap.shift(5)
+    return out
+
+
+def build_running_htf_frame(base: pd.DataFrame, tf: int) -> pd.DataFrame:
+    if tf <= 1:
+        return base.copy()
+
+    bucket = base.index.floor(f"{tf}min")
+    grp = bucket
+    out = pd.DataFrame(index=base.index)
+    out["open"] = base["open"].groupby(grp).transform("first")
+    out["high"] = base["high"].groupby(grp).cummax()
+    out["low"] = base["low"].groupby(grp).cummin()
+    out["close"] = base["close"]
+    out["volume"] = base["volume"].groupby(grp).cumsum()
     return out
 
 
@@ -377,14 +410,7 @@ def compute_tf_features(
     with_market_structure: bool,
     with_orderblock_proximity: bool,
 ) -> pd.DataFrame:
-    if tf == 1:
-        tf_df = base.copy()
-    else:
-        tf_df = (
-            base.resample(f"{tf}min")
-            .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-            .dropna()
-        )
+    tf_df = build_running_htf_frame(base, tf)
 
     f = pd.DataFrame(index=tf_df.index)
 
@@ -426,8 +452,13 @@ def compute_tf_features(
 
     # Support/resistance distances
     for lb in support_lbs:
-        sup = tf_df["low"].rolling(lb).min()
-        res = tf_df["high"].rolling(lb).max()
+        sup_raw = tf_df["low"].rolling(lb).min().shift(1)
+        res_raw = tf_df["high"].rolling(lb).max().shift(1)
+        tol = (tf_df["high"] - tf_df["low"]).rolling(lb, min_periods=max(3, lb // 5)).mean().shift(1) * 0.25
+        sup_touches = ((tf_df["low"].shift(1) - sup_raw).abs() <= tol).rolling(lb, min_periods=max(2, lb // 5)).sum()
+        res_touches = ((tf_df["high"].shift(1) - res_raw).abs() <= tol).rolling(lb, min_periods=max(2, lb // 5)).sum()
+        sup = sup_raw.where(sup_touches >= 2)
+        res = res_raw.where(res_touches >= 2)
         f[f"dist_support{lb}_tf{tf}"] = (tf_df["close"] / sup) - 1.0
         f[f"dist_resist{lb}_tf{tf}"] = (res / tf_df["close"]) - 1.0
 
@@ -621,7 +652,7 @@ def _round_by_column(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].round(3)
             continue
 
-        if col.startswith(("candle_", "break_", "fvg_", "session_")):
+        if col.startswith(("candle_", "break_", "fvg_", "session_", "regime_")):
             df[col] = df[col].round(6)
             continue
 
@@ -687,9 +718,8 @@ def main() -> None:
             with_market_structure=args.with_market_structure and (tf in pattern_tfs),
             with_orderblock_proximity=args.with_orderblock_proximity and (tf in pattern_tfs),
         )
-        aligned = tf_features.reindex(feature_table.index, method="ffill")
-        tf_frames.append(aligned)
-        print(f"TF={tf} done. cols={aligned.shape[1]}")
+        tf_frames.append(tf_features.reindex(feature_table.index))
+        print(f"TF={tf} done. cols={tf_features.shape[1]}")
 
     if tf_frames:
         feature_table = pd.concat([feature_table] + tf_frames, axis=1)
