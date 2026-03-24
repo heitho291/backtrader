@@ -21,6 +21,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -58,6 +59,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workers", type=str, default="1", help="Parallel optimizer workers count or auto")
     p.add_argument("--inprocess-miner", action="store_true", default=False,
                    help="Run miner in-process and reuse one preloaded features table (faster, lower RAM)")
+    p.add_argument("--inprocess-ticks", choices=["off", "on"], default="off",
+                   help="Tick handling in --inprocess-miner mode. 'off' avoids huge tick preload RAM spikes.")
 
     p.add_argument("--objective-column", type=str, default="test_score")
     p.add_argument(
@@ -840,14 +843,20 @@ def main() -> None:
             binned_source = miner_mod.build_binned_feature_frame(df_preloaded, cols_pre, int(args.prefilter_bins))
             binned_source = binned_source.reindex(df_preloaded.index)
         if args.tick_data is not None:
-            tick_prices_all, tick_minute_bounds = miner_mod.load_tick_minute_map(
-                path=args.tick_data,
-                datetime_col=args.tick_datetime_column,
-                price_col=args.tick_price_column,
-                sep=args.tick_sep,
-                cache_parquet=args.tick_cache_parquet,
-            )
-            print(f"Preloaded tick minutes: {len(tick_minute_bounds)}")
+            if args.inprocess_ticks == "on":
+                tick_prices_all, tick_minute_bounds = miner_mod.load_tick_minute_map(
+                    path=args.tick_data,
+                    datetime_col=args.tick_datetime_column,
+                    price_col=args.tick_price_column,
+                    sep=args.tick_sep,
+                    cache_parquet=args.tick_cache_parquet,
+                )
+                print(f"Preloaded tick minutes: {len(tick_minute_bounds)}")
+            else:
+                print(
+                    "[WARN] --tick-data is ignored in --inprocess-miner when "
+                    "--inprocess-ticks=off (default, prevents RAM spikes)."
+                )
 
     workers_raw = str(args.workers).strip().lower()
     if workers_raw == "auto":
