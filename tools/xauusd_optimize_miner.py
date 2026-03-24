@@ -640,12 +640,8 @@ def run_miner_inprocess(
     binned_df: pd.DataFrame
     if isinstance(binned_source, pd.DataFrame):
         binned_df = binned_source.reindex(df.index)
-        if cols:
-            missing = [c for c in cols if c not in binned_df.columns]
-            binned_df = binned_df.reindex(columns=[c for c in cols if c in binned_df.columns])
-            for c in missing:
-                binned_df[c] = np.uint8(0)
-            binned_df = binned_df.reindex(columns=cols)
+        missing = [c for c in cols if c not in binned_df.columns]
+        binned_df = binned_df.reindex(columns=[c for c in cols if c in binned_df.columns])
     else:
         src = Path(str(binned_source))
         if str(src).lower().endswith(".parquet"):
@@ -668,10 +664,19 @@ def run_miner_inprocess(
         binned_df = raw.reindex(df.index)
         keep = [c for c in cols if c in binned_df.columns]
         binned_df = binned_df[keep].copy() if keep else pd.DataFrame(index=df.index)
-        for c in cols:
-            if c not in binned_df.columns:
+        missing = [c for c in cols if c not in binned_df.columns]
+
+    if missing:
+        print(f"[inprocess] rebuilding missing binned columns on the fly: {len(missing)}")
+        rebuilt = miner_mod.build_binned_feature_frame(df, missing, int(args.prefilter_bins))
+        rebuilt = rebuilt.reindex(df.index)
+        for c in missing:
+            if c in rebuilt.columns:
+                binned_df[c] = rebuilt[c]
+            else:
                 binned_df[c] = np.uint8(0)
-        binned_df = binned_df.reindex(columns=cols)
+
+    binned_df = binned_df.reindex(columns=cols)
 
     if not binned_df.empty:
         num_cols = binned_df.select_dtypes(include=["number"]).columns
