@@ -72,6 +72,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--objective-hit-column", type=str, default="test_hits", help="Column used for weighted aggregation or threshold filtering")
     p.add_argument("--min-objective-threshold", type=float, default=0.0,
                    help="Drop rows below this threshold on --objective-hit-column before aggregation")
+    p.add_argument("--win-return-blend", type=float, default=0.15,
+                   help="When objective-column=test_win, blend win with test_return via: win + w*tanh(test_return)")
+    p.add_argument("--min-row-test-return", type=float, default=-0.05,
+                   help="Optional floor for summary-row test_return before objective aggregation (only if column exists)")
 
     p.add_argument("--train-frac", type=float, default=0.7)
     p.add_argument("--hold-range", type=parse_int_range, default=(60, 120))
@@ -403,6 +407,8 @@ def aggregate_objective(
     mode: str,
     hit_col: str,
     min_threshold: float,
+    win_return_blend: float = 0.0,
+    min_row_test_return: float = float("-inf"),
 ) -> tuple[float, int, str]:
     if objective_col not in df.columns:
         return float("nan"), 0, f"objective column missing: {objective_col}"
@@ -410,6 +416,19 @@ def aggregate_objective(
     x = df.copy()
     note = ""
     x[objective_col] = pd.to_numeric(x[objective_col], errors="coerce")
+    obj_col_eff = objective_col
+    if objective_col == "test_win" and "test_return" in x.columns:
+        x["test_return"] = pd.to_numeric(x["test_return"], errors="coerce")
+        if np.isfinite(min_row_test_return):
+            x = x[x["test_return"] >= float(min_row_test_return)]
+            if x.empty:
+                return float("nan"), 0, f"all rows filtered by --min-row-test-return={min_row_test_return}"
+        w = max(0.0, min(1.0, float(win_return_blend)))
+        if w > 0:
+            ret_component = np.tanh(np.clip(x["test_return"].to_numpy(dtype=float), -1.0, 1.0))
+            x["__objective_eff"] = x["test_win"].to_numpy(dtype=float) + w * ret_component
+            obj_col_eff = "__objective_eff"
+            note = f"win objective blended with return (w={w:.3f})"
     if hit_col in x.columns:
         x[hit_col] = pd.to_numeric(x[hit_col], errors="coerce")
         if min_threshold > 0:
@@ -423,25 +442,25 @@ def aggregate_objective(
             else:
                 x = x_filtered
 
-    x = x[x[objective_col].notna()]
+    x = x[x[obj_col_eff].notna()]
     if x.empty:
         return float("nan"), 0, f"no finite rows in objective column: {objective_col}"
 
     if mode == "mean":
-        return float(x[objective_col].mean()), int(len(x)), note
+        return float(x[obj_col_eff].mean()), int(len(x)), note
     if mode == "max":
-        return float(x[objective_col].max()), int(len(x)), note
+        return float(x[obj_col_eff].max()), int(len(x)), note
     if mode == "min":
-        return float(x[objective_col].min()), int(len(x)), note
+        return float(x[obj_col_eff].min()), int(len(x)), note
 
     if hit_col in x.columns:
         w = x[hit_col].to_numpy(dtype=float)
-        v = x[objective_col].to_numpy(dtype=float)
+        v = x[obj_col_eff].to_numpy(dtype=float)
         s = float(w.sum())
         if s > 0:
             return float((v * w).sum() / s), int(len(x)), note
 
-    return float(x[objective_col].mean()), int(len(x)), note
+    return float(x[obj_col_eff].mean()), int(len(x)), note
 
 
 
@@ -795,6 +814,8 @@ def main() -> None:
         raise ValueError("lot-run-min must be > 0")
     if args.prefilter_bins < 2:
         raise ValueError("prefilter-bins must be >= 2")
+    if not (0.0 <= args.win_return_blend <= 1.0):
+        raise ValueError("win-return-blend must be in [0,1]")
 
     _validate_range("trail-activate", *args.trail_activate_range)
     _validate_range("trail-offset", *args.trail_offset_range)
@@ -952,6 +973,8 @@ def main() -> None:
                             mode=args.objective_agg,
                             hit_col=args.objective_hit_column,
                             min_threshold=args.min_objective_threshold,
+                            win_return_blend=args.win_return_blend,
+                            min_row_test_return=args.min_row_test_return,
                         )
                         row_metrics = extract_row_metrics(s, args.objective_column)
                         if "row_rule" in row_metrics:
