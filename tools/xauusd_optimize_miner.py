@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Random optimize miner hyperparameters")
     p.add_argument("--features", type=Path, required=True)
     p.add_argument("--binned-features", type=Path, default=None)
+    p.add_argument("--binned-metadata", type=Path, default=None)
     p.add_argument("--miner-script", type=Path, default=Path("tools/xauusd_miner_ohlc_first_hit_pessimistic.py"))
     p.add_argument("--runs", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
@@ -61,6 +62,10 @@ def parse_args() -> argparse.Namespace:
                    help="Run miner in-process and reuse one preloaded features table (faster, lower RAM)")
     p.add_argument("--inprocess-ticks", choices=["off", "on"], default="off",
                    help="Tick handling in --inprocess-miner mode. 'off' avoids huge tick preload RAM spikes.")
+    p.add_argument("--inprocess-memory-budget-gb", type=float, default=6.0,
+                   help="Safety budget for estimated in-process memory. Above this, auto-fallback to subprocess mode.")
+    p.add_argument("--force-inprocess-large", action="store_true", default=False,
+                   help="Force in-process mode even if memory estimate exceeds --inprocess-memory-budget-gb.")
 
     p.add_argument("--objective-column", type=str, default="test_score")
     p.add_argument(
@@ -364,6 +369,8 @@ def build_cmd(args: argparse.Namespace, cfg: dict[str, object], out_summary: Pat
     ]
     if args.binned_features is not None:
         cmd.extend(["--binned-features", str(args.binned_features)])
+    if args.binned_metadata is not None:
+        cmd.extend(["--binned-metadata", str(args.binned_metadata)])
     if bool(cfg["allow_absolute_price_features"]):
         cmd.append("--allow-absolute-price-features")
     if bool(cfg["one_trade_at_a_time"]):
@@ -635,6 +642,7 @@ def run_miner_inprocess(
     miner_mod,
     df_preloaded: pd.DataFrame,
     binned_source,
+    binned_metadata_source,
     cfg: dict[str, object],
     args: argparse.Namespace,
     score_cfg: dict[str, float],
@@ -657,6 +665,11 @@ def run_miner_inprocess(
     )
 
     binned_df: pd.DataFrame
+    binned_metadata: dict[str, dict[str, object]] = {}
+    if isinstance(binned_metadata_source, dict):
+        binned_metadata = binned_metadata_source
+    elif binned_metadata_source is not None:
+        binned_metadata = miner_mod.load_binned_metadata(Path(str(binned_metadata_source)))
     if isinstance(binned_source, pd.DataFrame):
         binned_df = binned_source.reindex(df.index)
         missing = [c for c in cols if c not in binned_df.columns]
@@ -693,14 +706,15 @@ def run_miner_inprocess(
             if c in rebuilt.columns:
                 binned_df[c] = rebuilt[c]
             else:
-                binned_df[c] = np.uint8(0)
+                binned_df[c] = np.nan
 
     binned_df = binned_df.reindex(columns=cols)
 
     if not binned_df.empty:
         num_cols = binned_df.select_dtypes(include=["number"]).columns
         for c in num_cols:
-            binned_df[c] = pd.to_numeric(binned_df[c], errors="coerce").fillna(0).astype(np.uint8)
+            missing_code = int(binned_metadata.get(c, {}).get("missing_code", np.iinfo(np.uint16).max))
+            binned_df[c] = pd.to_numeric(binned_df[c], errors="coerce").fillna(missing_code).astype(np.uint16)
 
     tps_all = [float(x) for x in str(cfg["tps"]).split(",") if x.strip()]
     if not tps_all:
@@ -762,6 +776,7 @@ def run_miner_inprocess(
         finalist_tick_validation=True,
         tp_summary_value=tps_all[0],
         seed=int(cfg["miner_seed"]),
+        binned_metadata=binned_metadata,
         tick_prices_all=tick_prices_all,
         tick_minute_bounds=tick_minute_bounds,
     )
@@ -780,6 +795,7 @@ def main() -> None:
     miner_mod = None
     df_preloaded: pd.DataFrame | None = None
     binned_source = None
+    binned_metadata_source = None
     tick_prices_all = None
     tick_minute_bounds = None
     score_cfg = build_score_cfg(args)
@@ -864,6 +880,7 @@ def main() -> None:
         print(f"Preloaded rows: {len(df_preloaded)}")
         if args.binned_features is not None:
             binned_source = args.binned_features
+            binned_metadata_source = args.binned_metadata
             print(
                 "Using binned parquet in on-demand subset mode for in-process miner: "
                 f"{args.binned_features}"
@@ -872,6 +889,7 @@ def main() -> None:
             cols_pre = miner_mod.build_candidate_features(df_preloaded, False, 0)
             binned_source = miner_mod.build_binned_feature_frame(df_preloaded, cols_pre, int(args.prefilter_bins))
             binned_source = binned_source.reindex(df_preloaded.index)
+            binned_metadata_source = {}
         if args.tick_data is not None:
             if args.inprocess_ticks == "on":
                 tick_prices_all, tick_minute_bounds = miner_mod.load_tick_minute_map(
@@ -887,6 +905,16 @@ def main() -> None:
                     "[WARN] --tick-data is ignored in --inprocess-miner when "
                     "--inprocess-ticks=off (default, prevents RAM spikes)."
                 )
+        est_cells = float(max(1, int(args.tail_rows_range[1]))) * float(max(1, int(args.max_features_range[1])))
+        est_bytes = est_cells * 16.0  # binned + masks + overhead
+        est_gb = est_bytes / (1024.0 ** 3)
+        if est_gb > float(args.inprocess_memory_budget_gb) and not bool(args.force_inprocess_large):
+            print(
+                "[WARN] disabling --inprocess-miner due to estimated memory "
+                f"{est_gb:.2f}GB > budget {float(args.inprocess_memory_budget_gb):.2f}GB; "
+                "use --force-inprocess-large to override."
+            )
+            args.inprocess_miner = False
 
     workers_raw = str(args.workers).strip().lower()
     if workers_raw == "auto":
@@ -922,6 +950,7 @@ def main() -> None:
                             miner_mod=miner_mod,
                             df_preloaded=df_preloaded,
                             binned_source=binned_source,
+                            binned_metadata_source=binned_metadata_source,
                             cfg=cfg,
                             args=args,
                             score_cfg=score_cfg,

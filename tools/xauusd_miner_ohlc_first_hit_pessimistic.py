@@ -16,6 +16,7 @@ Key upgrades:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -31,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--features", type=Path, required=True)
     p.add_argument("--binned-features", type=Path, default=None,
                    help="Optional parquet/csv with pre-binned candidate features aligned to --features")
+    p.add_argument("--binned-metadata", type=Path, default=None,
+                   help="Optional JSON metadata emitted by xauusd_feature_binning.py for rule decoding and missing-code handling")
     p.add_argument("--prefilter-bins", type=int, default=20,
                    help="Used only when --binned-features is not supplied and bins must be built in-process")
     p.add_argument("--tail-rows", type=int, default=0,
@@ -236,8 +239,19 @@ def load_binned_features(path: Path, tail_rows: int = 0) -> pd.DataFrame:
         if c in {"open", "high", "low", "close", "volume"}:
             df[c] = pd.to_numeric(df[c], errors="coerce").astype(np.float32)
         else:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(np.uint8)
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype(np.float32)
     return df
+
+
+def load_binned_metadata(path: Optional[Path]) -> dict[str, dict[str, object]]:
+    if path is None or not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        feats = raw.get("features", {})
+        return feats if isinstance(feats, dict) else {}
+    except Exception:
+        return {}
 
 
 def build_binned_feature_frame(df: pd.DataFrame, cols: List[str], bins: int) -> pd.DataFrame:
@@ -552,6 +566,7 @@ def build_prefiltered_candidates(
     min_lift: float,
     min_coverage: float,
     max_coverage: float,
+    binned_metadata: Optional[dict[str, dict[str, object]]] = None,
 ) -> list[dict[str, object]]:
     selected_train = np.asarray(realistic_train_mask[:train_idx], dtype=bool)
     positive_set = selected_train & (y[:train_idx] == 1)
@@ -565,48 +580,82 @@ def build_prefiltered_candidates(
     candidates: list[dict[str, object]] = []
     eps = 1e-12
 
+    bundle_debug_total = 0
+    bundle_debug_skipped = 0
+
     for c in cols:
         if c not in binned_df.columns:
             continue
         meta = _parse_feature_meta(c)
         family = str(meta.get("family", c))
-        bins_arr = pd.to_numeric(binned_df[c], errors="coerce").fillna(0).to_numpy(dtype=np.uint16, copy=False)
+        col_meta = (binned_metadata or {}).get(c, {})
+        missing_code = int(col_meta.get("missing_code", np.iinfo(np.uint16).max))
+        feature_type = str(col_meta.get("feature_type", ""))
+        anchor_cols = candidate_anchor_columns(c, cols) if feature_type == "binary" else []
+        is_bundled_binary = bool(anchor_cols)
+        if feature_type == "binary" and required_anchor_prefixes_for_binary(c):
+            bundle_debug_total += 1
+            if not is_bundled_binary:
+                bundle_debug_skipped += 1
+                continue
+
+        bins_arr = pd.to_numeric(binned_df[c], errors="coerce").fillna(missing_code).to_numpy(dtype=np.uint16, copy=False)
         train_bins = bins_arr[:train_idx]
         unique_bins = np.unique(train_bins[selected_train])
-        unique_bins = unique_bins[unique_bins > 0]
+        unique_bins = unique_bins[unique_bins != missing_code]
         if unique_bins.size == 0:
             continue
 
         fam_candidates: list[dict[str, object]] = []
         for bin_id in unique_bins.tolist():
-            mask = bins_arr == int(bin_id)
-            mask_train = mask[:train_idx]
-            coverage = float(mask_train[selected_train].mean()) if sel_total else 0.0
-            if coverage < min_coverage or coverage > max_coverage:
-                continue
-            pos_hits = int(np.sum(mask_train & positive_set))
-            neg_hits = int(np.sum(mask_train & negative_set))
-            if pos_hits < min_positive_hits:
-                continue
-            pos_rate = pos_hits / max(1, pos_total)
-            neg_rate = neg_hits / max(1, neg_total)
-            lift = pos_rate / max(neg_rate, eps)
-            if pos_rate < min_pos_rate or neg_rate > max_neg_rate or lift < min_lift:
-                continue
+            base_mask = bins_arr == int(bin_id)
+            bundle_variants: list[tuple[np.ndarray, list[Cond], str, str]] = []
+            if is_bundled_binary:
+                for ac in anchor_cols:
+                    a_meta = (binned_metadata or {}).get(ac, {})
+                    a_missing = int(a_meta.get("missing_code", np.iinfo(np.uint16).max))
+                    a_arr = pd.to_numeric(binned_df[ac], errors="coerce").fillna(a_missing).to_numpy(dtype=np.uint16, copy=False)
+                    a_unique = np.unique(a_arr[:train_idx][selected_train])
+                    a_unique = a_unique[a_unique != a_missing]
+                    for a_bin in a_unique.tolist():
+                        m = base_mask & (a_arr == int(a_bin))
+                        label = (
+                            f"{decode_bin_condition(c, float(bin_id), binned_metadata or {})} & "
+                            f"{decode_bin_condition(ac, float(a_bin), binned_metadata or {})}"
+                        )
+                        bundle_variants.append((m, [(c, "==", float(bin_id)), (ac, "==", float(a_bin))], ac, label))
+            else:
+                label = decode_bin_condition(c, float(bin_id), binned_metadata or {})
+                bundle_variants.append((base_mask, [(c, "==", float(bin_id))], c, label))
 
-            fam_candidates.append({
-                "name": f"{c}_bin == {int(bin_id)}",
-                "conds": [(c, "==", float(bin_id))],
-                "mask": mask,
-                "family": family,
-                "scale": meta.get("scale"),
-                "prefilter_score": float(pos_rate * np.log1p(lift)),
-                "primary_col": c,
-                "prefilter_pos_rate": float(pos_rate),
-                "prefilter_neg_rate": float(neg_rate),
-                "prefilter_lift": float(lift),
-                "prefilter_coverage": float(coverage),
-            })
+            for mask, conds, primary_col, label in bundle_variants:
+                mask_train = mask[:train_idx]
+                coverage = float(mask_train[selected_train].mean()) if sel_total else 0.0
+                if coverage < min_coverage or coverage > max_coverage:
+                    continue
+                pos_hits = int(np.sum(mask_train & positive_set))
+                neg_hits = int(np.sum(mask_train & negative_set))
+                if pos_hits < min_positive_hits:
+                    continue
+                pos_rate = pos_hits / max(1, pos_total)
+                neg_rate = neg_hits / max(1, neg_total)
+                lift = pos_rate / max(neg_rate, eps)
+                if pos_rate < min_pos_rate or neg_rate > max_neg_rate or lift < min_lift:
+                    continue
+
+                fam_candidates.append({
+                    "name": label,
+                    "conds": conds,
+                    "mask": mask,
+                    "family": family,
+                    "scale": meta.get("scale"),
+                    "prefilter_score": float(pos_rate * np.log1p(lift)),
+                    "primary_col": primary_col,
+                    "prefilter_pos_rate": float(pos_rate),
+                    "prefilter_neg_rate": float(neg_rate),
+                    "prefilter_lift": float(lift),
+                    "prefilter_coverage": float(coverage),
+                })
 
         fam_candidates = sorted(fam_candidates, key=lambda x: float(x["prefilter_score"]), reverse=True)[:top_per_family]
         candidates.extend(fam_candidates)
@@ -625,6 +674,11 @@ def build_prefiltered_candidates(
 
     if max_features > 0:
         deduped = deduped[:max_features]
+    if bundle_debug_total > 0:
+        print(
+            "[prefilter] binary bundle families considered="
+            f"{bundle_debug_total} skipped_without_anchor={bundle_debug_skipped}"
+        )
     return deduped
 
 
@@ -1005,6 +1059,86 @@ def simplify_rule(rule: List[Cond]) -> List[Cond]:
             if op in merged[c]:
                 out.append((c, op, merged[c][op]))
     return out
+
+
+def decode_bin_condition(col: str, bin_id: float, binned_metadata: dict[str, dict[str, object]]) -> str:
+    meta = binned_metadata.get(col, {})
+    k = str(int(bin_id))
+    bin_to_raw = meta.get("bin_to_raw", {})
+    if isinstance(bin_to_raw, dict) and k in bin_to_raw:
+        raw = bin_to_raw[k]
+        if str(meta.get("feature_type", "")) == "binary":
+            return f"{col} == {int(float(raw))}"
+        return f"{col} == {float(raw):.6g}"
+
+    if str(meta.get("feature_type", "")) == "continuous":
+        edges = meta.get("bin_edges", [])
+        idx = int(bin_id)
+        if isinstance(edges, list) and 0 <= idx < len(edges):
+            pair = edges[idx]
+            if isinstance(pair, list) and len(pair) == 2:
+                return f"{col} in [{float(pair[0]):.6g}, {float(pair[1]):.6g}]"
+
+    return f"{col} == {int(bin_id)}"
+
+
+def _extract_tf_suffix(col: str) -> Optional[str]:
+    m = re.search(r"_tf(\d+)$", col)
+    return m.group(1) if m else None
+
+
+def required_anchor_prefixes_for_binary(col: str) -> list[str]:
+    if col.startswith("fvg_bull_flag_tf"):
+        return ["fvg_bull_size_tf", "fvg_any_size_tf", "fvg_bull_bars_since_tf"]
+    if col.startswith("fvg_bear_flag_tf"):
+        return ["fvg_bear_size_tf", "fvg_any_size_tf", "fvg_bear_bars_since_tf"]
+
+    m_break = re.match(r"^break_(up|dn)(\d+)_tf(\d+)$", col)
+    if m_break:
+        side, lb, _tf = m_break.groups()
+        return [f"break_{side}_dist{lb}_tf", f"break_{side}_bars_since{lb}_tf"]
+
+    if col.startswith("liq_sweep_high20_tf"):
+        return ["liq_sweep_high20_bars_since_tf"]
+    if col.startswith("liq_sweep_low20_tf"):
+        return ["liq_sweep_low20_bars_since_tf"]
+    if col.startswith("ms_hh_tf"):
+        return ["ms_hh_bars_since_tf"]
+    if col.startswith("ms_ll_tf"):
+        return ["ms_ll_bars_since_tf"]
+    return []
+
+
+def candidate_anchor_columns(binary_col: str, available_cols: list[str]) -> list[str]:
+    tf = _extract_tf_suffix(binary_col)
+    if tf is None:
+        return []
+    wanted_prefixes = required_anchor_prefixes_for_binary(binary_col)
+    if not wanted_prefixes:
+        return []
+    out: list[str] = []
+    for c in available_cols:
+        if c == binary_col:
+            continue
+        for pref in wanted_prefixes:
+            if c.startswith(pref) and c.endswith(f"_tf{tf}"):
+                out.append(c)
+                break
+    return out
+
+
+def validate_binary_anchor_invariant(rule_parts: list[Cond], available_rule_cols: list[str]) -> tuple[bool, str]:
+    cols_in_rule = {c for c, _, _ in rule_parts}
+    for c in sorted(cols_in_rule):
+        needed = required_anchor_prefixes_for_binary(c)
+        if not needed:
+            continue
+        anchors = candidate_anchor_columns(c, available_rule_cols)
+        if not anchors:
+            return False, f"binary feature '{c}' has no valid anchor mapping"
+        if not any(a in cols_in_rule for a in anchors):
+            return False, f"binary feature '{c}' is missing required anchor in final rule"
+    return True, ""
 
 
 def sharpe_proxy(x: np.ndarray) -> float:
@@ -1424,6 +1558,7 @@ def mine_best_rule(
     spread_bps: float,
     include_unrealized_at_test_end: bool,
     bar_time_ns: np.ndarray,
+    binned_metadata: Optional[dict[str, dict[str, object]]] = None,
     tick_prices_all: Optional[np.ndarray] = None,
     tick_minute_bounds: Optional[Dict[int, tuple[int, int]]] = None,
 ) -> Tuple[dict, pd.DataFrame]:
@@ -1503,6 +1638,7 @@ def mine_best_rule(
         min_lift=prefilter_min_lift,
         min_coverage=prefilter_min_coverage,
         max_coverage=prefilter_max_coverage,
+        binned_metadata=binned_metadata,
     )
     prefilter_relaxed_used = 0
     if not candidates:
@@ -1535,6 +1671,7 @@ def mine_best_rule(
                 min_lift=0.0,
                 min_coverage=float(mn_cov),
                 max_coverage=float(mx_cov),
+                binned_metadata=binned_metadata,
             )
             if candidates:
                 prefilter_relaxed_used = 1
@@ -1754,7 +1891,12 @@ def mine_best_rule(
                         best_ext = sc
                         best_ext_idxs = [base_i, j]
 
-                key_main = (lambda d: d["ev"]) if objective == "test_ev" else (lambda d: d["win"])
+                if objective == "test_ev":
+                    key_main = lambda d: d["ev"]
+                elif objective == "test_win":
+                    key_main = lambda d: d["win"]
+                else:
+                    key_main = lambda d: d.get("score", float("-inf"))
                 singles_sorted = sorted(single_scores, key=lambda x: key_main(x[1]), reverse=True)
                 pair_seed_idxs = [i for i, _ in singles_sorted[:two_starts_topk]]
                 fam_buckets: Dict[str, List[Tuple[int, dict]]] = {}
@@ -1854,6 +1996,9 @@ def mine_best_rule(
     rule_parts: list[Cond] = []
     for i in current_idxs:
         rule_parts.extend(candidates[i]["conds"])
+    ok_bundle, _ = validate_binary_anchor_invariant(rule_parts, cols)
+    if not ok_bundle:
+        return summary_empty, pd.DataFrame()
     rule = simplify_rule([(c, op, thr) for c, op, thr in rule_parts if op in {"<=", ">="}])
     binary_rule = [(c, op, thr) for c, op, thr in rule_parts if op == "=="]
     mask = np.ones(n, dtype=bool)
@@ -1907,7 +2052,7 @@ def mine_best_rule(
     hits = int(sel_test.sum())
     rule_str = " & ".join(
         [f"{c} {op} {thr:.6g}" for c, op, thr in rule] +
-        [f"{c} == {int(thr)}" for c, _, thr in binary_rule]
+        [decode_bin_condition(c, thr, binned_metadata or {}) for c, _, thr in binary_rule]
     )
 
     # Train-side rule metrics (same gating logic as test)
@@ -2204,6 +2349,7 @@ def run_single_config(
     finalist_tick_validation: bool,
     tp_summary_value: float,
     seed: int,
+    binned_metadata: Optional[dict[str, dict[str, object]]] = None,
     tick_prices_all: Optional[np.ndarray] = None,
     tick_minute_bounds: Optional[Dict[int, tuple[int, int]]] = None,
 ) -> Tuple[dict, pd.DataFrame]:
@@ -2292,6 +2438,7 @@ def run_single_config(
         spread_bps=spread_bps,
         include_unrealized_at_test_end=include_unrealized_at_test_end,
         bar_time_ns=bar_time_ns,
+        binned_metadata=binned_metadata,
         tick_prices_all=tick_prices_all,
         tick_minute_bounds=tick_minute_bounds,
     )
@@ -2379,6 +2526,7 @@ def main() -> None:
         raise ValueError("Need at least one TP value")
     cols = build_candidate_features(df, args.allow_absolute_price_features, args.max_features)
     print(f"Candidate features: {len(cols)}")
+    binned_metadata = load_binned_metadata(args.binned_metadata)
     if args.binned_features is not None:
         binned_df = load_binned_features(args.binned_features, args.tail_rows)
         if args.tail_rows > 0 and len(binned_df) > args.tail_rows:
@@ -2387,6 +2535,55 @@ def main() -> None:
         print(f"Building fallback binned features in-process (bins={args.prefilter_bins})")
         binned_df = build_binned_feature_frame(df, cols, args.prefilter_bins)
     binned_df = binned_df.reindex(df.index)
+    if len(binned_df) != len(df):
+        raise ValueError("binned features row count does not match features row count")
+    candidate_present = [c for c in cols if c in binned_df.columns]
+    if not candidate_present:
+        raise ValueError("No candidate feature columns found in binned features.")
+    type_counts = {"binary": 0, "discrete": 0, "continuous": 0, "unknown": 0}
+    for c in candidate_present:
+        t = str(binned_metadata.get(c, {}).get("feature_type", "unknown"))
+        if t not in type_counts:
+            t = "unknown"
+        type_counts[t] += 1
+    print(
+        "[binned-debug] feature types: "
+        f"binary={type_counts['binary']} discrete={type_counts['discrete']} "
+        f"continuous={type_counts['continuous']} unknown={type_counts['unknown']}"
+    )
+    fam_preview = [(c, str(_parse_feature_meta(c).get("family", c))) for c in candidate_present[:20]]
+    print(f"[binned-debug] family preview (first 20): {fam_preview}")
+
+    bundle_preview: list[tuple[str, list[str]]] = []
+    for c in candidate_present:
+        needed = required_anchor_prefixes_for_binary(c)
+        if needed:
+            bundle_preview.append((c, needed))
+    if bundle_preview:
+        print(f"[binned-debug] binary bundle requirements (sample): {bundle_preview[:20]}")
+
+    missing_ratios: list[tuple[str, float]] = []
+    bad_missing_cols: list[str] = []
+    for c in candidate_present:
+        miss_code = int(binned_metadata.get(c, {}).get("missing_code", np.iinfo(np.uint16).max))
+        s = pd.to_numeric(binned_df[c], errors="coerce")
+        missing_ratio = float(((~np.isfinite(s)) | (s == miss_code)).mean())
+        missing_ratios.append((c, missing_ratio))
+        if missing_ratio > 0.95:
+            bad_missing_cols.append(c)
+    warn_missing = sorted([x for x in missing_ratios if x[1] >= 0.05], key=lambda x: x[1], reverse=True)
+    if warn_missing:
+        print(
+            "[WARN] binned columns with >=5% missing-code share (top 20): "
+            f"{warn_missing[:20]}"
+        )
+    top_missing = sorted(missing_ratios, key=lambda x: x[1], reverse=True)[:20]
+    print(f"[binned-debug] top missing-code ratio columns: {top_missing}")
+    if bad_missing_cols:
+        raise ValueError(
+            "Binned data integrity error: columns with >95% missing-code after align: "
+            f"{bad_missing_cols[:10]}"
+        )
 
     score_cfg = {
         "ret_bad_test": args.score_return_bad_test,
@@ -2484,6 +2681,7 @@ def main() -> None:
             finalist_tick_validation=args.finalist_tick_validation,
             tp_summary_value=tp,
             seed=args.seed,
+            binned_metadata=binned_metadata,
             tick_prices_all=tick_prices_all,
             tick_minute_bounds=tick_minute_bounds,
         )
