@@ -254,6 +254,47 @@ def load_binned_metadata(path: Optional[Path]) -> dict[str, dict[str, object]]:
         return {}
 
 
+def validate_binned_metadata_alignment(
+    binned_df: pd.DataFrame,
+    candidate_cols: list[str],
+    binned_metadata: dict[str, dict[str, object]],
+) -> list[str]:
+    warns: list[str] = []
+    if not binned_metadata:
+        return warns
+    for c in candidate_cols:
+        if c not in binned_df.columns:
+            continue
+        meta = binned_metadata.get(c)
+        if not isinstance(meta, dict):
+            warns.append(f"{c}: missing metadata entry")
+            continue
+        ft = str(meta.get("feature_type", ""))
+        eff = int(meta.get("effective_bin_count", 0) or 0)
+        if ft not in {"binary", "discrete", "continuous"}:
+            warns.append(f"{c}: unknown feature_type={ft!r}")
+        if eff < 1:
+            warns.append(f"{c}: invalid effective_bin_count={eff}")
+        if ft in {"binary", "discrete"}:
+            m = meta.get("bin_to_raw", {})
+            if not isinstance(m, dict) or len(m) != eff:
+                warns.append(f"{c}: bin_to_raw size mismatch (len={len(m) if isinstance(m, dict) else -1}, eff={eff})")
+        if ft == "continuous":
+            edges = meta.get("bin_edges", [])
+            if not isinstance(edges, list) or len(edges) != eff:
+                warns.append(f"{c}: bin_edges size mismatch (len={len(edges) if isinstance(edges, list) else -1}, eff={eff})")
+        miss = int(meta.get("missing_code", 0))
+        arr = pd.to_numeric(binned_df[c], errors="coerce").fillna(miss).to_numpy(dtype=np.int64, copy=False)
+        uniq = np.unique(arr)
+        for bid in uniq.tolist():
+            if bid == miss:
+                continue
+            if bid < 1 or (eff > 0 and bid > eff):
+                warns.append(f"{c}: encountered out-of-range bin_id={bid} (expected 1..{eff}, missing={miss})")
+                break
+    return warns
+
+
 def build_binned_feature_frame(df: pd.DataFrame, cols: List[str], bins: int) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     bins = max(2, int(bins))
@@ -276,8 +317,16 @@ def build_binned_feature_frame(df: pd.DataFrame, cols: List[str], bins: int) -> 
             mapper = {float(v): i + 1 for i, v in enumerate(levels.tolist())}
             encoded = vals.map(mapper).astype(np.int32)
         else:
-            ranked = vals.rank(method="first")
-            encoded = pd.qcut(ranked, q=bins, labels=False, duplicates="drop").astype(np.int32) + 1
+            vmin = float(vals.min())
+            vmax = float(vals.max())
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                encoded = pd.Series(1, index=vals.index, dtype=np.int32)
+            else:
+                edges = np.linspace(vmin, vmax, bins + 1, dtype=np.float64)
+                arr = vals.to_numpy(dtype=np.float64, copy=False)
+                idx = np.searchsorted(edges, arr, side="right") - 1
+                idx = np.clip(idx, 0, bins - 1).astype(np.int32)
+                encoded = pd.Series(idx + 1, index=vals.index, dtype=np.int32)
         col = pd.Series(0, index=df.index, dtype=np.int32)
         col.loc[encoded.index] = encoded.to_numpy(dtype=np.int32, copy=False)
         out[c] = col.astype(dtype)
@@ -380,6 +429,8 @@ def build_candidate_features(df: pd.DataFrame, allow_absolute_price: bool, max_f
         if c.startswith("ema") or c.startswith("vwap_tf"):
             continue
 
+        if c in {"session_hour_sin", "session_hour_cos"}:
+            continue
         if c.startswith("delta_") or c.startswith("dist_vwap") or c.startswith("dist_") or c.startswith(("rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "candle_", "break_", "fvg_", "session_")):
             cand.append(c)
 
@@ -589,7 +640,7 @@ def build_prefiltered_candidates(
         meta = _parse_feature_meta(c)
         family = str(meta.get("family", c))
         col_meta = (binned_metadata or {}).get(c, {})
-        missing_code = int(col_meta.get("missing_code", np.iinfo(np.uint16).max))
+        missing_code = int(col_meta.get("missing_code", 0))
         feature_type = str(col_meta.get("feature_type", ""))
         anchor_cols = candidate_anchor_columns(c, cols) if feature_type == "binary" else []
         is_bundled_binary = bool(anchor_cols)
@@ -613,7 +664,7 @@ def build_prefiltered_candidates(
             if is_bundled_binary:
                 for ac in anchor_cols:
                     a_meta = (binned_metadata or {}).get(ac, {})
-                    a_missing = int(a_meta.get("missing_code", np.iinfo(np.uint16).max))
+                    a_missing = int(a_meta.get("missing_code", 0))
                     a_arr = pd.to_numeric(binned_df[ac], errors="coerce").fillna(a_missing).to_numpy(dtype=np.uint16, copy=False)
                     a_unique = np.unique(a_arr[:train_idx][selected_train])
                     a_unique = a_unique[a_unique != a_missing]
@@ -1061,25 +1112,29 @@ def simplify_rule(rule: List[Cond]) -> List[Cond]:
     return out
 
 
-def decode_bin_condition(col: str, bin_id: float, binned_metadata: dict[str, dict[str, object]]) -> str:
+def decode_bin_condition_verbose(col: str, bin_id: float, binned_metadata: dict[str, dict[str, object]]) -> tuple[str, bool]:
     meta = binned_metadata.get(col, {})
     k = str(int(bin_id))
     bin_to_raw = meta.get("bin_to_raw", {})
     if isinstance(bin_to_raw, dict) and k in bin_to_raw:
         raw = bin_to_raw[k]
         if str(meta.get("feature_type", "")) == "binary":
-            return f"{col} == {int(float(raw))}"
-        return f"{col} == {float(raw):.6g}"
+            return f"{col} == {int(float(raw))}", True
+        return f"{col} == {float(raw):.6g}", True
 
     if str(meta.get("feature_type", "")) == "continuous":
         edges = meta.get("bin_edges", [])
-        idx = int(bin_id)
+        idx = int(bin_id) - 1
         if isinstance(edges, list) and 0 <= idx < len(edges):
             pair = edges[idx]
             if isinstance(pair, list) and len(pair) == 2:
-                return f"{col} in [{float(pair[0]):.6g}, {float(pair[1]):.6g}]"
+                return f"{col} in [{float(pair[0]):.6g}, {float(pair[1]):.6g}]", True
 
-    return f"{col} == {int(bin_id)}"
+    return f"{col} == {int(bin_id)}", False
+
+
+def decode_bin_condition(col: str, bin_id: float, binned_metadata: dict[str, dict[str, object]]) -> str:
+    return decode_bin_condition_verbose(col, bin_id, binned_metadata)[0]
 
 
 def _extract_tf_suffix(col: str) -> Optional[str]:
@@ -1677,6 +1732,20 @@ def mine_best_rule(
                 prefilter_relaxed_used = 1
                 break
 
+    fam_counts: dict[str, int] = {}
+    prefilter_plain_rsi = 0
+    prefilter_delta_rsi = 0
+    for cand in candidates:
+        fam = str(cand.get("family", "unknown"))
+        fam_counts[fam] = fam_counts.get(fam, 0) + 1
+        for c0, _, _ in cand.get("conds", []):
+            if str(c0).startswith("rsi") and not str(c0).startswith("delta_rsi"):
+                prefilter_plain_rsi += 1
+            if str(c0).startswith("delta_") and "rsi" in str(c0):
+                prefilter_delta_rsi += 1
+    fam_top = sorted(fam_counts.items(), key=lambda x: (-x[1], x[0]))[:8]
+    fam_top_str = ";".join([f"{a}:{b}" for a, b in fam_top])
+
     summary_empty = {
         "rule": "",
         "train_base_win": base_win(y[:train_idx]),
@@ -1702,6 +1771,10 @@ def mine_best_rule(
         "train_hits": 0,
         "prefilter_candidates": int(len(candidates)),
         "prefilter_relaxed_used": int(prefilter_relaxed_used),
+        "prefilter_family_top": fam_top_str,
+        "prefilter_family_count": int(len(fam_counts)),
+        "prefilter_rsi_plain_count": int(prefilter_plain_rsi),
+        "prefilter_rsi_delta_count": int(prefilter_delta_rsi),
     }
     if not candidates:
         return summary_empty, pd.DataFrame()
@@ -2050,9 +2123,18 @@ def mine_best_rule(
     yy = y_test[sel_test]
     pp = pnl_test[sel_test]
     hits = int(sel_test.sum())
+    decoded_parts: list[str] = []
+    decode_fallback_count = 0
+    for c, _, thr in binary_rule:
+        txt, ok = decode_bin_condition_verbose(c, thr, binned_metadata or {})
+        decoded_parts.append(txt)
+        if (c in (binned_metadata or {})) and (not ok):
+            decode_fallback_count += 1
+    if decode_fallback_count > 0:
+        print(f"[WARN] decode fallback to raw bin id for {decode_fallback_count} rule condition(s)")
     rule_str = " & ".join(
         [f"{c} {op} {thr:.6g}" for c, op, thr in rule] +
-        [decode_bin_condition(c, thr, binned_metadata or {}) for c, _, thr in binary_rule]
+        decoded_parts
     )
 
     # Train-side rule metrics (same gating logic as test)
@@ -2248,6 +2330,11 @@ def mine_best_rule(
         "prefilter_candidates": len(candidates),
         "prefilter_relaxed_used": int(prefilter_relaxed_used),
         "prefilter_realistic_train_rows": int(realistic_train_mask.sum()),
+        "prefilter_family_top": fam_top_str,
+        "prefilter_family_count": int(len(fam_counts)),
+        "prefilter_rsi_plain_count": int(prefilter_plain_rsi),
+        "prefilter_rsi_delta_count": int(prefilter_delta_rsi),
+        "decode_metadata_fallback_count": int(decode_fallback_count),
         "cluster_gap_minutes": cluster_gap_minutes,
         "max_entries_per_cluster": max_entries_per_cluster,
     }
@@ -2562,10 +2649,14 @@ def main() -> None:
     if bundle_preview:
         print(f"[binned-debug] binary bundle requirements (sample): {bundle_preview[:20]}")
 
+    align_warnings = validate_binned_metadata_alignment(binned_df, candidate_present, binned_metadata)
+    if align_warnings:
+        print(f"[WARN] metadata/binned alignment issues detected (showing up to 30): {align_warnings[:30]}")
+
     missing_ratios: list[tuple[str, float]] = []
     bad_missing_cols: list[str] = []
     for c in candidate_present:
-        miss_code = int(binned_metadata.get(c, {}).get("missing_code", np.iinfo(np.uint16).max))
+        miss_code = int(binned_metadata.get(c, {}).get("missing_code", 0))
         s = pd.to_numeric(binned_df[c], errors="coerce")
         missing_ratio = float(((~np.isfinite(s)) | (s == miss_code)).mean())
         missing_ratios.append((c, missing_ratio))

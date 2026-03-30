@@ -63,6 +63,8 @@ def build_candidate_columns(df: pd.DataFrame) -> list[str]:
         if c.startswith(("open_tf", "high_tf", "low_tf", "close_tf", "volume_tf", "ema", "vwap_tf", "regime_")):
             continue
         if c.startswith(("delta_", "dist_", "dist_vwap", "rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "candle_", "break_", "fvg_", "session_")):
+            if c in {"session_hour_sin", "session_hour_cos"}:
+                continue
             out.append(c)
     return out
 
@@ -75,7 +77,7 @@ def _parse_feature_family(name: str) -> str:
 
 
 def bin_series(s: pd.Series, bins: int, dtype) -> tuple[pd.Series, dict[str, object]]:
-    missing_code = int(np.iinfo(dtype).max)
+    missing_code = 0
     valid = s.dropna()
     feature_meta: dict[str, object] = {
         "feature_type": "continuous",
@@ -94,30 +96,41 @@ def bin_series(s: pd.Series, bins: int, dtype) -> tuple[pd.Series, dict[str, obj
 
     if uniq <= 2 and set(float(v) for v in uniq_vals.tolist()).issubset({0.0, 1.0}):
         feature_meta["feature_type"] = "binary"
-        encoded = valid.astype(np.int32)
+        mapper = {0.0: 1, 1.0: 2}
+        encoded = valid.map(lambda v: mapper.get(float(v), 0)).astype(np.int32)
         out.loc[encoded.index] = encoded.to_numpy(dtype=np.int32, copy=False)
         feature_meta["effective_bin_count"] = 2
-        feature_meta["bin_to_raw"] = {"0": 0.0, "1": 1.0}
+        feature_meta["bin_to_raw"] = {"1": 0.0, "2": 1.0}
         return out.astype(dtype), feature_meta
 
     if uniq <= bins:
         feature_meta["feature_type"] = "discrete"
-        mapper = {float(v): i for i, v in enumerate(uniq_vals.tolist())}
+        mapper = {float(v): i + 1 for i, v in enumerate(uniq_vals.tolist())}
         encoded = valid.map(mapper).astype(np.int32)
         out.loc[encoded.index] = encoded.to_numpy(dtype=np.int32, copy=False)
         feature_meta["effective_bin_count"] = int(len(mapper))
         feature_meta["bin_to_raw"] = {str(i): float(v) for v, i in mapper.items()}
         return out.astype(dtype), feature_meta
 
-    ranked = valid.rank(method="first")
-    qbin = pd.qcut(ranked, q=bins, labels=False, duplicates="drop")
-    encoded = qbin.astype(np.int32)
+    vmin = float(valid.min())
+    vmax = float(valid.max())
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        encoded = pd.Series(1, index=valid.index, dtype=np.int32)
+        out.loc[encoded.index] = encoded.to_numpy(dtype=np.int32, copy=False)
+        feature_meta["effective_bin_count"] = 1
+        feature_meta["bin_edges"] = [[vmin, vmax]]
+        return out.astype(dtype), feature_meta
+
+    edges = np.linspace(vmin, vmax, bins + 1, dtype=np.float64)
+    arr = valid.to_numpy(dtype=np.float64, copy=False)
+    idx = np.searchsorted(edges, arr, side="right") - 1
+    idx = np.clip(idx, 0, bins - 1).astype(np.int32)
+    encoded = pd.Series(idx + 1, index=valid.index, dtype=np.int32)
     out.loc[encoded.index] = encoded.to_numpy(dtype=np.int32, copy=False)
-    qcats = pd.qcut(valid, q=bins, duplicates="drop")
-    cats = qcats.cat.categories
+    cats = [(float(edges[i]), float(edges[i + 1])) for i in range(bins)]
     feature_meta["feature_type"] = "continuous"
-    feature_meta["effective_bin_count"] = int(len(cats))
-    feature_meta["bin_edges"] = [[float(iv.left), float(iv.right)] for iv in cats]
+    feature_meta["effective_bin_count"] = int(bins)
+    feature_meta["bin_edges"] = [[lo, hi] for lo, hi in cats]
     return out.astype(dtype), feature_meta
 
 

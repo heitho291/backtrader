@@ -14,6 +14,7 @@ import importlib.util
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--runs", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", type=Path, default=Path("miner_optimizer_results.csv"))
+    p.add_argument("--out-debug-csv", type=Path, default=None, help="Optional structured diagnostics CSV path")
     p.add_argument("--checkpoint-every", type=int, default=5)
     p.add_argument("--max-attempts-per-run", type=int, default=5, help="Retry failed/empty runs up to N attempts per final run")
     p.add_argument("--keep-failed-runs", action="store_true", default=False, help="Keep failed attempts in output CSV")
@@ -439,15 +441,12 @@ def aggregate_objective(
     if hit_col in x.columns:
         x[hit_col] = pd.to_numeric(x[hit_col], errors="coerce")
         if min_threshold > 0:
-            before = len(x)
             x_filtered = x[x[hit_col] >= min_threshold]
-            if x_filtered.empty and before > 0:
-                note = (
-                    f"all rows filtered by --min-objective-threshold={min_threshold} on column '{hit_col}'; "
-                    "fallback to unfiltered objective rows"
+            if x_filtered.empty and len(x) > 0:
+                return float("nan"), 0, (
+                    f"all rows filtered by --min-objective-threshold={min_threshold} on column '{hit_col}'"
                 )
-            else:
-                x = x_filtered
+            x = x_filtered
 
     x = x[x[obj_col_eff].notna()]
     if x.empty:
@@ -552,12 +551,27 @@ def extract_row_metrics(summary_df: pd.DataFrame, objective_col: str) -> dict[st
         "test_start", "test_end",
         "conds", "min_test_hits_used", "min_train_hits_used", "min_hits_override_used",
         "test_cumulative_return", "train_cumulative_return", "include_unrealized_at_test_end",
+        "profit_factor", "train_profit_factor",
+        "runner_efficiency_p90", "runner_efficiency_norm",
+        "absolute_dd_pct", "max_dd_pct", "relative_dd_pct",
+        "test_risk_adjusted_return", "train_risk_adjusted_return",
+        "lot_small", "lot_run", "lot_max_single",
+        "dd_scaling_factor_to_10pct", "lot_small_at_10pct_dd", "lot_run_at_10pct_dd",
+        "projected_sum_pnl_usd_at_10pct_dd",
+        "prefilter_candidates", "prefilter_relaxed_used", "prefilter_realistic_train_rows",
+        "prefilter_family_top", "prefilter_family_count", "prefilter_rsi_plain_count", "prefilter_rsi_delta_count",
+        "decode_metadata_fallback_count",
+        "row_finalist_tick_validation", "row_finalist_tick_train_trades", "row_finalist_tick_test_trades", "row_tick_validation_scope",
     ]
+    wanted.extend([c for c in summary_df.columns if c.startswith("regime_")])
 
     out: dict[str, object] = {}
     for k in wanted:
         if k in row.index:
-            out[f"row_{k}"] = row[k]
+            if k.startswith("row_"):
+                out[k] = row[k]
+            else:
+                out[f"row_{k}"] = row[k]
     return out
 
 
@@ -565,6 +579,58 @@ def extract_row_metrics(summary_df: pd.DataFrame, objective_col: str) -> dict[st
 def _tail_line(text: str) -> str:
     lines = text.strip().splitlines()
     return lines[-1] if lines else ""
+
+
+def _rule_feature_names(rule_text: str) -> list[str]:
+    if not isinstance(rule_text, str) or not rule_text.strip():
+        return []
+    parts = [p.strip() for p in rule_text.split("&") if p.strip()]
+    out: list[str] = []
+    for p in parts:
+        m = re.match(r"^\s*([A-Za-z0-9_]+)\s*(?:<=|>=|==|in\s+\[)", p)
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+def build_optimizer_debug_row(
+    run: int,
+    attempt: int,
+    cfg: dict[str, object],
+    summary_df: pd.DataFrame | None,
+    row_rule: str,
+) -> dict[str, object]:
+    feats = _rule_feature_names(row_rule)
+    fam_counts: dict[str, int] = {}
+    for f in feats:
+        fam = f.split("_")[0]
+        fam_counts[fam] = fam_counts.get(fam, 0) + 1
+    fam_rank = sorted(fam_counts.items(), key=lambda x: (-x[1], x[0]))
+    top3 = ";".join([f"{a}:{b}" for a, b in fam_rank[:3]])
+    rsi_plain = sum(1 for f in feats if f.startswith("rsi") and not f.startswith("delta_rsi"))
+    rsi_delta = sum(1 for f in feats if f.startswith("delta_") and "rsi" in f)
+
+    out: dict[str, object] = {
+        "run": run,
+        "attempt": attempt,
+        "miner_seed": cfg.get("miner_seed"),
+        "objective_cfg": cfg.get("objective"),
+        "rule_features_count": len(feats),
+        "rule_families_count": len(fam_counts),
+        "rule_top_families": top3,
+        "rule_rsi_plain_count": rsi_plain,
+        "rule_rsi_delta_count": rsi_delta,
+    }
+    if summary_df is not None and not summary_df.empty:
+        row = summary_df.iloc[0]
+        for c in summary_df.columns:
+            if c.startswith(("prefilter_", "regime_", "row_")):
+                out[f"diag_{c}"] = row[c]
+        if "prefilter_candidates" in row.index:
+            out["diag_prefilter_candidates"] = row["prefilter_candidates"]
+        if "prefilter_relaxed_used" in row.index:
+            out["diag_prefilter_relaxed_used"] = row["prefilter_relaxed_used"]
+    return out
 
 def save_results(path: Path, rows: list[dict[str, object]]) -> None:
     target = path
@@ -713,7 +779,7 @@ def run_miner_inprocess(
     if not binned_df.empty:
         num_cols = binned_df.select_dtypes(include=["number"]).columns
         for c in num_cols:
-            missing_code = int(binned_metadata.get(c, {}).get("missing_code", np.iinfo(np.uint16).max))
+            missing_code = int(binned_metadata.get(c, {}).get("missing_code", 0))
             binned_df[c] = pd.to_numeric(binned_df[c], errors="coerce").fillna(missing_code).astype(np.uint16)
 
     tps_all = [float(x) for x in str(cfg["tps"]).split(",") if x.strip()]
@@ -923,10 +989,12 @@ def main() -> None:
         workers = max(1, int(workers_raw))
 
     rows: list[dict[str, object]] = []
+    debug_rows: list[dict[str, object]] = []
 
-    def execute_run(run: int) -> tuple[list[dict[str, object]], list[str]]:
+    def execute_run(run: int) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
         rng_local = random.Random(args.seed + run * 1000003)
         run_rows: list[dict[str, object]] = []
+        run_debug_rows: list[dict[str, object]] = []
         logs: list[str] = []
         success = False
         attempt = 0
@@ -993,9 +1061,11 @@ def main() -> None:
                 row_rule = ""
                 row_metrics: dict[str, object] = {}
                 risk_metrics: dict[str, object] = {}
+                summary_for_debug: pd.DataFrame | None = None
                 if proc.returncode == 0 and out_summary.exists():
                     try:
                         s = pd.read_csv(out_summary)
+                        summary_for_debug = s.copy()
                         objective, rows_used, objective_note = aggregate_objective(
                             s,
                             objective_col=args.objective_column,
@@ -1013,6 +1083,16 @@ def main() -> None:
                             risk_metrics = compute_loss_streak_risk_metrics(sig)
                     except Exception:
                         pass
+
+                run_debug_rows.append(
+                    build_optimizer_debug_row(
+                        run=run,
+                        attempt=attempt,
+                        cfg=cfg,
+                        summary_df=summary_for_debug,
+                        row_rule=row_rule,
+                    )
+                )
 
                 valid_result = proc.returncode == 0 and math.isfinite(objective) and rows_used > 0 and bool(row_rule)
                 err_tail = _tail_line(proc.stderr or "") if proc.returncode != 0 else ""
@@ -1068,24 +1148,29 @@ def main() -> None:
 
         if not success and (last_row is not None):
             logs.append(f"[WARN] run {run}: no valid result after {args.max_attempts_per_run} attempts")
-            if not args.keep_failed_runs:
-                fail_row = dict(last_row)
-                fail_row["failed_reason"] = "no_valid_result_after_attempts"
-                run_rows.append(fail_row)
-
-        return run_rows, logs
+        return run_rows, run_debug_rows, logs
 
     try:
         if workers <= 1:
             completed = 0
             for run in range(1, args.runs + 1):
-                rr, logs = execute_run(run)
+                rr, dbg, logs = execute_run(run)
                 rows.extend(rr)
+                debug_rows.extend(dbg)
                 for ln in logs:
                     print(ln)
                 completed += 1
                 if args.checkpoint_every > 0 and completed % args.checkpoint_every == 0:
-                    save_results(args.out, rows)
+                    rows_valid = [
+                        r for r in rows
+                        if int(r.get("exit_code", 1)) == 0
+                        and math.isfinite(float(r.get("objective", float("nan"))))
+                        and int(r.get("objective_rows_used", 0)) > 0
+                        and bool(str(r.get("row_rule", "")).strip())
+                    ]
+                    save_results(args.out, rows_valid)
+                    debug_out = args.out_debug_csv or args.out.with_name(f"{args.out.stem}_debug.csv")
+                    save_results(debug_out, debug_rows)
                     print(f"checkpoint saved: {args.out} ({completed} runs)")
         else:
             print(f"Running optimizer with workers={workers}")
@@ -1093,23 +1178,45 @@ def main() -> None:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
                 futs = [ex.submit(execute_run, run) for run in range(1, args.runs + 1)]
                 for fut in concurrent.futures.as_completed(futs):
-                    rr, logs = fut.result()
+                    rr, dbg, logs = fut.result()
                     rows.extend(rr)
+                    debug_rows.extend(dbg)
                     for ln in logs:
                         print(ln)
                     completed += 1
                     if args.checkpoint_every > 0 and completed % args.checkpoint_every == 0:
-                        save_results(args.out, rows)
+                        rows_valid = [
+                            r for r in rows
+                            if int(r.get("exit_code", 1)) == 0
+                            and math.isfinite(float(r.get("objective", float("nan"))))
+                            and int(r.get("objective_rows_used", 0)) > 0
+                            and bool(str(r.get("row_rule", "")).strip())
+                        ]
+                        save_results(args.out, rows_valid)
+                        debug_out = args.out_debug_csv or args.out.with_name(f"{args.out.stem}_debug.csv")
+                        save_results(debug_out, debug_rows)
                         print(f"checkpoint saved: {args.out} ({completed} runs)")
 
     except KeyboardInterrupt:
         print("\n[WARN] Interrupted by user, saving checkpoint before exit...")
         save_results(args.out, rows)
+        debug_out = args.out_debug_csv or args.out.with_name(f"{args.out.stem}_debug.csv")
+        save_results(debug_out, debug_rows)
         print(f"Saved (partial): {args.out}")
         return
 
+    rows = [
+        r for r in rows
+        if int(r.get("exit_code", 1)) == 0
+        and math.isfinite(float(r.get("objective", float("nan"))))
+        and int(r.get("objective_rows_used", 0)) > 0
+        and bool(str(r.get("row_rule", "")).strip())
+    ]
     save_results(args.out, rows)
+    debug_out = args.out_debug_csv or args.out.with_name(f"{args.out.stem}_debug.csv")
+    save_results(debug_out, debug_rows)
     print(f"Saved: {args.out}")
+    print(f"Saved debug: {debug_out}")
 
 
 if __name__ == "__main__":

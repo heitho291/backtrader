@@ -342,6 +342,7 @@ def add_session_features(df: pd.DataFrame, with_weekend: bool = False) -> pd.Dat
     sess["session_hour_sin"] = np.sin((2.0 * np.pi * hour) / 24.0).astype(np.float32)
     sess["session_hour_cos"] = np.cos((2.0 * np.pi * hour) / 24.0).astype(np.float32)
     sess["session_dow"] = dow.astype(np.float32)
+    sess["session_is_tokyo"] = ((hour >= 0.0) & (hour < 9.0)).astype(np.float32)
     sess["session_is_london"] = ((hour >= 7.0) & (hour < 16.0)).astype(np.float32)
     sess["session_is_ny"] = ((hour >= 13.0) & (hour < 22.0)).astype(np.float32)
     sess["session_is_ldn_ny_overlap"] = ((hour >= 13.0) & (hour < 16.0)).astype(np.float32)
