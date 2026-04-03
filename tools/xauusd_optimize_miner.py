@@ -654,10 +654,19 @@ def save_results(path: Path, rows: list[dict[str, object]]) -> None:
         return
 
     sorted_rows = sorted(rows, key=lambda r: (float(r.get("objective", float("-inf"))) if r.get("exit_code") == 0 else float("-inf")), reverse=True)
+    clean_rows: list[dict[str, object]] = []
+    for r in sorted_rows:
+        rr: dict[str, object] = {}
+        for k, v in r.items():
+            if isinstance(v, str):
+                rr[k] = v.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+            else:
+                rr[k] = v
+        clean_rows.append(rr)
 
     headers: list[str] = []
     seen: set[str] = set()
-    for r in sorted_rows:
+    for r in clean_rows:
         for k in r.keys():
             if k not in seen:
                 seen.add(k)
@@ -665,16 +674,16 @@ def save_results(path: Path, rows: list[dict[str, object]]) -> None:
 
     try:
         with target.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore", quoting=csv.QUOTE_ALL)
             w.writeheader()
-            w.writerows(sorted_rows)
+            w.writerows(clean_rows)
     except PermissionError:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         alt = target.with_name(f"{target.stem}_{ts}{target.suffix}")
         with alt.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore", quoting=csv.QUOTE_ALL)
             w.writeheader()
-            w.writerows(sorted_rows)
+            w.writerows(clean_rows)
         print(f"[WARN] Could not write {target} (locked?). Wrote {alt} instead.")
 
 
