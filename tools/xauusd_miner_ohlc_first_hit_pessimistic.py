@@ -80,6 +80,8 @@ def parse_args() -> argparse.Namespace:
                    help="Top-k single conditions used to form candidate pair starts when --two-starts is enabled")
     p.add_argument("--two-starts-family-topn", type=int, default=3,
                    help="Per-feature-family top-N singles used for family-diverse pair seeds")
+    p.add_argument("--two-starts-seed-cap", type=int, default=96,
+                   help="Hard cap for pair-seed list after merging top-k and family picks (controls O(n^2) pair explosion).")
 
     p.add_argument("--score-return-bad-test", type=float, default=0.75)
     p.add_argument("--score-return-mid-test", type=float, default=1.5)
@@ -1577,6 +1579,7 @@ def mine_best_rule(
     two_starts: bool,
     two_starts_topk: int,
     two_starts_family_topn: int,
+    two_starts_seed_cap: int,
     score_cfg: dict,
     sl: float,
     trail_activate: float,
@@ -1781,6 +1784,7 @@ def mine_best_rule(
 
     two_starts_topk = max(2, int(two_starts_topk))
     two_starts_family_topn = max(1, int(two_starts_family_topn))
+    two_starts_seed_cap = max(2, int(two_starts_seed_cap))
     fake_conds = [(str(c["primary_col"]), ">=", 0.0) for c in candidates]
     same_reference_group = {} if disable_same_reference_check else _build_same_reference_groups(df.iloc[:train_idx], fake_conds)
     test_weekdays = max(1, int((df.index[train_idx:].dayofweek < 5).sum()))
@@ -1982,6 +1986,8 @@ def mine_best_rule(
                     fam_idxs.extend([i1 for i1, _ in arr_sorted[:two_starts_family_topn]])
                 if fam_idxs:
                     pair_seed_idxs = list(dict.fromkeys(pair_seed_idxs + fam_idxs))
+                if len(pair_seed_idxs) > two_starts_seed_cap:
+                    pair_seed_idxs = pair_seed_idxs[:two_starts_seed_cap]
 
                 best_pair = None
                 best_pair_idxs: Optional[List[int]] = None
@@ -2415,6 +2421,7 @@ def run_single_config(
     two_starts: bool,
     two_starts_topk: int,
     two_starts_family_topn: int,
+    two_starts_seed_cap: int,
     score_cfg: dict,
     cluster_gap_minutes: int,
     max_entries_per_cluster: int,
@@ -2489,6 +2496,7 @@ def run_single_config(
         two_starts=two_starts,
         two_starts_topk=two_starts_topk,
         two_starts_family_topn=two_starts_family_topn,
+        two_starts_seed_cap=two_starts_seed_cap,
         score_cfg=score_cfg,
         sl=sl,
         trail_activate=trail_activate,
@@ -2589,6 +2597,8 @@ def main() -> None:
         raise ValueError("--two-starts-topk must be >= 2")
     if args.two_starts_family_topn < 1:
         raise ValueError("--two-starts-family-topn must be >= 1")
+    if args.two_starts_seed_cap < 2:
+        raise ValueError("--two-starts-seed-cap must be >= 2")
     if args.cluster_gap_minutes < 0:
         raise ValueError("--cluster-gap-minutes must be >= 0")
     if args.max_entries_per_cluster < 1:
@@ -2751,6 +2761,7 @@ def main() -> None:
             two_starts=args.two_starts,
             two_starts_topk=args.two_starts_topk,
             two_starts_family_topn=args.two_starts_family_topn,
+            two_starts_seed_cap=args.two_starts_seed_cap,
             score_cfg=score_cfg,
             cluster_gap_minutes=args.cluster_gap_minutes,
             max_entries_per_cluster=args.max_entries_per_cluster,

@@ -168,6 +168,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tick-price-column", type=str, default="auto")
     p.add_argument("--tick-sep", type=str, default=",")
     p.add_argument("--two-starts-topk", type=int, default=32)
+    p.add_argument("--two-starts-seed-cap", type=int, default=96)
 
     return p.parse_args()
 
@@ -360,6 +361,8 @@ def build_cmd(args: argparse.Namespace, cfg: dict[str, object], out_summary: Pat
         str(args.prefilter_bins),
         "--two-starts-topk",
         str(args.two_starts_topk),
+        "--two-starts-seed-cap",
+        str(args.two_starts_seed_cap),
         "--tps",
         cmd_tps,
         "--tp-weights",
@@ -821,6 +824,7 @@ def run_miner_inprocess(
         two_starts=True,
         two_starts_topk=int(args.two_starts_topk),
         two_starts_family_topn=int(args.two_starts_family_topn),
+        two_starts_seed_cap=int(args.two_starts_seed_cap),
         score_cfg=score_cfg,
         cluster_gap_minutes=int(args.cluster_gap_minutes),
         max_entries_per_cluster=int(args.max_entries_per_cluster),
@@ -886,6 +890,8 @@ def main() -> None:
         raise ValueError("two-starts-family-topn must be >= 1")
     if args.two_starts_topk < 2:
         raise ValueError("two-starts-topk must be >= 2")
+    if args.two_starts_seed_cap < 2:
+        raise ValueError("two-starts-seed-cap must be >= 2")
     if args.cluster_gap_minutes < 0 or args.max_entries_per_cluster < 1:
         raise ValueError("cluster parameters must satisfy gap>=0 and max-entries>=1")
     if args.account_margin_usd <= 0 or args.broker_leverage <= 0 or args.lot_step <= 0 or args.contract_units_per_lot <= 0:
