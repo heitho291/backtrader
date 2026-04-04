@@ -115,6 +115,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--p-include-unrealized-at-test-end", type=float, default=1.0,
                    help="Probability to include unrealized pnl at test_end in miner scoring")
     p.add_argument("--objective-choice", type=str, choices=["test_ev", "test_win", "test_score"], default="test_score")
+    p.add_argument("--optimize-on", choices=["train", "test"], default="train",
+                   help="Forwarded to miner --optimize-on to control greedy selection target.")
     p.add_argument("--two-starts-family-topn", type=int, default=3)
     p.add_argument("--score-return-bad-test", type=float, default=0.75)
     p.add_argument("--score-return-mid-test", type=float, default=1.5)
@@ -159,6 +161,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefilter-min-pos-rate", type=float, default=0.0)
     p.add_argument("--prefilter-max-neg-rate", type=float, default=1.0)
     p.add_argument("--prefilter-min-lift", type=float, default=0.0)
+    p.add_argument("--prefilter-min-precision", type=float, default=0.0)
+    p.add_argument("--prefilter-combo-conds", type=int, default=1)
+    p.add_argument("--prefilter-combo-topk", type=int, default=96)
     p.add_argument("--prefilter-min-coverage", type=float, default=0.001)
     p.add_argument("--prefilter-max-coverage", type=float, default=0.98)
     p.add_argument("--prefilter-bins", type=int, default=20)
@@ -297,6 +302,8 @@ def build_cmd(args: argparse.Namespace, cfg: dict[str, object], out_summary: Pat
         str(cfg["min_hits_return_override"]),
         "--objective",
         str(cfg["objective"]),
+        "--optimize-on",
+        str(args.optimize_on),
         "--seed",
         str(cfg["miner_seed"]),
         "--quantiles",
@@ -353,6 +360,12 @@ def build_cmd(args: argparse.Namespace, cfg: dict[str, object], out_summary: Pat
         str(args.prefilter_max_neg_rate),
         "--prefilter-min-lift",
         str(args.prefilter_min_lift),
+        "--prefilter-min-precision",
+        str(args.prefilter_min_precision),
+        "--prefilter-combo-conds",
+        str(args.prefilter_combo_conds),
+        "--prefilter-combo-topk",
+        str(args.prefilter_combo_topk),
         "--prefilter-min-coverage",
         str(args.prefilter_min_coverage),
         "--prefilter-max-coverage",
@@ -828,6 +841,7 @@ def run_miner_inprocess(
         min_hits_return_override=float(cfg["min_hits_return_override"]),
         wf_folds=int(cfg["wf_folds"]),
         objective=str(cfg["objective"]),
+        optimize_on=str(args.optimize_on),
         one_trade_at_a_time=bool(cfg["one_trade_at_a_time"]),
         disable_same_reference_check=bool(cfg["disable_same_reference_check"]),
         two_starts=True,
@@ -850,6 +864,9 @@ def run_miner_inprocess(
         prefilter_min_pos_rate=float(args.prefilter_min_pos_rate),
         prefilter_max_neg_rate=float(args.prefilter_max_neg_rate),
         prefilter_min_lift=float(args.prefilter_min_lift),
+        prefilter_min_precision=float(args.prefilter_min_precision),
+        prefilter_combo_conds=int(args.prefilter_combo_conds),
+        prefilter_combo_topk=int(args.prefilter_combo_topk),
         prefilter_min_coverage=float(args.prefilter_min_coverage),
         prefilter_max_coverage=float(args.prefilter_max_coverage),
         finalist_tick_validation=True,
@@ -911,6 +928,12 @@ def main() -> None:
         raise ValueError("lot-run-min must be > 0")
     if args.prefilter_bins < 2:
         raise ValueError("prefilter-bins must be >= 2")
+    if not (0.0 <= args.prefilter_min_precision <= 1.0):
+        raise ValueError("prefilter-min-precision must be in [0,1]")
+    if args.prefilter_combo_conds < 1:
+        raise ValueError("prefilter-combo-conds must be >= 1")
+    if args.prefilter_combo_topk < 1:
+        raise ValueError("prefilter-combo-topk must be >= 1")
     if not (0.0 <= args.win_return_blend <= 1.0):
         raise ValueError("win-return-blend must be in [0,1]")
 

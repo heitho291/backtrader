@@ -16,6 +16,7 @@ Key upgrades:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 from pathlib import Path
@@ -73,6 +74,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--quantiles", type=str, default="0.05,0.10,0.90,0.95")
     p.add_argument("--wf-folds", type=int, default=4)
     p.add_argument("--objective", choices=["test_ev", "test_win", "test_score"], default="test_score")
+    p.add_argument("--optimize-on", choices=["train", "test"], default="train",
+                   help="Use train-only or test metrics to drive greedy rule selection.")
     p.add_argument("--two-starts", action="store_true", default=True,
                    help="Also test top-k pair starts in addition to best single-condition start")
     p.add_argument("--no-two-starts", dest="two_starts", action="store_false")
@@ -120,6 +123,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefilter-min-pos-rate", type=float, default=0.0)
     p.add_argument("--prefilter-max-neg-rate", type=float, default=1.0)
     p.add_argument("--prefilter-min-lift", type=float, default=0.0)
+    p.add_argument("--prefilter-min-precision", type=float, default=0.0,
+                   help="Minimum precision = pos_hits/(pos_hits+neg_hits) for prefilter candidates.")
+    p.add_argument("--prefilter-combo-conds", type=int, default=1,
+                   help="Build prefilter candidates as combos with at least N conditions (1=single candidates).")
+    p.add_argument("--prefilter-combo-topk", type=int, default=96,
+                   help="Top-K prefilter singles used as pool for combo construction when --prefilter-combo-conds>1.")
     p.add_argument("--prefilter-min-coverage", type=float, default=0.001)
     p.add_argument("--prefilter-max-coverage", type=float, default=0.98)
 
@@ -135,6 +144,8 @@ def parse_args() -> argparse.Namespace:
                    help="Disable support/resist identical-reference dedup check (faster/less memory)")
     p.add_argument("--out-summary", type=Path, default=Path("best_rules_summary.csv"))
     p.add_argument("--out-signals", type=Path, default=Path("signals_best_rules.csv"))
+    p.add_argument("--csv-sep", type=str, default=",",
+                   help="CSV separator used for summary/signals export (set ';' for some Excel locales).")
 
     p.add_argument("--tick-data", type=Path, default=None,
                    help="Optional tick file (CSV/Parquet) for realistic intrabar sequencing on critical candles")
@@ -617,6 +628,9 @@ def build_prefiltered_candidates(
     min_pos_rate: float,
     max_neg_rate: float,
     min_lift: float,
+    min_precision: float,
+    combo_conds: int,
+    combo_topk: int,
     min_coverage: float,
     max_coverage: float,
     binned_metadata: Optional[dict[str, dict[str, object]]] = None,
@@ -632,6 +646,24 @@ def build_prefiltered_candidates(
 
     candidates: list[dict[str, object]] = []
     eps = 1e-12
+    combo_conds = max(1, int(combo_conds))
+    combo_topk = max(8, int(combo_topk))
+
+    def eval_mask(mask_train: np.ndarray) -> tuple[bool, float, float, float, float, int, int, float]:
+        coverage = float(mask_train[selected_train].mean()) if sel_total else 0.0
+        if coverage < min_coverage or coverage > max_coverage:
+            return False, 0.0, 0.0, 0.0, 0.0, 0, 0, 0.0
+        pos_hits = int(np.sum(mask_train & positive_set))
+        neg_hits = int(np.sum(mask_train & negative_set))
+        if pos_hits < min_positive_hits:
+            return False, 0.0, 0.0, 0.0, 0.0, pos_hits, neg_hits, 0.0
+        pos_rate = pos_hits / max(1, pos_total)
+        neg_rate = neg_hits / max(1, neg_total)
+        lift = pos_rate / max(neg_rate, eps)
+        precision = pos_hits / max(1, pos_hits + neg_hits)
+        if pos_rate < min_pos_rate or neg_rate > max_neg_rate or lift < min_lift or precision < min_precision:
+            return False, pos_rate, neg_rate, lift, coverage, pos_hits, neg_hits, precision
+        return True, pos_rate, neg_rate, lift, coverage, pos_hits, neg_hits, precision
 
     bundle_debug_total = 0
     bundle_debug_skipped = 0
@@ -683,17 +715,8 @@ def build_prefiltered_candidates(
 
             for mask, conds, primary_col, label in bundle_variants:
                 mask_train = mask[:train_idx]
-                coverage = float(mask_train[selected_train].mean()) if sel_total else 0.0
-                if coverage < min_coverage or coverage > max_coverage:
-                    continue
-                pos_hits = int(np.sum(mask_train & positive_set))
-                neg_hits = int(np.sum(mask_train & negative_set))
-                if pos_hits < min_positive_hits:
-                    continue
-                pos_rate = pos_hits / max(1, pos_total)
-                neg_rate = neg_hits / max(1, neg_total)
-                lift = pos_rate / max(neg_rate, eps)
-                if pos_rate < min_pos_rate or neg_rate > max_neg_rate or lift < min_lift:
+                ok, pos_rate, neg_rate, lift, coverage, pos_hits, neg_hits, precision = eval_mask(mask_train)
+                if not ok:
                     continue
 
                 fam_candidates.append({
@@ -708,6 +731,7 @@ def build_prefiltered_candidates(
                     "prefilter_neg_rate": float(neg_rate),
                     "prefilter_lift": float(lift),
                     "prefilter_coverage": float(coverage),
+                    "prefilter_precision": float(precision),
                 })
 
         fam_candidates = sorted(fam_candidates, key=lambda x: float(x["prefilter_score"]), reverse=True)[:top_per_family]
@@ -724,6 +748,56 @@ def build_prefiltered_candidates(
         deduped.append(cand)
         if len(deduped) >= max_candidates:
             break
+
+    if combo_conds > 1 and deduped:
+        singles_pool = deduped[:combo_topk]
+        combo_candidates: list[dict[str, object]] = []
+        for base in singles_pool:
+            cur_mask = np.asarray(base["mask"], dtype=bool).copy()
+            cur_conds = list(base["conds"])
+            used_cols = {str(c0) for c0, _, _ in cur_conds}
+            cur_score = float(base.get("prefilter_score", 0.0))
+            for _ in range(1, combo_conds):
+                best_ext = None
+                best_sc = cur_score
+                for cand in singles_pool:
+                    cand_cols = {str(c0) for c0, _, _ in cand.get("conds", [])}
+                    if used_cols & cand_cols:
+                        continue
+                    cm = cur_mask & np.asarray(cand["mask"], dtype=bool)
+                    ok, pos_rate, neg_rate, lift, coverage, pos_hits, neg_hits, precision = eval_mask(cm[:train_idx])
+                    if not ok:
+                        continue
+                    sc = float(pos_rate * np.log1p(lift))
+                    if sc > best_sc:
+                        best_sc = sc
+                        best_ext = (cand, cm, pos_rate, neg_rate, lift, coverage, precision)
+                if best_ext is None:
+                    break
+                cand, cm, pos_rate, neg_rate, lift, coverage, precision = best_ext
+                cur_mask = cm
+                cur_conds.extend(cand["conds"])
+                used_cols.update([str(c0) for c0, _, _ in cand["conds"]])
+                cur_score = best_sc
+
+            if len(cur_conds) >= combo_conds:
+                combo_candidates.append({
+                    "name": " & ".join([decode_bin_condition(c0, thr0, binned_metadata or {}) for c0, _, thr0 in cur_conds]),
+                    "conds": cur_conds,
+                    "mask": cur_mask,
+                    "family": "combo",
+                    "scale": None,
+                    "prefilter_score": float(cur_score),
+                    "primary_col": str(cur_conds[0][0]),
+                    "prefilter_pos_rate": float(pos_rate),
+                    "prefilter_neg_rate": float(neg_rate),
+                    "prefilter_lift": float(lift),
+                    "prefilter_coverage": float(coverage),
+                    "prefilter_precision": float(precision),
+                })
+        if combo_candidates:
+            combo_candidates = sorted(combo_candidates, key=lambda x: float(x["prefilter_score"]), reverse=True)
+            deduped = combo_candidates
 
     if max_features > 0:
         deduped = deduped[:max_features]
@@ -1574,6 +1648,7 @@ def mine_best_rule(
     min_hits_return_override: float,
     wf_folds: int,
     objective: str,
+    optimize_on: str,
     one_trade_at_a_time: bool,
     disable_same_reference_check: bool,
     two_starts: bool,
@@ -1600,6 +1675,9 @@ def mine_best_rule(
     prefilter_min_pos_rate: float,
     prefilter_max_neg_rate: float,
     prefilter_min_lift: float,
+    prefilter_min_precision: float,
+    prefilter_combo_conds: int,
+    prefilter_combo_topk: int,
     prefilter_min_coverage: float,
     prefilter_max_coverage: float,
     seed: int,
@@ -1694,6 +1772,9 @@ def mine_best_rule(
         min_pos_rate=prefilter_min_pos_rate,
         max_neg_rate=prefilter_max_neg_rate,
         min_lift=prefilter_min_lift,
+        min_precision=prefilter_min_precision,
+        combo_conds=prefilter_combo_conds,
+        combo_topk=prefilter_combo_topk,
         min_coverage=prefilter_min_coverage,
         max_coverage=prefilter_max_coverage,
         binned_metadata=binned_metadata,
@@ -1727,6 +1808,9 @@ def mine_best_rule(
                 min_pos_rate=0.0,
                 max_neg_rate=1.0,
                 min_lift=0.0,
+                min_precision=0.0,
+                combo_conds=1,
+                combo_topk=max(32, int(prefilter_combo_topk)),
                 min_coverage=float(mn_cov),
                 max_coverage=float(mx_cov),
                 binned_metadata=binned_metadata,
@@ -1873,6 +1957,8 @@ def mine_best_rule(
         return {
             "ev": float(np.mean(pp)),
             "win": float((yy == 1).mean()),
+            "train_ev": float(np.mean(train_pp)) if train_hits else float("nan"),
+            "train_win": float((train_yy == 1).mean()) if train_hits else float("nan"),
             "hits": hits,
             "train_hits": train_hits,
             "median_per_day": med_per_day,
@@ -1907,15 +1993,16 @@ def mine_best_rule(
     def better(a: dict, b: Optional[dict]) -> bool:
         if b is None:
             return True
+        use_train = (optimize_on == "train")
         if objective == "test_ev":
-            a_main = a["ev"]
-            b_main = b["ev"]
+            a_main = a["train_ev"] if use_train else a["ev"]
+            b_main = b["train_ev"] if use_train else b["ev"]
         elif objective == "test_win":
-            a_main = a["win"]
-            b_main = b["win"]
+            a_main = a["train_win"] if use_train else a["win"]
+            b_main = b["train_win"] if use_train else b["win"]
         else:
-            a_main = a.get("score", float("nan"))
-            b_main = b.get("score", float("nan"))
+            a_main = a.get("score_train", float("nan")) if use_train else a.get("score", float("nan"))
+            b_main = b.get("score_train", float("nan")) if use_train else b.get("score", float("nan"))
         if a_main != b_main:
             return a_main > b_main
         if a["hits"] != b["hits"]:
@@ -1969,11 +2056,11 @@ def mine_best_rule(
                         best_ext_idxs = [base_i, j]
 
                 if objective == "test_ev":
-                    key_main = lambda d: d["ev"]
+                    key_main = (lambda d: d["train_ev"]) if optimize_on == "train" else (lambda d: d["ev"])
                 elif objective == "test_win":
-                    key_main = lambda d: d["win"]
+                    key_main = (lambda d: d["train_win"]) if optimize_on == "train" else (lambda d: d["win"])
                 else:
-                    key_main = lambda d: d.get("score", float("-inf"))
+                    key_main = (lambda d: d.get("score_train", float("-inf"))) if optimize_on == "train" else (lambda d: d.get("score", float("-inf")))
                 singles_sorted = sorted(single_scores, key=lambda x: key_main(x[1]), reverse=True)
                 pair_seed_idxs = [i for i, _ in singles_sorted[:two_starts_topk]]
                 fam_buckets: Dict[str, List[Tuple[int, dict]]] = {}
@@ -2034,11 +2121,15 @@ def mine_best_rule(
                 if best_cand is None:
                     break
                 if objective == "test_ev":
-                    improves = best_cand["ev"] > current["ev"]
+                    improves = (best_cand["train_ev"] > current["train_ev"]) if optimize_on == "train" else (best_cand["ev"] > current["ev"])
                 elif objective == "test_win":
-                    improves = best_cand["win"] > current["win"]
+                    improves = (best_cand["train_win"] > current["train_win"]) if optimize_on == "train" else (best_cand["win"] > current["win"])
                 else:
-                    improves = best_cand.get("score", float("nan")) > current.get("score", float("nan"))
+                    improves = (
+                        best_cand.get("score_train", float("nan")) > current.get("score_train", float("nan"))
+                        if optimize_on == "train"
+                        else best_cand.get("score", float("nan")) > current.get("score", float("nan"))
+                    )
                 if not improves:
                     break
 
@@ -2416,6 +2507,7 @@ def run_single_config(
     min_hits_return_override: float,
     wf_folds: int,
     objective: str,
+    optimize_on: str,
     one_trade_at_a_time: bool,
     disable_same_reference_check: bool,
     two_starts: bool,
@@ -2438,6 +2530,9 @@ def run_single_config(
     prefilter_min_pos_rate: float,
     prefilter_max_neg_rate: float,
     prefilter_min_lift: float,
+    prefilter_min_precision: float,
+    prefilter_combo_conds: int,
+    prefilter_combo_topk: int,
     prefilter_min_coverage: float,
     prefilter_max_coverage: float,
     finalist_tick_validation: bool,
@@ -2491,6 +2586,7 @@ def run_single_config(
         min_hits_return_override=min_hits_return_override,
         wf_folds=wf_folds,
         objective=objective,
+        optimize_on=optimize_on,
         one_trade_at_a_time=one_trade_at_a_time,
         disable_same_reference_check=disable_same_reference_check,
         two_starts=two_starts,
@@ -2517,6 +2613,9 @@ def run_single_config(
         prefilter_min_pos_rate=prefilter_min_pos_rate,
         prefilter_max_neg_rate=prefilter_max_neg_rate,
         prefilter_min_lift=prefilter_min_lift,
+        prefilter_min_precision=prefilter_min_precision,
+        prefilter_combo_conds=prefilter_combo_conds,
+        prefilter_combo_topk=prefilter_combo_topk,
         prefilter_min_coverage=prefilter_min_coverage,
         prefilter_max_coverage=prefilter_max_coverage,
         seed=seed,
@@ -2756,6 +2855,7 @@ def main() -> None:
             min_hits_return_override=args.min_hits_return_override,
             wf_folds=args.wf_folds,
             objective=args.objective,
+            optimize_on=args.optimize_on,
             one_trade_at_a_time=args.one_trade_at_a_time,
             disable_same_reference_check=args.disable_same_reference_check,
             two_starts=args.two_starts,
@@ -2778,6 +2878,9 @@ def main() -> None:
             prefilter_min_pos_rate=args.prefilter_min_pos_rate,
             prefilter_max_neg_rate=args.prefilter_max_neg_rate,
             prefilter_min_lift=args.prefilter_min_lift,
+            prefilter_min_precision=args.prefilter_min_precision,
+            prefilter_combo_conds=args.prefilter_combo_conds,
+            prefilter_combo_topk=args.prefilter_combo_topk,
             prefilter_min_coverage=args.prefilter_min_coverage,
             prefilter_max_coverage=args.prefilter_max_coverage,
             finalist_tick_validation=args.finalist_tick_validation,
@@ -2798,11 +2901,26 @@ def main() -> None:
         if not sig.empty:
             signals.append(sig.reset_index().rename(columns={"index": "datetime"}))
 
-    pd.DataFrame(summaries).to_csv(args.out_summary, index=False)
+    pd.DataFrame(summaries).to_csv(
+        args.out_summary,
+        index=False,
+        sep=args.csv_sep,
+        quoting=csv.QUOTE_MINIMAL,
+    )
     if signals:
-        pd.concat(signals, axis=0, ignore_index=True).to_csv(args.out_signals, index=False)
+        pd.concat(signals, axis=0, ignore_index=True).to_csv(
+            args.out_signals,
+            index=False,
+            sep=args.csv_sep,
+            quoting=csv.QUOTE_MINIMAL,
+        )
     else:
-        pd.DataFrame(columns=["datetime", "close", "pnl", "outcome", "minutes_to_hit", "tp_hits", "tp", "sl", "hold", "rule", "tps", "tp_weights"]).to_csv(args.out_signals, index=False)
+        pd.DataFrame(columns=["datetime", "close", "pnl", "outcome", "minutes_to_hit", "tp_hits", "tp", "sl", "hold", "rule", "tps", "tp_weights"]).to_csv(
+            args.out_signals,
+            index=False,
+            sep=args.csv_sep,
+            quoting=csv.QUOTE_MINIMAL,
+        )
 
     print("\nSaved:", args.out_summary)
     print("Saved:", args.out_signals)
