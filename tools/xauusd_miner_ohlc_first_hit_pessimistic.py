@@ -71,6 +71,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-include-unrealized-at-test-end", dest="include_unrealized_at_test_end", action="store_false")
     p.add_argument("--max-conds", type=int, default=5)
     p.add_argument("--min-conds", type=int, default=3)
+    p.add_argument("--require-tf1-feature", action="store_true", default=False,
+                   help="Require at least one _tf1 condition in the final rule.")
     p.add_argument("--quantiles", type=str, default="0.05,0.10,0.90,0.95")
     p.add_argument("--wf-folds", type=int, default=4)
     p.add_argument("--objective", choices=["test_ev", "test_win", "test_score"], default="test_score")
@@ -118,6 +120,9 @@ def parse_args() -> argparse.Namespace:
                    help="Optional comma-separated lot choices; one is selected deterministically per run seed")
 
     p.add_argument("--prefilter-top-per-family", type=int, default=10)
+    p.add_argument("--prefilter", action="store_true", default=True,
+                   help="Enable label-aware prefilter candidate screening.")
+    p.add_argument("--no-prefilter", dest="prefilter", action="store_false")
     p.add_argument("--prefilter-max-candidates", type=int, default=200)
     p.add_argument("--prefilter-min-positive-hits", type=int, default=25)
     p.add_argument("--prefilter-min-pos-rate", type=float, default=0.0)
@@ -809,6 +814,42 @@ def build_prefiltered_candidates(
     return deduped
 
 
+def build_all_binned_candidates(
+    binned_df: pd.DataFrame,
+    cols: List[str],
+    train_idx: int,
+    max_candidates: int,
+    binned_metadata: Optional[dict[str, dict[str, object]]] = None,
+) -> list[dict[str, object]]:
+    selected_train = np.ones(train_idx, dtype=bool)
+    candidates: list[dict[str, object]] = []
+    for c in cols:
+        if c not in binned_df.columns:
+            continue
+        meta = _parse_feature_meta(c)
+        family = str(meta.get("family", c))
+        col_meta = (binned_metadata or {}).get(c, {})
+        missing_code = int(col_meta.get("missing_code", 0))
+        bins_arr = pd.to_numeric(binned_df[c], errors="coerce").fillna(missing_code).to_numpy(dtype=np.uint16, copy=False)
+        train_bins = bins_arr[:train_idx]
+        unique_bins = np.unique(train_bins[selected_train])
+        unique_bins = unique_bins[unique_bins != missing_code]
+        for bin_id in unique_bins.tolist():
+            m = bins_arr == int(bin_id)
+            candidates.append({
+                "name": decode_bin_condition(c, float(bin_id), binned_metadata or {}),
+                "conds": [(c, "==", float(bin_id))],
+                "mask": m,
+                "family": family,
+                "scale": meta.get("scale"),
+                "prefilter_score": 0.0,
+                "primary_col": c,
+            })
+            if len(candidates) >= max_candidates:
+                return candidates
+    return candidates
+
+
 def parse_tp_weights(tps: List[float], w_str: str) -> np.ndarray:
     """Parse TP weights.
 
@@ -1204,6 +1245,13 @@ def decode_bin_condition_verbose(col: str, bin_id: float, binned_metadata: dict[
         if isinstance(edges, list) and 0 <= idx < len(edges):
             pair = edges[idx]
             if isinstance(pair, list) and len(pair) == 2:
+                if str(col).startswith("dist_"):
+                    if idx <= 0:
+                        return f"{col} <= {float(pair[1]):.6g}", True
+                    if idx >= (len(edges) - 1):
+                        return f"{col} >= {float(pair[0]):.6g}", True
+                    mid = 0.5 * (float(pair[0]) + float(pair[1]))
+                    return f"{col} >= {mid:.6g}", True
                 return f"{col} in [{float(pair[0]):.6g}, {float(pair[1]):.6g}]", True
 
     return f"{col} == {int(bin_id)}", False
@@ -1670,6 +1718,7 @@ def mine_best_rule(
     lot_run_min: float,
     lot_run_choices: str,
     prefilter_top_per_family: int,
+    prefilter_enabled: bool,
     prefilter_max_candidates: int,
     prefilter_min_positive_hits: int,
     prefilter_min_pos_rate: float,
@@ -1680,6 +1729,7 @@ def mine_best_rule(
     prefilter_combo_topk: int,
     prefilter_min_coverage: float,
     prefilter_max_coverage: float,
+    require_tf1_feature: bool,
     seed: int,
     final_tick_validation: bool,
     high: np.ndarray,
@@ -1758,29 +1808,38 @@ def mine_best_rule(
         max_entries_per_cluster=max_entries_per_cluster,
     )
 
-    candidates = build_prefiltered_candidates(
-        df=df,
-        binned_df=binned_df,
-        cols=cols,
-        train_idx=train_idx,
-        y=y,
-        realistic_train_mask=realistic_train_mask,
-        max_features=max(len(cols), prefilter_max_candidates),
-        top_per_family=prefilter_top_per_family,
-        max_candidates=prefilter_max_candidates,
-        min_positive_hits=prefilter_min_positive_hits,
-        min_pos_rate=prefilter_min_pos_rate,
-        max_neg_rate=prefilter_max_neg_rate,
-        min_lift=prefilter_min_lift,
-        min_precision=prefilter_min_precision,
-        combo_conds=prefilter_combo_conds,
-        combo_topk=prefilter_combo_topk,
-        min_coverage=prefilter_min_coverage,
-        max_coverage=prefilter_max_coverage,
-        binned_metadata=binned_metadata,
-    )
+    if prefilter_enabled:
+        candidates = build_prefiltered_candidates(
+            df=df,
+            binned_df=binned_df,
+            cols=cols,
+            train_idx=train_idx,
+            y=y,
+            realistic_train_mask=realistic_train_mask,
+            max_features=max(len(cols), prefilter_max_candidates),
+            top_per_family=prefilter_top_per_family,
+            max_candidates=prefilter_max_candidates,
+            min_positive_hits=prefilter_min_positive_hits,
+            min_pos_rate=prefilter_min_pos_rate,
+            max_neg_rate=prefilter_max_neg_rate,
+            min_lift=prefilter_min_lift,
+            min_precision=prefilter_min_precision,
+            combo_conds=prefilter_combo_conds,
+            combo_topk=prefilter_combo_topk,
+            min_coverage=prefilter_min_coverage,
+            max_coverage=prefilter_max_coverage,
+            binned_metadata=binned_metadata,
+        )
+    else:
+        candidates = build_all_binned_candidates(
+            binned_df=binned_df,
+            cols=cols,
+            train_idx=train_idx,
+            max_candidates=max(1, int(prefilter_max_candidates)),
+            binned_metadata=binned_metadata,
+        )
     prefilter_relaxed_used = 0
-    if not candidates:
+    if prefilter_enabled and not candidates:
         relax_steps = [
             (
                 max(1, int(prefilter_min_positive_hits // 2)),
@@ -2017,6 +2076,13 @@ def mine_best_rule(
             nv = v - 1
         return max(1, nv)
 
+    def _has_tf1(idxs: List[int]) -> bool:
+        for ix in idxs:
+            for c0, _, _ in candidates[ix].get("conds", []):
+                if str(c0).endswith("_tf1"):
+                    return True
+        return False
+
     req_hits = max(1, int(min_test_hits))
     used_min_test_hits = req_hits
     current: Optional[dict] = None
@@ -2156,7 +2222,29 @@ def mine_best_rule(
                 current_idxs.append(int(best_idx))
                 current = best_cand
 
-            if len(current_idxs) >= min_conds:
+            if require_tf1_feature and current is not None and len(current_idxs) >= min_conds and not _has_tf1(current_idxs):
+                used_feat = {str(candidates[i]["primary_col"]) for i in current_idxs}
+                best_tf1 = None
+                best_tf1_idx = None
+                cm = current["mask"]
+                for i, cand in enumerate(candidates):
+                    if i in current_idxs or str(cand["primary_col"]) in used_feat:
+                        continue
+                    if not any(str(c0).endswith("_tf1") for c0, _, _ in cand.get("conds", [])):
+                        continue
+                    if not _rule_extension_allowed(current_idxs, i, candidates, same_reference_group):
+                        continue
+                    sc = score(cm & np.asarray(candidates[i]["mask"], dtype=bool), required_hits=req_hits)
+                    if sc is not None and better(sc, best_tf1):
+                        best_tf1 = sc
+                        best_tf1_idx = i
+                if best_tf1 is None:
+                    current = None
+                else:
+                    current_idxs.append(int(best_tf1_idx))
+                    current = best_tf1
+
+            if current is not None and len(current_idxs) >= min_conds:
                 used_min_test_hits = req_hits
                 break
 
@@ -2526,6 +2614,7 @@ def run_single_config(
     lot_run_min: float,
     lot_run_choices: str,
     prefilter_top_per_family: int,
+    prefilter_enabled: bool,
     prefilter_max_candidates: int,
     prefilter_min_positive_hits: int,
     prefilter_min_pos_rate: float,
@@ -2536,6 +2625,7 @@ def run_single_config(
     prefilter_combo_topk: int,
     prefilter_min_coverage: float,
     prefilter_max_coverage: float,
+    require_tf1_feature: bool,
     finalist_tick_validation: bool,
     tp_summary_value: float,
     seed: int,
@@ -2609,6 +2699,7 @@ def run_single_config(
         lot_run_min=lot_run_min,
         lot_run_choices=lot_run_choices,
         prefilter_top_per_family=prefilter_top_per_family,
+        prefilter_enabled=prefilter_enabled,
         prefilter_max_candidates=prefilter_max_candidates,
         prefilter_min_positive_hits=prefilter_min_positive_hits,
         prefilter_min_pos_rate=prefilter_min_pos_rate,
@@ -2619,6 +2710,7 @@ def run_single_config(
         prefilter_combo_topk=prefilter_combo_topk,
         prefilter_min_coverage=prefilter_min_coverage,
         prefilter_max_coverage=prefilter_max_coverage,
+        require_tf1_feature=require_tf1_feature,
         seed=seed,
         final_tick_validation=bool(finalist_tick_validation and tick_prices_all is not None and tick_minute_bounds is not None),
         high=high,
@@ -2874,6 +2966,7 @@ def main() -> None:
             lot_run_min=args.lot_run_min,
             lot_run_choices=args.lot_run_choices,
             prefilter_top_per_family=args.prefilter_top_per_family,
+            prefilter_enabled=args.prefilter,
             prefilter_max_candidates=args.prefilter_max_candidates,
             prefilter_min_positive_hits=args.prefilter_min_positive_hits,
             prefilter_min_pos_rate=args.prefilter_min_pos_rate,
@@ -2884,6 +2977,7 @@ def main() -> None:
             prefilter_combo_topk=args.prefilter_combo_topk,
             prefilter_min_coverage=args.prefilter_min_coverage,
             prefilter_max_coverage=args.prefilter_max_coverage,
+            require_tf1_feature=args.require_tf1_feature,
             finalist_tick_validation=args.finalist_tick_validation,
             tp_summary_value=tp,
             seed=args.seed,

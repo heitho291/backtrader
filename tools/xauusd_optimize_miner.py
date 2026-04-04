@@ -120,6 +120,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trail-factor-range", type=parse_float_range, default=(0.2, 0.8))
     p.add_argument("--p-trail", type=float, default=1.0, help="Probability to enable trailing per run")
     p.add_argument("--p-use-multi-tp", type=float, default=1.0, help="Probability to enable TP-based exits per run")
+    p.add_argument("--p-prefilter-off", type=float, default=0.0,
+                   help="Probability to disable miner prefilter for a run (A/B style).")
     p.add_argument("--min-test-hits-reduce-step-range", type=parse_float_range, default=(0.05, 0.20))
     p.add_argument("--min-hits-return-override-range", type=parse_float_range, default=(2.0, 4.0))
     p.add_argument("--p-include-unrealized-at-test-end", type=float, default=1.0,
@@ -127,6 +129,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--objective-choice", type=str, choices=["test_ev", "test_win", "test_score"], default="test_score")
     p.add_argument("--optimize-on", choices=["train", "test"], default="train",
                    help="Forwarded to miner --optimize-on to control greedy selection target.")
+    p.add_argument("--require-tf1-feature", action="store_true", default=False,
+                   help="Forwarded to miner to require at least one _tf1 condition in final rule.")
     p.add_argument("--two-starts-family-topn", type=int, default=3)
     p.add_argument("--score-return-bad-test", type=float, default=0.75)
     p.add_argument("--score-return-mid-test", type=float, default=1.5)
@@ -166,12 +170,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lot-run-choices", type=str, default="")
     p.add_argument("--lot-run-min", type=float, default=0.01)
     p.add_argument("--prefilter-top-per-family", type=int, default=10)
+    p.add_argument("--prefilter-top-per-family-range", type=parse_int_range, default=None)
     p.add_argument("--prefilter-max-candidates", type=int, default=200)
+    p.add_argument("--prefilter-max-candidates-range", type=parse_int_range, default=None)
     p.add_argument("--prefilter-min-positive-hits", type=int, default=25)
+    p.add_argument("--prefilter-min-positive-hits-range", type=parse_int_range, default=None)
     p.add_argument("--prefilter-min-pos-rate", type=float, default=0.0)
+    p.add_argument("--prefilter-min-pos-rate-range", type=parse_float_range, default=None)
     p.add_argument("--prefilter-max-neg-rate", type=float, default=1.0)
+    p.add_argument("--prefilter-max-neg-rate-range", type=parse_float_range, default=None)
     p.add_argument("--prefilter-min-lift", type=float, default=0.0)
+    p.add_argument("--prefilter-min-lift-range", type=parse_float_range, default=None)
     p.add_argument("--prefilter-min-precision", type=float, default=0.0)
+    p.add_argument("--prefilter-min-precision-range", type=parse_float_range, default=None)
     p.add_argument("--prefilter-combo-conds", type=int, default=1)
     p.add_argument("--prefilter-combo-topk", type=int, default=96)
     p.add_argument("--prefilter-min-coverage", type=float, default=0.001)
@@ -228,6 +239,13 @@ def sample_cfg(rng: random.Random, args: argparse.Namespace) -> dict[str, object
     if trail_offset >= trail_activate:
         trail_offset = max(trail_activate - 1e-6, 1e-6)
     one_trade_at_a_time = rng.random() < args.p_one_trade_at_a_time
+    prefilter_top_per_family = rng.randint(*args.prefilter_top_per_family_range) if args.prefilter_top_per_family_range else int(args.prefilter_top_per_family)
+    prefilter_max_candidates = rng.randint(*args.prefilter_max_candidates_range) if args.prefilter_max_candidates_range else int(args.prefilter_max_candidates)
+    prefilter_min_positive_hits = rng.randint(*args.prefilter_min_positive_hits_range) if args.prefilter_min_positive_hits_range else int(args.prefilter_min_positive_hits)
+    prefilter_min_pos_rate = rng.uniform(*args.prefilter_min_pos_rate_range) if args.prefilter_min_pos_rate_range else float(args.prefilter_min_pos_rate)
+    prefilter_max_neg_rate = rng.uniform(*args.prefilter_max_neg_rate_range) if args.prefilter_max_neg_rate_range else float(args.prefilter_max_neg_rate)
+    prefilter_min_lift = rng.uniform(*args.prefilter_min_lift_range) if args.prefilter_min_lift_range else float(args.prefilter_min_lift)
+    prefilter_min_precision = rng.uniform(*args.prefilter_min_precision_range) if args.prefilter_min_precision_range else float(args.prefilter_min_precision)
 
     return {
         "hold": rng.randint(*args.hold_range),
@@ -258,6 +276,14 @@ def sample_cfg(rng: random.Random, args: argparse.Namespace) -> dict[str, object
         "allow_absolute_price_features": rng.random() < args.p_allow_absolute_price_features,
         "one_trade_at_a_time": one_trade_at_a_time,
         "disable_same_reference_check": rng.random() < args.p_disable_same_reference_check,
+        "prefilter_enabled": not (rng.random() < args.p_prefilter_off),
+        "prefilter_top_per_family": int(prefilter_top_per_family),
+        "prefilter_max_candidates": int(prefilter_max_candidates),
+        "prefilter_min_positive_hits": int(prefilter_min_positive_hits),
+        "prefilter_min_pos_rate": float(prefilter_min_pos_rate),
+        "prefilter_max_neg_rate": float(prefilter_max_neg_rate),
+        "prefilter_min_lift": float(prefilter_min_lift),
+        "prefilter_min_precision": float(prefilter_min_precision),
         "lot_run": (
             round(rng.uniform(*args.lot_run_range), 4)
             if args.lot_run_range is not None and not one_trade_at_a_time
@@ -366,19 +392,19 @@ def build_cmd(
         "--contract-units-per-lot",
         str(args.contract_units_per_lot),
         "--prefilter-top-per-family",
-        str(args.prefilter_top_per_family),
+        str(cfg.get("prefilter_top_per_family", args.prefilter_top_per_family)),
         "--prefilter-max-candidates",
-        str(args.prefilter_max_candidates),
+        str(cfg.get("prefilter_max_candidates", args.prefilter_max_candidates)),
         "--prefilter-min-positive-hits",
-        str(args.prefilter_min_positive_hits),
+        str(cfg.get("prefilter_min_positive_hits", args.prefilter_min_positive_hits)),
         "--prefilter-min-pos-rate",
-        str(args.prefilter_min_pos_rate),
+        str(cfg.get("prefilter_min_pos_rate", args.prefilter_min_pos_rate)),
         "--prefilter-max-neg-rate",
-        str(args.prefilter_max_neg_rate),
+        str(cfg.get("prefilter_max_neg_rate", args.prefilter_max_neg_rate)),
         "--prefilter-min-lift",
-        str(args.prefilter_min_lift),
+        str(cfg.get("prefilter_min_lift", args.prefilter_min_lift)),
         "--prefilter-min-precision",
-        str(args.prefilter_min_precision),
+        str(cfg.get("prefilter_min_precision", args.prefilter_min_precision)),
         "--prefilter-combo-conds",
         str(prefilter_combo_conds),
         "--prefilter-combo-topk",
@@ -406,6 +432,10 @@ def build_cmd(
         cmd.extend(["--binned-features", str(args.binned_features)])
     if args.binned_metadata is not None:
         cmd.extend(["--binned-metadata", str(args.binned_metadata)])
+    if bool(args.require_tf1_feature):
+        cmd.append("--require-tf1-feature")
+    if not bool(cfg.get("prefilter_enabled", True)):
+        cmd.append("--no-prefilter")
     if bool(cfg["allow_absolute_price_features"]):
         cmd.append("--allow-absolute-price-features")
     if bool(cfg["one_trade_at_a_time"]):
@@ -878,17 +908,19 @@ def run_miner_inprocess(
         lot_run=float(cfg["lot_run"]) if cfg.get("lot_run") is not None else float("nan"),
         lot_run_min=float(args.lot_run_min),
         lot_run_choices=str(args.lot_run_choices),
-        prefilter_top_per_family=int(args.prefilter_top_per_family),
-        prefilter_max_candidates=int(args.prefilter_max_candidates),
-        prefilter_min_positive_hits=int(args.prefilter_min_positive_hits),
-        prefilter_min_pos_rate=float(args.prefilter_min_pos_rate),
-        prefilter_max_neg_rate=float(args.prefilter_max_neg_rate),
-        prefilter_min_lift=float(args.prefilter_min_lift),
-        prefilter_min_precision=float(args.prefilter_min_precision),
+        prefilter_top_per_family=int(cfg.get("prefilter_top_per_family", args.prefilter_top_per_family)),
+        prefilter_enabled=bool(cfg.get("prefilter_enabled", True)),
+        prefilter_max_candidates=int(cfg.get("prefilter_max_candidates", args.prefilter_max_candidates)),
+        prefilter_min_positive_hits=int(cfg.get("prefilter_min_positive_hits", args.prefilter_min_positive_hits)),
+        prefilter_min_pos_rate=float(cfg.get("prefilter_min_pos_rate", args.prefilter_min_pos_rate)),
+        prefilter_max_neg_rate=float(cfg.get("prefilter_max_neg_rate", args.prefilter_max_neg_rate)),
+        prefilter_min_lift=float(cfg.get("prefilter_min_lift", args.prefilter_min_lift)),
+        prefilter_min_precision=float(cfg.get("prefilter_min_precision", args.prefilter_min_precision)),
         prefilter_combo_conds=prefilter_combo_conds,
         prefilter_combo_topk=int(args.prefilter_combo_topk),
         prefilter_min_coverage=float(args.prefilter_min_coverage),
         prefilter_max_coverage=float(args.prefilter_max_coverage),
+        require_tf1_feature=bool(args.require_tf1_feature),
         finalist_tick_validation=True,
         tp_summary_value=tps_all[0],
         seed=int(cfg["miner_seed"]),
@@ -930,6 +962,8 @@ def main() -> None:
         raise ValueError("p-one-trade-at-a-time must be in [0,1]")
     if not (0.0 <= args.p_disable_same_reference_check <= 1.0):
         raise ValueError("p-disable-same-reference-check must be in [0,1]")
+    if not (0.0 <= args.p_prefilter_off <= 1.0):
+        raise ValueError("p-prefilter-off must be in [0,1]")
     if args.timeout_sec < 0:
         raise ValueError("timeout-sec must be >= 0")
     if not (0.0 < args.resource_backoff_factor <= 1.0):
@@ -970,6 +1004,20 @@ def main() -> None:
     _validate_range("min-hits-return-override", *args.min_hits_return_override_range)
     _validate_range("max-features", *args.max_features_range)
     _validate_range("tail-rows", *args.tail_rows_range)
+    if args.prefilter_top_per_family_range is not None:
+        _validate_range("prefilter-top-per-family", *args.prefilter_top_per_family_range)
+    if args.prefilter_max_candidates_range is not None:
+        _validate_range("prefilter-max-candidates", *args.prefilter_max_candidates_range)
+    if args.prefilter_min_positive_hits_range is not None:
+        _validate_range("prefilter-min-positive-hits", *args.prefilter_min_positive_hits_range)
+    if args.prefilter_min_pos_rate_range is not None:
+        _validate_range("prefilter-min-pos-rate", *args.prefilter_min_pos_rate_range)
+    if args.prefilter_max_neg_rate_range is not None:
+        _validate_range("prefilter-max-neg-rate", *args.prefilter_max_neg_rate_range)
+    if args.prefilter_min_lift_range is not None:
+        _validate_range("prefilter-min-lift", *args.prefilter_min_lift_range)
+    if args.prefilter_min_precision_range is not None:
+        _validate_range("prefilter-min-precision", *args.prefilter_min_precision_range)
 
     if args.trail_activate_range[1] <= 0:
         raise ValueError("trail-activate-range max must be > 0")
