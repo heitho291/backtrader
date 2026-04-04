@@ -1892,6 +1892,7 @@ def mine_best_rule(
         train_hits = int(sel_train.sum())
         if train_hits == 0:
             return None
+        train_yy = y[:train_idx][sel_train]
         train_pp = pnl[:train_idx][sel_train]
         train_sum_return = float(np.sum(train_pp)) if train_hits else float("nan")
         min_hits_ok = train_hits >= required_hits
