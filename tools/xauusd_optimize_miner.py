@@ -100,6 +100,16 @@ def parse_args() -> argparse.Namespace:
                    help="Probability to disable miner support/resist same-reference dedup check")
     p.add_argument("--timeout-sec", type=int, default=1800,
                    help="Hard timeout per miner subprocess run in seconds (0=disabled)")
+    p.add_argument("--resource-backoff-on-retry", action="store_true", default=True,
+                   help="On retry attempts, reduce sampled tail_rows/max_features to recover from OOM/SIGKILL.")
+    p.add_argument("--no-resource-backoff-on-retry", dest="resource_backoff_on_retry", action="store_false")
+    p.add_argument("--resource-backoff-factor", type=float, default=0.7,
+                   help="Per-retry multiplier for tail_rows/max_features (0<factor<=1).")
+    p.add_argument("--resource-backoff-min-tail-rows", type=int, default=200000)
+    p.add_argument("--resource-backoff-min-max-features", type=int, default=200)
+    p.add_argument("--resource-backoff-force-combo-conds-one", action="store_true", default=True,
+                   help="Force prefilter combo conds to 1 on retries to reduce combinatorial load.")
+    p.add_argument("--no-resource-backoff-force-combo-conds-one", dest="resource_backoff_force_combo_conds_one", action="store_false")
     p.add_argument("--capture-stdout", action="store_true", default=False,
                    help="Capture miner stdout (off by default to reduce memory usage)")
     p.add_argument("--sl-range", type=parse_float_range, default=(0.0010, 0.0035))
@@ -256,12 +266,19 @@ def sample_cfg(rng: random.Random, args: argparse.Namespace) -> dict[str, object
     }
 
 
-def build_cmd(args: argparse.Namespace, cfg: dict[str, object], out_summary: Path, out_signals: Path) -> list[str]:
+def build_cmd(
+    args: argparse.Namespace,
+    cfg: dict[str, object],
+    out_summary: Path,
+    out_signals: Path,
+    prefilter_combo_conds_override: int | None = None,
+) -> list[str]:
     raw_tps = str(cfg["tps"])
     tps_list = [x.strip() for x in raw_tps.split(",") if x.strip()]
     use_multi_tp = bool(cfg["use_multi_tp"])
     cmd_tps = raw_tps if use_multi_tp else (tps_list[0] if tps_list else "0.002")
     cmd_tp_weights = str(cfg["tp_weights"]) if use_multi_tp else "1.0"
+    prefilter_combo_conds = int(prefilter_combo_conds_override) if prefilter_combo_conds_override is not None else int(args.prefilter_combo_conds)
 
     cmd = [
         sys.executable,
@@ -363,7 +380,7 @@ def build_cmd(args: argparse.Namespace, cfg: dict[str, object], out_summary: Pat
         "--prefilter-min-precision",
         str(args.prefilter_min_precision),
         "--prefilter-combo-conds",
-        str(args.prefilter_combo_conds),
+        str(prefilter_combo_conds),
         "--prefilter-combo-topk",
         str(args.prefilter_combo_topk),
         "--prefilter-min-coverage",
@@ -739,6 +756,7 @@ def run_miner_inprocess(
     score_cfg: dict[str, float],
     tick_prices_all=None,
     tick_minute_bounds=None,
+    prefilter_combo_conds_override: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     tail_rows = int(cfg["tail_rows"])
     df = df_preloaded.tail(tail_rows)
@@ -816,6 +834,8 @@ def run_miner_inprocess(
     tp_weights = str(cfg["tp_weights"]) if use_multi_tp else "1.0"
     tp_w = miner_mod.parse_tp_weights(tps, tp_weights)
 
+    prefilter_combo_conds = int(prefilter_combo_conds_override) if prefilter_combo_conds_override is not None else int(args.prefilter_combo_conds)
+
     summary, sig = miner_mod.run_single_config(
         df=df,
         binned_df=binned_df,
@@ -865,7 +885,7 @@ def run_miner_inprocess(
         prefilter_max_neg_rate=float(args.prefilter_max_neg_rate),
         prefilter_min_lift=float(args.prefilter_min_lift),
         prefilter_min_precision=float(args.prefilter_min_precision),
-        prefilter_combo_conds=int(args.prefilter_combo_conds),
+        prefilter_combo_conds=prefilter_combo_conds,
         prefilter_combo_topk=int(args.prefilter_combo_topk),
         prefilter_min_coverage=float(args.prefilter_min_coverage),
         prefilter_max_coverage=float(args.prefilter_max_coverage),
@@ -912,6 +932,12 @@ def main() -> None:
         raise ValueError("p-disable-same-reference-check must be in [0,1]")
     if args.timeout_sec < 0:
         raise ValueError("timeout-sec must be >= 0")
+    if not (0.0 < args.resource_backoff_factor <= 1.0):
+        raise ValueError("resource-backoff-factor must be in (0,1]")
+    if args.resource_backoff_min_tail_rows < 1:
+        raise ValueError("resource-backoff-min-tail-rows must be >= 1")
+    if args.resource_backoff_min_max_features < 1:
+        raise ValueError("resource-backoff-min-max-features must be >= 1")
     if args.two_starts_family_topn < 1:
         raise ValueError("two-starts-family-topn must be >= 1")
     if args.two_starts_topk < 2:
@@ -1041,11 +1067,24 @@ def main() -> None:
         while attempt < args.max_attempts_per_run and not success:
             attempt += 1
             cfg = sample_cfg(rng_local, args)
+            prefilter_combo_conds_eff = int(args.prefilter_combo_conds)
+            if args.resource_backoff_on_retry and attempt > 1:
+                fac = float(args.resource_backoff_factor) ** (attempt - 1)
+                cfg["tail_rows"] = max(int(args.resource_backoff_min_tail_rows), int(int(cfg["tail_rows"]) * fac))
+                cfg["max_features"] = max(int(args.resource_backoff_min_max_features), int(int(cfg["max_features"]) * fac))
+                if args.resource_backoff_force_combo_conds_one and prefilter_combo_conds_eff > 1:
+                    prefilter_combo_conds_eff = 1
 
             with tempfile.TemporaryDirectory(prefix="miner_opt_") as td:
                 out_summary = Path(td) / "summary.csv"
                 out_signals = Path(td) / "signals.csv"
-                cmd = build_cmd(args, cfg, out_summary, out_signals)
+                cmd = build_cmd(
+                    args,
+                    cfg,
+                    out_summary,
+                    out_signals,
+                    prefilter_combo_conds_override=prefilter_combo_conds_eff,
+                )
                 t0 = time.time()
                 timed_out = False
                 if args.inprocess_miner:
@@ -1062,6 +1101,7 @@ def main() -> None:
                             score_cfg=score_cfg,
                             tick_prices_all=tick_prices_all,
                             tick_minute_bounds=tick_minute_bounds,
+                            prefilter_combo_conds_override=prefilter_combo_conds_eff,
                         )
                         s.to_csv(out_summary, index=False)
                         if not sig.empty:
@@ -1175,6 +1215,11 @@ def main() -> None:
                     else:
                         row["failed_reason"] = "non_finite_objective_or_no_rule"
                     run_rows.append(row)
+                if proc.returncode in (-9, 137):
+                    logs.append(
+                        f"[run {run} attempt {attempt}] miner killed with code {proc.returncode} "
+                        "(likely OOM / kernel SIGKILL)."
+                    )
 
                 logs.append(
                     f"[{run}/{args.runs} attempt {attempt}/{args.max_attempts_per_run}] "
