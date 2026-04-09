@@ -51,6 +51,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--features", type=Path, required=True)
     p.add_argument("--binned-features", type=Path, default=None)
     p.add_argument("--binned-metadata", type=Path, default=None)
+    p.add_argument("--rules-json", type=Path, default=None,
+                   help="Optional external rules JSON for miner; skips internal prefilter/greedy candidate generation.")
+    p.add_argument("--fixed-rules-mode", action="store_true", default=False,
+                   help="Forwarded to miner: evaluate rules from --rules-json as fixed full rules.")
+    p.add_argument("--fixed-rule-index", type=int, default=0,
+                   help="Forwarded to miner fixed-rules mode (1-based, 0=auto-best).")
     p.add_argument("--miner-script", type=Path, default=Path("tools/xauusd_miner_ohlc_first_hit_pessimistic.py"))
     p.add_argument("--runs", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
@@ -432,6 +438,12 @@ def build_cmd(
         cmd.extend(["--binned-features", str(args.binned_features)])
     if args.binned_metadata is not None:
         cmd.extend(["--binned-metadata", str(args.binned_metadata)])
+    if args.rules_json is not None:
+        cmd.extend(["--rules-json", str(args.rules_json)])
+    if bool(args.fixed_rules_mode):
+        cmd.append("--fixed-rules-mode")
+    if int(args.fixed_rule_index) > 0:
+        cmd.extend(["--fixed-rule-index", str(int(args.fixed_rule_index))])
     if bool(args.require_tf1_feature):
         cmd.append("--require-tf1-feature")
     if not bool(cfg.get("prefilter_enabled", True)):
@@ -858,6 +870,9 @@ def run_miner_inprocess(
     tps_all = [float(x) for x in str(cfg["tps"]).split(",") if x.strip()]
     if not tps_all:
         raise ValueError("No tps sampled")
+    qs = [float(x) for x in str(cfg.get("quantiles", "")).split(",") if str(x).strip()]
+    if not qs:
+        qs = [0.05, 0.10, 0.90, 0.95]
 
     use_multi_tp = bool(cfg["use_multi_tp"])
     tps = tps_all if use_multi_tp else [tps_all[0]]
@@ -887,6 +902,7 @@ def run_miner_inprocess(
         min_conds=int(cfg["min_conds"]),
         max_conds=int(cfg["max_conds"]),
         min_test_hits=int(cfg["min_test_hits"]),
+        quantiles=qs,
         min_test_hits_reduce_step=float(cfg["min_test_hits_reduce_step"]),
         min_hits_return_override=float(cfg["min_hits_return_override"]),
         wf_folds=int(cfg["wf_folds"]),
@@ -921,6 +937,9 @@ def run_miner_inprocess(
         prefilter_min_coverage=float(args.prefilter_min_coverage),
         prefilter_max_coverage=float(args.prefilter_max_coverage),
         require_tf1_feature=bool(args.require_tf1_feature),
+        external_rules_path=args.rules_json,
+        fixed_rules_mode=bool(args.fixed_rules_mode),
+        fixed_rule_index=int(args.fixed_rule_index),
         finalist_tick_validation=True,
         tp_summary_value=tps_all[0],
         seed=int(cfg["miner_seed"]),

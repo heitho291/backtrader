@@ -149,6 +149,12 @@ def parse_args() -> argparse.Namespace:
                    help="Disable support/resist identical-reference dedup check (faster/less memory)")
     p.add_argument("--out-summary", type=Path, default=Path("best_rules_summary.csv"))
     p.add_argument("--out-signals", type=Path, default=Path("signals_best_rules.csv"))
+    p.add_argument("--rules-json", type=Path, default=None,
+                   help="Optional external candidate rules JSON (from in-detail prefilter script).")
+    p.add_argument("--fixed-rules-mode", action="store_true", default=False,
+                   help="Evaluate each rule from --rules-json as a fixed full rule (no greedy recomposition).")
+    p.add_argument("--fixed-rule-index", type=int, default=0,
+                   help="1-based index of the rule in --rules-json to evaluate in fixed-rules mode (0=auto-best).")
     p.add_argument("--csv-sep", type=str, default=",",
                    help="CSV separator used for summary/signals export (set ';' for some Excel locales).")
 
@@ -289,9 +295,9 @@ def validate_binned_metadata_alignment(
             continue
         ft = str(meta.get("feature_type", ""))
         eff = int(meta.get("effective_bin_count", 0) or 0)
-        if ft not in {"binary", "discrete", "continuous"}:
+        if ft not in {"binary", "discrete", "continuous", "raw_passthrough"}:
             warns.append(f"{c}: unknown feature_type={ft!r}")
-        if eff < 1:
+        if ft != "raw_passthrough" and eff < 1:
             warns.append(f"{c}: invalid effective_bin_count={eff}")
         if ft in {"binary", "discrete"}:
             m = meta.get("bin_to_raw", {})
@@ -449,7 +455,7 @@ def build_candidate_features(df: pd.DataFrame, allow_absolute_price: bool, max_f
 
         if c in {"session_hour_sin", "session_hour_cos"}:
             continue
-        if c.startswith("delta_") or c.startswith("dist_vwap") or c.startswith("dist_") or c.startswith(("rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "candle_", "break_", "fvg_", "session_")):
+        if c.startswith("delta_") or c.startswith("dist_vwap") or c.startswith("dist_") or c.startswith(("rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "mfi", "kdj_", "candle_", "break_", "fvg_", "session_")):
             cand.append(c)
 
     if max_features > 0:
@@ -616,6 +622,96 @@ def quantile_thresholds(train: pd.DataFrame, cols: List[str], qs: List[float]) -
         if s.empty:
             continue
         out[c] = {q: float(s.quantile(q)) for q in qs}
+    return out
+
+
+def build_quantile_candidates(
+    df: pd.DataFrame,
+    cols: List[str],
+    train_idx: int,
+    quantiles: List[float],
+    allowed_cols: Optional[set[str]] = None,
+) -> list[dict[str, object]]:
+    train = df.iloc[:train_idx]
+    qmap = quantile_thresholds(train, cols, quantiles)
+    candidates: list[dict[str, object]] = []
+    for c in cols:
+        if allowed_cols is not None and c not in allowed_cols:
+            continue
+        if c not in qmap:
+            continue
+        x = pd.to_numeric(df[c], errors="coerce").to_numpy(copy=False)
+        meta = _parse_feature_meta(c)
+        family = str(meta.get("family", c))
+        for q, thr in qmap[c].items():
+            if not np.isfinite(thr):
+                continue
+            m_ge = np.isfinite(x) & (x >= float(thr))
+            m_le = np.isfinite(x) & (x <= float(thr))
+            candidates.append({
+                "name": f"{c} >= {thr:.6g} (q={q:.2f})",
+                "conds": [(c, ">=", float(thr))],
+                "mask": m_ge,
+                "family": family,
+                "scale": meta.get("scale"),
+                "prefilter_score": 0.0,
+                "primary_col": c,
+            })
+            candidates.append({
+                "name": f"{c} <= {thr:.6g} (q={q:.2f})",
+                "conds": [(c, "<=", float(thr))],
+                "mask": m_le,
+                "family": family,
+                "scale": meta.get("scale"),
+                "prefilter_score": 0.0,
+                "primary_col": c,
+            })
+    return candidates
+
+
+def build_candidates_from_rules_json(
+    df: pd.DataFrame,
+    binned_df: pd.DataFrame,
+    path: Path,
+) -> list[dict[str, object]]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    rules = raw.get("rules", []) if isinstance(raw, dict) else []
+    out: list[dict[str, object]] = []
+    for r in rules:
+        conds = r.get("conds", [])
+        if not conds:
+            continue
+        mask = np.ones(len(df), dtype=bool)
+        parsed: list[Cond] = []
+        primary_col = None
+        for c in conds:
+            col = str(c.get("col", ""))
+            op = str(c.get("op", "=="))
+            val = float(c.get("value", np.nan))
+            if not col or not np.isfinite(val):
+                continue
+            if op == "==":
+                x = pd.to_numeric(binned_df[col], errors="coerce").to_numpy(copy=False)
+                mask &= np.isfinite(x) & (np.abs(x - val) <= 1e-6)
+            elif op in {">=", "<="}:
+                x = pd.to_numeric(df[col], errors="coerce").to_numpy(copy=False)
+                mask &= np.isfinite(x) & ((x >= val) if op == ">=" else (x <= val))
+            else:
+                continue
+            parsed.append((col, op, val))
+            if primary_col is None:
+                primary_col = col
+        if not parsed:
+            continue
+        out.append({
+            "name": " & ".join([f"{c0} {op0} {thr0:.6g}" for c0, op0, thr0 in parsed]),
+            "conds": parsed,
+            "mask": mask,
+            "family": "external_rule",
+            "scale": None,
+            "prefilter_score": float(r.get("score", 0.0)),
+            "primary_col": primary_col or str(parsed[0][0]),
+        })
     return out
 
 
@@ -1692,6 +1788,7 @@ def mine_best_rule(
     min_conds: int,
     max_conds: int,
     min_test_hits: int,
+    quantiles: List[float],
     min_test_hits_reduce_step: float,
     min_hits_return_override: float,
     wf_folds: int,
@@ -1730,6 +1827,9 @@ def mine_best_rule(
     prefilter_min_coverage: float,
     prefilter_max_coverage: float,
     require_tf1_feature: bool,
+    external_rules_path: Optional[Path],
+    fixed_rules_mode: bool,
+    fixed_rule_index: int,
     seed: int,
     final_tick_validation: bool,
     high: np.ndarray,
@@ -1808,8 +1908,12 @@ def mine_best_rule(
         max_entries_per_cluster=max_entries_per_cluster,
     )
 
-    if prefilter_enabled:
-        candidates = build_prefiltered_candidates(
+    allowed_cols: Optional[set[str]] = None
+    prefilter_seed_candidates: list[dict[str, object]] = []
+    if external_rules_path is not None:
+        candidates = build_candidates_from_rules_json(df=df, binned_df=binned_df, path=external_rules_path)
+    elif prefilter_enabled:
+        prefilter_seed_candidates = build_prefiltered_candidates(
             df=df,
             binned_df=binned_df,
             cols=cols,
@@ -1830,16 +1934,30 @@ def mine_best_rule(
             max_coverage=prefilter_max_coverage,
             binned_metadata=binned_metadata,
         )
+        allowed_cols = set()
+        for cand in prefilter_seed_candidates:
+            for c0, _, _ in cand.get("conds", []):
+                allowed_cols.add(str(c0))
+        dist_cols = [c for c in cols if c.startswith("dist_") and (allowed_cols is None or c in allowed_cols)]
+        other_candidates = [c for c in prefilter_seed_candidates if not any(str(c0).startswith("dist_") for c0, _, _ in c.get("conds", []))]
+        dist_candidates = build_quantile_candidates(
+            df=df,
+            cols=dist_cols,
+            train_idx=train_idx,
+            quantiles=quantiles,
+            allowed_cols=allowed_cols,
+        )
+        candidates = other_candidates + dist_candidates
     else:
-        candidates = build_all_binned_candidates(
-            binned_df=binned_df,
+        candidates = build_quantile_candidates(
+            df=df,
             cols=cols,
             train_idx=train_idx,
-            max_candidates=max(1, int(prefilter_max_candidates)),
-            binned_metadata=binned_metadata,
+            quantiles=quantiles,
+            allowed_cols=None,
         )
     prefilter_relaxed_used = 0
-    if prefilter_enabled and not candidates:
+    if prefilter_enabled and external_rules_path is None and not candidates:
         relax_steps = [
             (
                 max(1, int(prefilter_min_positive_hits // 2)),
@@ -1853,7 +1971,7 @@ def mine_best_rule(
             ),
         ]
         for mph, mn_cov, mx_cov in relax_steps:
-            candidates = build_prefiltered_candidates(
+            prefilter_seed_candidates = build_prefiltered_candidates(
                 df=df,
                 binned_df=binned_df,
                 cols=cols,
@@ -1874,9 +1992,25 @@ def mine_best_rule(
                 max_coverage=float(mx_cov),
                 binned_metadata=binned_metadata,
             )
-            if candidates:
+            if prefilter_seed_candidates:
+                allowed_cols = set()
+                for cand in prefilter_seed_candidates:
+                    for c0, _, _ in cand.get("conds", []):
+                        allowed_cols.add(str(c0))
+                dist_cols = [c for c in cols if c.startswith("dist_") and c in allowed_cols]
+                other_candidates = [c for c in prefilter_seed_candidates if not any(str(c0).startswith("dist_") for c0, _, _ in c.get("conds", []))]
+                dist_candidates = build_quantile_candidates(
+                    df=df,
+                    cols=dist_cols,
+                    train_idx=train_idx,
+                    quantiles=quantiles,
+                    allowed_cols=allowed_cols,
+                )
+                candidates = other_candidates + dist_candidates
                 prefilter_relaxed_used = 1
                 break
+    if not prefilter_enabled and prefilter_max_candidates > 0 and len(candidates) > prefilter_max_candidates:
+        candidates = candidates[:prefilter_max_candidates]
 
     fam_counts: dict[str, int] = {}
     prefilter_plain_rsi = 0
@@ -1930,10 +2064,14 @@ def mine_best_rule(
     two_starts_seed_cap = max(2, int(two_starts_seed_cap))
     fake_conds = [(str(c["primary_col"]), ">=", 0.0) for c in candidates]
     same_reference_group = {} if disable_same_reference_check else _build_same_reference_groups(df.iloc[:train_idx], fake_conds)
-    test_weekdays = max(1, int((df.index[train_idx:].dayofweek < 5).sum()))
-    train_weekdays = max(1, int((df.index[:train_idx].dayofweek < 5).sum()))
-    test_years = test_weekdays / 252.0
-    train_years = train_weekdays / 252.0
+    test_start_dt = pd.Timestamp(df.index[train_idx]) if train_idx < len(df.index) else pd.Timestamp(df.index[-1])
+    test_end_dt = pd.Timestamp(df.index[-1])
+    train_start_dt = pd.Timestamp(df.index[0])
+    train_end_dt = pd.Timestamp(df.index[max(0, train_idx - 1)])
+    test_days = max(1.0, float((test_end_dt - test_start_dt).total_seconds() / 86400.0))
+    train_days = max(1.0, float((train_end_dt - train_start_dt).total_seconds() / 86400.0))
+    test_years = test_days / 365.25
+    train_years = train_days / 365.25
 
     def score(mask_full: np.ndarray, required_hits: int = min_test_hits) -> Optional[dict]:
         cand_train = mask_full[:train_idx] & tradable_train
@@ -2088,7 +2226,33 @@ def mine_best_rule(
     current: Optional[dict] = None
     current_idxs: List[int] = []
 
+    if fixed_rules_mode and external_rules_path is not None:
+        if int(fixed_rule_index) > 0:
+            idx = int(fixed_rule_index) - 1
+            if idx < 0 or idx >= len(candidates):
+                return summary_empty, pd.DataFrame()
+            sc = score(np.asarray(candidates[idx]["mask"], dtype=bool), required_hits=req_hits)
+            if sc is None:
+                return summary_empty, pd.DataFrame()
+            current = sc
+            current_idxs = [idx]
+        else:
+            best_fixed = None
+            best_fixed_idx = None
+            for i, cand in enumerate(candidates):
+                sc = score(np.asarray(cand["mask"], dtype=bool), required_hits=req_hits)
+                if sc is not None and better(sc, best_fixed):
+                    best_fixed = sc
+                    best_fixed_idx = i
+            if best_fixed is None or best_fixed_idx is None:
+                return summary_empty, pd.DataFrame()
+            current = best_fixed
+            current_idxs = [int(best_fixed_idx)]
+
     while True:
+        if fixed_rules_mode and current is not None and current_idxs:
+            used_min_test_hits = req_hits
+            break
         best: Optional[dict] = None
         best_idxs: List[int] = []
         single_scores: List[Tuple[int, dict]] = []
@@ -2592,6 +2756,7 @@ def run_single_config(
     min_conds: int,
     max_conds: int,
     min_test_hits: int,
+    quantiles: List[float],
     min_test_hits_reduce_step: float,
     min_hits_return_override: float,
     wf_folds: int,
@@ -2626,6 +2791,9 @@ def run_single_config(
     prefilter_min_coverage: float,
     prefilter_max_coverage: float,
     require_tf1_feature: bool,
+    external_rules_path: Optional[Path],
+    fixed_rules_mode: bool,
+    fixed_rule_index: int,
     finalist_tick_validation: bool,
     tp_summary_value: float,
     seed: int,
@@ -2673,6 +2841,7 @@ def run_single_config(
         min_conds=min_conds,
         max_conds=max_conds,
         min_test_hits=min_test_hits,
+        quantiles=quantiles,
         min_test_hits_reduce_step=min_test_hits_reduce_step,
         min_hits_return_override=min_hits_return_override,
         wf_folds=wf_folds,
@@ -2711,6 +2880,9 @@ def run_single_config(
         prefilter_min_coverage=prefilter_min_coverage,
         prefilter_max_coverage=prefilter_max_coverage,
         require_tf1_feature=require_tf1_feature,
+        external_rules_path=external_rules_path,
+        fixed_rules_mode=fixed_rules_mode,
+        fixed_rule_index=fixed_rule_index,
         seed=seed,
         final_tick_validation=bool(finalist_tick_validation and tick_prices_all is not None and tick_minute_bounds is not None),
         high=high,
@@ -2813,6 +2985,9 @@ def main() -> None:
     tps_all = [float(x) for x in args.tps.split(",") if x.strip()]
     if not tps_all:
         raise ValueError("Need at least one TP value")
+    qs = [float(x) for x in args.quantiles.split(",") if x.strip()]
+    if not qs:
+        raise ValueError("Need at least one quantile value")
     cols = build_candidate_features(df, args.allow_absolute_price_features, args.max_features)
     print(f"Candidate features: {len(cols)}")
     binned_metadata = load_binned_metadata(args.binned_metadata)
@@ -2829,7 +3004,7 @@ def main() -> None:
     candidate_present = [c for c in cols if c in binned_df.columns]
     if not candidate_present:
         raise ValueError("No candidate feature columns found in binned features.")
-    type_counts = {"binary": 0, "discrete": 0, "continuous": 0, "unknown": 0}
+    type_counts = {"binary": 0, "discrete": 0, "continuous": 0, "raw_passthrough": 0, "unknown": 0}
     for c in candidate_present:
         t = str(binned_metadata.get(c, {}).get("feature_type", "unknown"))
         if t not in type_counts:
@@ -2838,7 +3013,8 @@ def main() -> None:
     print(
         "[binned-debug] feature types: "
         f"binary={type_counts['binary']} discrete={type_counts['discrete']} "
-        f"continuous={type_counts['continuous']} unknown={type_counts['unknown']}"
+        f"continuous={type_counts['continuous']} raw_passthrough={type_counts['raw_passthrough']} "
+        f"unknown={type_counts['unknown']}"
     )
     fam_preview = [(c, str(_parse_feature_meta(c).get("family", c))) for c in candidate_present[:20]]
     print(f"[binned-debug] family preview (first 20): {fam_preview}")
@@ -2944,6 +3120,7 @@ def main() -> None:
             min_conds=args.min_conds,
             max_conds=args.max_conds,
             min_test_hits=min_hits,
+            quantiles=qs,
             min_test_hits_reduce_step=args.min_test_hits_reduce_step,
             min_hits_return_override=args.min_hits_return_override,
             wf_folds=args.wf_folds,
@@ -2978,6 +3155,9 @@ def main() -> None:
             prefilter_min_coverage=args.prefilter_min_coverage,
             prefilter_max_coverage=args.prefilter_max_coverage,
             require_tf1_feature=args.require_tf1_feature,
+            external_rules_path=args.rules_json,
+            fixed_rules_mode=args.fixed_rules_mode,
+            fixed_rule_index=args.fixed_rule_index,
             finalist_tick_validation=args.finalist_tick_validation,
             tp_summary_value=tp,
             seed=args.seed,

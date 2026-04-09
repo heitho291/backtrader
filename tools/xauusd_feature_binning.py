@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-binned", type=Path, required=True, help="Output parquet path")
     p.add_argument("--out-metadata", type=Path, default=None, help="Optional output JSON metadata path")
     p.add_argument("--bins", type=int, default=20, help="Target number of bins for continuous columns")
+    p.add_argument("--keep-raw-prefixes", type=str, default="dist_",
+                   help="Comma-separated feature prefixes that should be copied raw (no binning).")
     return p.parse_args()
 
 
@@ -62,7 +64,7 @@ def build_candidate_columns(df: pd.DataFrame) -> list[str]:
             continue
         if c.startswith(("open_tf", "high_tf", "low_tf", "close_tf", "volume_tf", "ema", "vwap_tf", "regime_")):
             continue
-        if c.startswith(("delta_", "dist_", "dist_vwap", "rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "candle_", "break_", "fvg_", "session_")):
+        if c.startswith(("delta_", "dist_", "dist_vwap", "rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "mfi", "kdj_", "candle_", "break_", "fvg_", "session_")):
             if c in {"session_hour_sin", "session_hour_cos"}:
                 continue
             out.append(c)
@@ -143,12 +145,24 @@ def main() -> None:
 
     df = load_features(args.features)
     cols = build_candidate_columns(df)
+    keep_raw_prefixes = tuple([x.strip() for x in str(args.keep_raw_prefixes).split(",") if x.strip()])
     dtype = np.uint8 if args.bins < np.iinfo(np.uint8).max else np.uint16
 
     binned_cols: dict[str, pd.Series] = {}
     metadata: dict[str, object] = {"version": 1, "features": {}}
     for c in cols:
-        binned, col_meta = bin_series(pd.to_numeric(df[c], errors="coerce"), args.bins, dtype)
+        if keep_raw_prefixes and c.startswith(keep_raw_prefixes):
+            binned = pd.to_numeric(df[c], errors="coerce").astype(np.float32)
+            col_meta = {
+                "feature_type": "raw_passthrough",
+                "effective_bin_count": 0,
+                "missing_code": 0,
+                "bin_to_raw": {},
+                "bin_edges": [],
+                "missing_ratio": float((~np.isfinite(binned)).mean()),
+            }
+        else:
+            binned, col_meta = bin_series(pd.to_numeric(df[c], errors="coerce"), args.bins, dtype)
         col_meta["family"] = _parse_feature_family(c)
         metadata["features"][c] = col_meta
         binned_cols[c] = binned

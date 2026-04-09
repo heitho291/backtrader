@@ -45,11 +45,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chunk-size", type=int, default=2_000_000,
                    help="Reserved for chunk-based CSV processing tuning")
     p.add_argument("--tfs", type=str, default="1,2,3,5,15,30,60", help="Minute timeframes")
+    p.add_argument("--low-tfs", type=str, default="1,2,3,5")
+    p.add_argument("--mid-tfs", type=str, default="15")
+    p.add_argument("--high-tfs", type=str, default="30,60")
     p.add_argument("--ema-lens", type=str, default="8,13,20,21,34,50,55,89,100,144,200")
+    p.add_argument("--ema-lens-low", type=str, default="")
+    p.add_argument("--ema-lens-mid", type=str, default="")
+    p.add_argument("--ema-lens-high", type=str, default="")
     p.add_argument("--rsi-lens", type=str, default="5,7,9,14,21,28")
+    p.add_argument("--rsi-lens-low", type=str, default="")
+    p.add_argument("--rsi-lens-mid", type=str, default="")
+    p.add_argument("--rsi-lens-high", type=str, default="")
     p.add_argument("--adx-lens", type=str, default="7,14,21")
+    p.add_argument("--adx-lens-low", type=str, default="")
+    p.add_argument("--adx-lens-mid", type=str, default="")
+    p.add_argument("--adx-lens-high", type=str, default="")
+    p.add_argument("--mfi-lens", type=str, default="7,14")
+    p.add_argument("--kdj-lens", type=str, default="9,14")
     p.add_argument("--support-lookbacks", type=str, default="20,50,100,200")
     p.add_argument("--delta-windows", type=str, default="3,5,10,20", help="Add delta features over N bars for indicator columns")
+    p.add_argument("--delta-max-tf", type=int, default=5, help="Only create delta features for _tfN columns with N<=value (0=all)")
     p.add_argument("--pattern-tfs", type=str, default="1,5,15", help="TF subset for candle/breakout/FVG features")
     p.add_argument("--breakout-lookbacks", type=str, default="20,50,100", help="Lookbacks for breakout features")
     p.add_argument("--with-candle-patterns", action="store_true", default=True)
@@ -124,6 +139,26 @@ def dmi_components(df: pd.DataFrame, period: int = 14):
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
     adx = dx.ewm(alpha=1.0 / period, adjust=False).mean()
     return plus_di, minus_di, dx, adx
+
+
+def mfi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    rmf = tp * df["volume"]
+    d = tp.diff()
+    pos = rmf.where(d > 0, 0.0).rolling(period).sum()
+    neg = rmf.where(d < 0, 0.0).rolling(period).sum().abs()
+    mr = pos / neg.replace(0, np.nan)
+    return 100.0 - (100.0 / (1.0 + mr))
+
+
+def kdj(df: pd.DataFrame, period: int = 9, smooth: int = 3) -> tuple[pd.Series, pd.Series, pd.Series]:
+    low_n = df["low"].rolling(period).min()
+    high_n = df["high"].rolling(period).max()
+    rsv = 100.0 * (df["close"] - low_n) / (high_n - low_n).replace(0, np.nan)
+    k = rsv.ewm(alpha=1.0 / smooth, adjust=False).mean()
+    d = k.ewm(alpha=1.0 / smooth, adjust=False).mean()
+    j = 3.0 * k - 2.0 * d
+    return k, d, j
 
 
 def _detect_sep(path: Path) -> str:
@@ -401,6 +436,8 @@ def compute_tf_features(
     ema_lens: list[int],
     rsi_lens: list[int],
     adx_lens: list[int],
+    mfi_lens: list[int],
+    kdj_lens: list[int],
     support_lbs: list[int],
     with_vwap: bool,
     breakout_lbs: list[int],
@@ -446,6 +483,15 @@ def compute_tf_features(
         f[f"dx{l}_tf{tf}"] = dx
         f[f"adx{l}_tf{tf}"] = adx_v
 
+    for l in mfi_lens:
+        f[f"mfi{l}_tf{tf}"] = mfi(tf_df, l)
+
+    for l in kdj_lens:
+        k, d, j = kdj(tf_df, period=l, smooth=3)
+        f[f"kdj_k{l}_tf{tf}"] = k
+        f[f"kdj_d{l}_tf{tf}"] = d
+        f[f"kdj_j{l}_tf{tf}"] = j
+
     # Volume z-score
     vol_ma = tf_df["volume"].rolling(50).mean()
     vol_std = tf_df["volume"].rolling(50).std()
@@ -489,13 +535,21 @@ def compute_tf_features(
 
 
 
-def add_delta_features(df: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
+def add_delta_features(df: pd.DataFrame, windows: list[int], max_tf: int = 0) -> pd.DataFrame:
     base_cols = [
         c for c in df.columns
         if c.startswith((
-            "dist_", "dist_vwap", "rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "vwap_d"
+            "dist_", "dist_vwap", "rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "vwap_d", "mfi", "kdj_"
         ))
     ]
+
+    if max_tf and max_tf > 0:
+        filt = []
+        for c in base_cols:
+            m = re.search(r"_tf(\d+)$", c)
+            if m is None or int(m.group(1)) <= int(max_tf):
+                filt.append(c)
+        base_cols = filt
 
     delta_frames = []
     for w in windows:
@@ -676,6 +730,20 @@ def main() -> None:
     ema_lens = [int(x) for x in args.ema_lens.split(",") if x.strip()]
     rsi_lens = [int(x) for x in args.rsi_lens.split(",") if x.strip()]
     adx_lens = [int(x) for x in args.adx_lens.split(",") if x.strip()]
+    mfi_lens = [int(x) for x in args.mfi_lens.split(",") if x.strip()]
+    kdj_lens = [int(x) for x in args.kdj_lens.split(",") if x.strip()]
+    low_tfs = {int(x) for x in args.low_tfs.split(",") if x.strip()}
+    mid_tfs = {int(x) for x in args.mid_tfs.split(",") if x.strip()}
+    high_tfs = {int(x) for x in args.high_tfs.split(",") if x.strip()}
+    ema_lens_low = [int(x) for x in args.ema_lens_low.split(",") if x.strip()] or ema_lens
+    ema_lens_mid = [int(x) for x in args.ema_lens_mid.split(",") if x.strip()] or ema_lens
+    ema_lens_high = [int(x) for x in args.ema_lens_high.split(",") if x.strip()] or ema_lens
+    rsi_lens_low = [int(x) for x in args.rsi_lens_low.split(",") if x.strip()] or rsi_lens
+    rsi_lens_mid = [int(x) for x in args.rsi_lens_mid.split(",") if x.strip()] or rsi_lens
+    rsi_lens_high = [int(x) for x in args.rsi_lens_high.split(",") if x.strip()] or rsi_lens
+    adx_lens_low = [int(x) for x in args.adx_lens_low.split(",") if x.strip()] or adx_lens
+    adx_lens_mid = [int(x) for x in args.adx_lens_mid.split(",") if x.strip()] or adx_lens
+    adx_lens_high = [int(x) for x in args.adx_lens_high.split(",") if x.strip()] or adx_lens
     support_lbs = [int(x) for x in args.support_lookbacks.split(",") if x.strip()]
     breakout_lbs = [int(x) for x in args.breakout_lookbacks.split(",") if x.strip()]
     pattern_tfs = {int(x) for x in args.pattern_tfs.split(",") if x.strip()}
@@ -709,8 +777,14 @@ def main() -> None:
     tf_frames = []
     for tf in tfs:
         print(f"Computing TF={tf} ...")
+        if tf in high_tfs:
+            e_l, r_l, a_l = ema_lens_high, rsi_lens_high, adx_lens_high
+        elif tf in mid_tfs:
+            e_l, r_l, a_l = ema_lens_mid, rsi_lens_mid, adx_lens_mid
+        else:
+            e_l, r_l, a_l = ema_lens_low, rsi_lens_low, adx_lens_low
         tf_features = compute_tf_features(
-            base, tf, ema_lens, rsi_lens, adx_lens, support_lbs, args.with_vwap,
+            base, tf, e_l, r_l, a_l, mfi_lens, kdj_lens, support_lbs, args.with_vwap,
             breakout_lbs=breakout_lbs,
             with_candle_patterns=args.with_candle_patterns and (tf in pattern_tfs),
             with_breakout_features=args.with_breakout_features and (tf in pattern_tfs),
@@ -728,7 +802,7 @@ def main() -> None:
     if args.with_session_features:
         feature_table = add_session_features(feature_table, with_weekend=args.with_session_weekend)
 
-    feature_table = add_delta_features(feature_table, delta_windows)
+    feature_table = add_delta_features(feature_table, delta_windows, max_tf=int(args.delta_max_tf))
 
     # Reduce memory early (before warmup filtering)
     num_cols = feature_table.select_dtypes(include=["number"]).columns
