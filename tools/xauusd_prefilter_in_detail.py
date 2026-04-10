@@ -97,6 +97,10 @@ def _chunk_list(xs: list, n: int) -> list[list]:
     return [xs[i:i + n] for i in range(0, len(xs), n)]
 
 
+def _next_batch(it: Iterable[Tuple[int, ...]], n: int) -> list[Tuple[int, ...]]:
+    return list(itertools.islice(it, max(1, int(n))))
+
+
 def _with_rank_context(ranked: list[dict], rank_name: str) -> list[dict]:
     out: list[dict] = []
     for i, it in enumerate(ranked):
@@ -108,11 +112,14 @@ def _with_rank_context(ranked: list[dict], rank_name: str) -> list[dict]:
 
 
 def _build_unlocked_pool(
+    miner_mod,
     rank_lists: list[list[dict]],
+    all_candidate_cols: list[str],
     unlocked_next: int,
     step_size: int,
     binary_cap_per_list_block: int,
     binary_anchor_lookahead_blocks: int,
+    binary_cap_per_block: int,
 ) -> list[dict]:
     if unlocked_next <= 0:
         return []
@@ -121,45 +128,60 @@ def _build_unlocked_pool(
     lookahead_blocks = max(0, int(binary_anchor_lookahead_blocks))
     merged: dict[tuple[str, str, float], dict] = {}
 
-    def _add_item(it: dict, from_lookahead: bool) -> None:
+    blocks_by_rank = [_chunk_list(rank, block_size) for rank in rank_lists]
+
+    def _has_anchor_within_lookahead(binary_col: str, block_idx: int) -> bool:
+        anchors = miner_mod.candidate_anchor_columns(binary_col, all_candidate_cols)
+        if not anchors:
+            return True
+        cols_window: set[str] = set()
+        b0 = max(0, int(block_idx))
+        b1 = b0 + lookahead_blocks
+        for blocks in blocks_by_rank:
+            for bi in range(b0, min(len(blocks), b1 + 1)):
+                cols_window.update(str(x["col"]) for x in blocks[bi])
+        return any(a in cols_window for a in anchors)
+
+    def _add_item(it: dict, source_block: int) -> None:
         key = (str(it["col"]), str(it["op"]), float(it["value"]))
         cur = merged.get(key)
         cand = dict(it)
-        cand["_from_lookahead"] = bool(from_lookahead)
+        cand["_source_block"] = int(source_block)
         if cur is None:
             merged[key] = cand
             return
-        # Neighbor-merge preference: keep non-lookahead and better rank position.
-        cur_la = bool(cur.get("_from_lookahead", False))
-        cand_la = bool(cand.get("_from_lookahead", False))
-        if cur_la and not cand_la:
-            merged[key] = cand
-            return
-        if cur_la == cand_la and int(cand.get("_rank_pos", 10 ** 9)) < int(cur.get("_rank_pos", 10 ** 9)):
+        if int(cand.get("_rank_pos", 10 ** 9)) < int(cur.get("_rank_pos", 10 ** 9)):
             merged[key] = cand
 
-    for rank in rank_lists:
-        blocks = _chunk_list(rank, block_size)
+    for blocks in blocks_by_rank:
         for bi in range(min(len(blocks), unlocked_blocks)):
             bin_count = 0
             for it in blocks[bi]:
                 if bool(it.get("binary", False)):
-                    if bin_count >= int(binary_cap_per_list_block):
-                        continue
-                    bin_count += 1
-                _add_item(it, from_lookahead=False)
-        if lookahead_blocks > 0:
-            start = unlocked_blocks
-            stop = min(len(blocks), unlocked_blocks + lookahead_blocks)
-            for bi in range(start, stop):
-                bin_count = 0
-                for it in blocks[bi]:
-                    if not bool(it.get("binary", False)):
+                    if not _has_anchor_within_lookahead(str(it["col"]), bi):
                         continue
                     if bin_count >= int(binary_cap_per_list_block):
                         continue
                     bin_count += 1
-                    _add_item(it, from_lookahead=True)
+                _add_item(it, source_block=bi)
+
+    if int(binary_cap_per_block) > 0:
+        per_step_cap = int(binary_cap_per_block)
+        by_block: dict[int, list[int]] = {}
+        pool = list(merged.values())
+        for i, it in enumerate(pool):
+            bi = int(it.get("_source_block", 0))
+            by_block.setdefault(bi, []).append(i)
+        keep_idx: set[int] = set()
+        for bi, idxs in by_block.items():
+            bidx = [i for i in idxs if bool(pool[i].get("binary", False))]
+            nidx = [i for i in idxs if not bool(pool[i].get("binary", False))]
+            keep_idx.update(nidx)
+            keep_idx.update(bidx[:per_step_cap])
+        merged = {
+            (str(pool[i]["col"]), str(pool[i]["op"]), float(pool[i]["value"])): pool[i]
+            for i in sorted(keep_idx)
+        }
 
     return list(merged.values())
 
@@ -307,7 +329,12 @@ def main() -> None:
             else:
                 x = pd.to_numeric(df[col], errors="coerce").to_numpy(copy=False)
             if op == "==":
-                mask &= np.isfinite(x) & (np.abs(x - val) <= 1e-6)
+                if "lo_bin" in c and "hi_bin" in c:
+                    lo_bin = float(c["lo_bin"])
+                    hi_bin = float(c["hi_bin"])
+                    mask &= np.isfinite(x) & (x >= lo_bin - 1e-6) & (x <= hi_bin + 1e-6)
+                else:
+                    mask &= np.isfinite(x) & (np.abs(x - val) <= 1e-6)
             elif op == ">=":
                 mask &= np.isfinite(x) & (x >= val)
             elif op == "<=":
@@ -383,48 +410,54 @@ def main() -> None:
     while True:
         unlocked_next = unlocked + int(args.step_size)
         pool = _build_unlocked_pool(
+            miner_mod=miner,
             rank_lists=[rank_freq, rank_lift, rank_ratio],
+            all_candidate_cols=cols,
             unlocked_next=unlocked_next,
             step_size=int(args.step_size),
             binary_cap_per_list_block=int(args.binary_cap_per_list_block),
             binary_anchor_lookahead_blocks=int(args.binary_anchor_lookahead_blocks),
+            binary_cap_per_block=int(args.binary_cap_per_list_block) * 3,
         )
         if not pool:
             break
 
-        unlocked_blocks = max(1, int(math.ceil(float(unlocked_next) / float(max(1, int(args.step_size))))))
-        global_binary_cap = int(args.binary_cap_per_block) * unlocked_blocks
-        # binary cap over unlocked blocks (lookahead binaries are excluded from this cap)
-        bin_idx = [i for i, it in enumerate(pool) if bool(it["binary"])]
-        keep_bin_idx = [
-            i
-            for i in bin_idx
-            if not bool(pool[i].get("_from_lookahead", False))
-        ]
-        if len(keep_bin_idx) > global_binary_cap:
-            keep = set(keep_bin_idx[:global_binary_cap])
-            keep.update(i for i, it in enumerate(pool) if not bool(it["binary"]))
-            keep.update(i for i, it in enumerate(pool) if bool(it["binary"]) and bool(it.get("_from_lookahead", False)))
-            pool = [pool[i] for i in sorted(keep)]
-
         idxs = list(range(len(pool)))
-        combos_iter = itertools.chain.from_iterable(
+        combos_base = itertools.chain.from_iterable(
             itertools.combinations(idxs, r) for r in range(2, int(args.max_path_conds) + 1)
         )
+        total_combos = 0
+        for r in range(2, int(args.max_path_conds) + 1):
+            if r <= len(idxs):
+                total_combos += math.comb(len(idxs), r)
 
         results: List[dict] = []
-        for batch in _batched(combos_iter, int(args.batch_size)):
-            mem_gb = (len(batch) * max(1, len(pool)) * 8.0) / (1024 ** 3)
-            if mem_gb > float(args.memory_soft_limit_gb):
-                overload = mem_gb / max(1e-9, float(args.memory_soft_limit_gb))
-                workers_eff = max(1, int(workers / max(1.0, overload)))
-            else:
-                workers_eff = workers
+        combos_iter = iter(combos_base)
+        tested = 0
+        valid = 0
+        batch_size_eff = max(256, int(args.batch_size))
+        target_mem_gb = max(0.5, float(args.memory_soft_limit_gb) * 0.75)
+        batch_no = 0
+        while True:
+            batch_no += 1
+            est_mem_gb = (batch_size_eff * max(1, len(pool)) * 8.0) / (1024 ** 3)
+            while est_mem_gb > target_mem_gb and batch_size_eff > 256:
+                batch_size_eff = max(256, batch_size_eff // 2)
+                est_mem_gb = (batch_size_eff * max(1, len(pool)) * 8.0) / (1024 ** 3)
+            workers_eff = workers
+            if est_mem_gb > target_mem_gb:
+                overload = est_mem_gb / max(1e-9, target_mem_gb)
+                workers_eff = max(1, int(workers / math.ceil(overload)))
+
+            batch = _next_batch(combos_iter, batch_size_eff)
+            if not batch:
+                break
             if workers_eff <= 1:
                 for combo in batch:
                     r = evaluate_combo(combo, pool)
                     if r is not None:
                         results.append(r)
+                        valid += 1
             else:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=workers_eff) as ex:
                     futs = [ex.submit(evaluate_combo, combo, pool) for combo in batch]
@@ -432,6 +465,13 @@ def main() -> None:
                         r = f.result()
                         if r is not None:
                             results.append(r)
+                            valid += 1
+            tested += len(batch)
+            print(
+                f"[prefilter-progress] round={unlocked_next} pool={len(pool)} "
+                f"combos_total={total_combos} tested={tested} valid={valid} "
+                f"batch_size={batch_size_eff} workers={workers_eff} est_mem_gb={est_mem_gb:.3f}"
+            )
 
         if not results:
             break
@@ -443,6 +483,82 @@ def main() -> None:
             break
         prev_best = cur_best
         unlocked = unlocked_next
+
+    def _is_binned_continuous_eq(c: dict) -> bool:
+        col = str(c.get("col"))
+        op = str(c.get("op"))
+        if op != "==":
+            return False
+        ftype = str(meta.get(col, {}).get("feature_type", ""))
+        return ftype == "continuous"
+
+    def _better_score(a: dict | None, b: dict | None) -> bool:
+        if a is None:
+            return False
+        if b is None:
+            return True
+        ka = (float(a["ratio"]), int(a["pos_hits"]), -int(a["neg_hits"]))
+        kb = (float(b["ratio"]), int(b["pos_hits"]), -int(b["neg_hits"]))
+        return ka > kb
+
+    def _mask_cond_to_interval(c: dict) -> tuple[int, int]:
+        if "lo_bin" in c and "hi_bin" in c:
+            return int(c["lo_bin"]), int(c["hi_bin"])
+        v = int(round(float(c.get("value", 0.0))))
+        return v, v
+
+    def _apply_neighbor_merge(rule: dict) -> dict:
+        conds = [dict(x) for x in rule.get("conds", [])]
+        base_mask = _build_mask_from_conds(conds)
+        best_sc = _score_from_mask(base_mask)
+        if best_sc is None:
+            return rule
+        changed = True
+        while changed:
+            changed = False
+            for i, c in enumerate(conds):
+                if not _is_binned_continuous_eq(c):
+                    continue
+                col = str(c["col"])
+                eff = int(meta.get(col, {}).get("effective_bin_count", 0) or 0)
+                if eff <= 1:
+                    continue
+                lo, hi = _mask_cond_to_interval(c)
+                local_best_sc = best_sc
+                local_best = None
+                if lo > 1:
+                    cand = dict(c)
+                    cand["lo_bin"] = int(lo - 1)
+                    cand["hi_bin"] = int(hi)
+                    cand["value"] = float(cand["lo_bin"])
+                    trial_conds = [dict(x) for x in conds]
+                    trial_conds[i] = cand
+                    sc = _score_from_mask(_build_mask_from_conds(trial_conds))
+                    if _better_score(sc, local_best_sc):
+                        local_best_sc = sc
+                        local_best = cand
+                if hi < eff:
+                    cand = dict(c)
+                    cand["lo_bin"] = int(lo)
+                    cand["hi_bin"] = int(hi + 1)
+                    cand["value"] = float(cand["lo_bin"])
+                    trial_conds = [dict(x) for x in conds]
+                    trial_conds[i] = cand
+                    sc = _score_from_mask(_build_mask_from_conds(trial_conds))
+                    if _better_score(sc, local_best_sc):
+                        local_best_sc = sc
+                        local_best = cand
+                if local_best is not None:
+                    conds[i] = local_best
+                    best_sc = local_best_sc
+                    changed = True
+        merged_rule = dict(rule)
+        merged_rule["conds"] = conds
+        merged_rule.update(best_sc)
+        return merged_rule
+
+    best_paths = [_apply_neighbor_merge(r) for r in best_paths]
+    best_paths = sorted(best_paths, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))
 
     out_json = {
         "version": 2,
@@ -474,7 +590,14 @@ def main() -> None:
             val = float(c["value"])
             ftype = str(meta.get(col, {}).get("feature_type", "unknown"))
             if op == "==":
-                decoded_parts.append(miner.decode_bin_condition(col, val, meta))
+                if "lo_bin" in c and "hi_bin" in c and int(c["lo_bin"]) != int(c["hi_bin"]):
+                    lo_bin = float(c["lo_bin"])
+                    hi_bin = float(c["hi_bin"])
+                    lo_txt, _ = miner.decode_bin_condition_verbose(col, lo_bin, meta)
+                    hi_txt, _ = miner.decode_bin_condition_verbose(col, hi_bin, meta)
+                    decoded_parts.append(f"{col} in [{int(lo_bin)}, {int(hi_bin)}] ({lo_txt}; {hi_txt})")
+                else:
+                    decoded_parts.append(miner.decode_bin_condition(col, val, meta))
             else:
                 decoded_parts.append(f"{col} {op} {val:.6g}")
             type_parts.append(f"{col}:{ftype}")
