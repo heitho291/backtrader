@@ -260,7 +260,7 @@ def main() -> None:
         tick_minute_bounds=tick_minute_bounds,
     )
 
-    cols = miner.build_candidate_features(df, allow_absolute_price_features=False, max_features=0)
+    cols = miner.build_candidate_features(df, allow_absolute_price=False, max_features=0)
     y_train = y[:train_idx]
     y_test = y[train_idx:]
     tradable_train = ((y_train == 0) | (y_train == 1))
