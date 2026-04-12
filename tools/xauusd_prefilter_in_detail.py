@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import importlib.util
 import itertools
 import json
 import math
 import os
+import random
+import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -70,6 +73,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workers", type=str, default="auto")
     p.add_argument("--batch-size", type=int, default=50000)
     p.add_argument("--memory-soft-limit-gb", type=float, default=20.0)
+    p.add_argument("--max-valids", type=int, default=1000)
+    p.add_argument("--early-stop-top-k", type=int, default=100)
+    p.add_argument("--early-stop-window-combos", type=int, default=150000)
+    p.add_argument("--early-stop-avg-improve-pct", type=float, default=0.25)
+    p.add_argument("--batch-random-seed", type=int, default=42)
 
     p.add_argument("--min-pos-per-week", type=float, default=1.0)
     p.add_argument("--min-main-score", type=float, default=1.0)
@@ -99,6 +107,22 @@ def _chunk_list(xs: list, n: int) -> list[list]:
 
 def _next_batch(it: Iterable[Tuple[int, ...]], n: int) -> list[Tuple[int, ...]]:
     return list(itertools.islice(it, max(1, int(n))))
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent), encoding="utf-8") as tf:
+        tf.write(text)
+        tmp = Path(tf.name)
+    os.replace(tmp, path)
+
+
+def _atomic_write_csv(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent), encoding="utf-8", newline="") as tf:
+        frame.to_csv(tf.name, index=False)
+        tmp = Path(tf.name)
+    os.replace(tmp, path)
 
 
 def _with_rank_context(ranked: list[dict], rank_name: str) -> list[dict]:
@@ -373,7 +397,17 @@ def main() -> None:
             "wf_hits": wf_hits,
         }
 
-    def evaluate_combo(combo: Tuple[int, ...], pool_items: List[dict]) -> dict | None:
+    def _train_key(r: dict) -> tuple[float, int, int]:
+        return (float(r["ratio"]), int(r["pos_hits"]), -int(r["neg_hits"]))
+
+    def _test_key(r: dict) -> tuple[float, int, int]:
+        return (float(r["test_ratio"]), int(r["test_pos_hits"]), -int(r["test_neg_hits"]))
+
+    def _mask_hash(mask: np.ndarray) -> str:
+        packed = np.packbits(mask.astype(np.uint8, copy=False))
+        return hashlib.sha1(packed.tobytes()).hexdigest()
+
+    def evaluate_combo(combo: Tuple[int, ...], pool_items: List[dict], parent: dict | None = None) -> dict | None:
         conds = [pool_items[i] for i in combo]
         dedup = []
         seen_gid = set()
@@ -402,87 +436,254 @@ def main() -> None:
         sc = _score_from_mask(mask)
         if sc is None:
             return None
+        mh = _mask_hash(mask)
+        if parent is not None:
+            if str(parent.get("_mask_hash", "")) == mh:
+                return None
+            if _train_key(sc) <= _train_key(parent):
+                return None
         return {
             "conds": [{"col": str(c["col"]), "op": str(c["op"]), "value": float(c["value"]), "domain": "auto"} for c in conds],
+            "_combo": tuple(sorted(int(x) for x in combo)),
+            "_mask_hash": mh,
             **sc,
         }
 
-    while True:
-        unlocked_next = unlocked + int(args.step_size)
-        pool = _build_unlocked_pool(
-            miner_mod=miner,
-            rank_lists=[rank_freq, rank_lift, rank_ratio],
-            all_candidate_cols=cols,
-            unlocked_next=unlocked_next,
-            step_size=int(args.step_size),
-            binary_cap_per_list_block=int(args.binary_cap_per_list_block),
-            binary_anchor_lookahead_blocks=int(args.binary_anchor_lookahead_blocks),
-            binary_cap_per_block=int(args.binary_cap_per_list_block) * 3,
-        )
-        if not pool:
-            break
+    csv_columns = [
+        "path_index", "rule_human", "rule_json_id", "decode_type_info", "pos_hits", "neg_hits",
+        "remaining_hit_ratio", "precision_info", "test_pos_hits", "test_neg_hits", "test_ratio",
+        "wf_mean_ratio", "wf_min_ratio", "wf_hits", "tp", "sl", "hold", "trail",
+        "trail_activate", "trail_offset", "trail_factor",
+    ]
 
-        idxs = list(range(len(pool)))
-        combos_base = itertools.chain.from_iterable(
-            itertools.combinations(idxs, r) for r in range(2, int(args.max_path_conds) + 1)
-        )
-        total_combos = 0
-        for r in range(2, int(args.max_path_conds) + 1):
-            if r <= len(idxs):
-                total_combos += math.comb(len(idxs), r)
+    def _rules_to_rows(rules: list[dict]) -> list[dict]:
+        rows: list[dict] = []
+        for i, r in enumerate(rules, start=1):
+            decoded_parts = []
+            type_parts = []
+            for c in r["conds"]:
+                col = str(c["col"])
+                op = str(c["op"])
+                val = float(c["value"])
+                ftype = str(meta.get(col, {}).get("feature_type", "unknown"))
+                if op == "==":
+                    if "lo_bin" in c and "hi_bin" in c and int(c["lo_bin"]) != int(c["hi_bin"]):
+                        lo_bin = float(c["lo_bin"])
+                        hi_bin = float(c["hi_bin"])
+                        lo_txt, _ = miner.decode_bin_condition_verbose(col, lo_bin, meta)
+                        hi_txt, _ = miner.decode_bin_condition_verbose(col, hi_bin, meta)
+                        decoded_parts.append(f"{col} in [{int(lo_bin)}, {int(hi_bin)}] ({lo_txt}; {hi_txt})")
+                    else:
+                        decoded_parts.append(miner.decode_bin_condition(col, val, meta))
+                else:
+                    decoded_parts.append(f"{col} {op} {val:.6g}")
+                type_parts.append(f"{col}:{ftype}")
+            rows.append({
+                "path_index": i,
+                "rule_human": " & ".join(decoded_parts),
+                "rule_json_id": f"rule_{i}",
+                "decode_type_info": " | ".join(type_parts),
+                "pos_hits": r["pos_hits"],
+                "neg_hits": r["neg_hits"],
+                "remaining_hit_ratio": r["ratio"],
+                "precision_info": r["precision"],
+                "test_pos_hits": r["test_pos_hits"],
+                "test_neg_hits": r["test_neg_hits"],
+                "test_ratio": r["test_ratio"],
+                "wf_mean_ratio": r["wf_mean_ratio"],
+                "wf_min_ratio": r["wf_min_ratio"],
+                "wf_hits": r["wf_hits"],
+                "tp": ",".join([f"{x:.8g}" for x in tps]),
+                "sl": float(args.sl),
+                "hold": int(args.hold),
+                "trail": int(args.trail),
+                "trail_activate": float(args.trail_activate),
+                "trail_offset": float(args.trail_offset),
+                "trail_factor": float(args.trail_factor),
+            })
+        return rows
 
-        results: List[dict] = []
-        combos_iter = iter(combos_base)
-        tested = 0
-        valid = 0
-        batch_size_eff = max(256, int(args.batch_size))
-        target_mem_gb = max(0.5, float(args.memory_soft_limit_gb) * 0.75)
-        batch_no = 0
+    def _dedupe_mask(rows: list[dict]) -> list[dict]:
+        buckets: dict[tuple[int, int, int, int], dict[str, dict]] = {}
+        for r in rows:
+            key = (int(r["pos_hits"]), int(r["neg_hits"]), int(r["test_pos_hits"]), int(r["test_neg_hits"]))
+            buckets.setdefault(key, {})
+            mh = str(r.get("_mask_hash", ""))
+            cur = buckets[key].get(mh)
+            if cur is None:
+                buckets[key][mh] = r
+                continue
+            if len(r.get("conds", [])) < len(cur.get("conds", [])):
+                buckets[key][mh] = r
+            elif len(r.get("conds", [])) == len(cur.get("conds", [])):
+                if _test_key(r) > _test_key(cur) or (_test_key(r) == _test_key(cur) and _train_key(r) > _train_key(cur)):
+                    buckets[key][mh] = r
+        out: list[dict] = []
+        for m in buckets.values():
+            out.extend(m.values())
+        return out
+
+    def _save_progress(valid_pool: list[dict], state: dict) -> None:
+        rules_only = {"version": 2, "rules": valid_pool}
+        _atomic_write_text(args.out_rules_json, json.dumps(rules_only, ensure_ascii=False, indent=2))
+        progress_path = args.out_rules_json.with_suffix(args.out_rules_json.suffix + ".progress.json")
+        _atomic_write_text(progress_path, json.dumps(state, ensure_ascii=False, indent=2))
+        rows = _rules_to_rows(valid_pool[: int(args.top_paths)])
+        if rows:
+            _atomic_write_csv(args.out_rules_csv, pd.DataFrame(rows))
+        else:
+            _atomic_write_csv(args.out_rules_csv, pd.DataFrame(columns=csv_columns))
+
+    rng = random.Random(int(args.batch_random_seed))
+    valid_pool: list[dict] = []
+    progress_state: dict = {}
+    try:
         while True:
-            batch_no += 1
-            est_mem_gb = (batch_size_eff * max(1, len(pool)) * 8.0) / (1024 ** 3)
-            while est_mem_gb > target_mem_gb and batch_size_eff > 256:
-                batch_size_eff = max(256, batch_size_eff // 2)
-                est_mem_gb = (batch_size_eff * max(1, len(pool)) * 8.0) / (1024 ** 3)
-            workers_eff = workers
-            if est_mem_gb > target_mem_gb:
-                overload = est_mem_gb / max(1e-9, target_mem_gb)
-                workers_eff = max(1, int(workers / math.ceil(overload)))
-
-            batch = _next_batch(combos_iter, batch_size_eff)
-            if not batch:
-                break
-            if workers_eff <= 1:
-                for combo in batch:
-                    r = evaluate_combo(combo, pool)
-                    if r is not None:
-                        results.append(r)
-                        valid += 1
-            else:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers_eff) as ex:
-                    futs = [ex.submit(evaluate_combo, combo, pool) for combo in batch]
-                    for f in futs:
-                        r = f.result()
-                        if r is not None:
-                            results.append(r)
-                            valid += 1
-            tested += len(batch)
-            print(
-                f"[prefilter-progress] round={unlocked_next} pool={len(pool)} "
-                f"combos_total={total_combos} tested={tested} valid={valid} "
-                f"batch_size={batch_size_eff} workers={workers_eff} est_mem_gb={est_mem_gb:.3f}"
+            unlocked_next = unlocked + int(args.step_size)
+            pool = _build_unlocked_pool(
+                miner_mod=miner,
+                rank_lists=[rank_freq, rank_lift, rank_ratio],
+                all_candidate_cols=cols,
+                unlocked_next=unlocked_next,
+                step_size=int(args.step_size),
+                binary_cap_per_list_block=int(args.binary_cap_per_list_block),
+                binary_anchor_lookahead_blocks=int(args.binary_anchor_lookahead_blocks),
+                binary_cap_per_block=int(args.binary_cap_per_list_block) * 3,
             )
+            if not pool:
+                break
+            idxs = list(range(len(pool)))
+            phase_a = len(valid_pool) < int(args.max_valids)
+            shard_specs: list[tuple[int, int, int, int]] = []
+            batch_eff = max(256, int(args.batch_size))
+            sid = 0
+            if phase_a:
+                for r in range(2, int(args.max_path_conds) + 1):
+                    if r > len(idxs):
+                        continue
+                    total_r = math.comb(len(idxs), r)
+                    for st in range(0, total_r, batch_eff):
+                        shard_specs.append((sid, r, st, min(batch_eff, total_r - st)))
+                        sid += 1
+            else:
+                seeds = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
+                for p in seeds:
+                    cset = set(int(x) for x in p.get("_combo", ()))
+                    for add in idxs:
+                        if add in cset:
+                            continue
+                        combo = tuple(sorted(cset | {add}))
+                        if 2 <= len(combo) <= int(args.max_path_conds):
+                            shard_specs.append((sid, -1, 0, 0))
+                            sid += 1
+                # shuffle mutation order globally
+            rng.shuffle(shard_specs)
+            tested = 0
+            valid_round = 0
+            mut_i = 0
+            seeds = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
+            mut_combos: list[tuple[tuple[int, ...], dict]] = []
+            if (not phase_a) or (phase_a and len(seeds) > 0 and unlocked_next > int(args.step_size)):
+                for p in seeds:
+                    cset = set(int(x) for x in p.get("_combo", ()))
+                    for add in idxs:
+                        if add in cset:
+                            continue
+                        combo = tuple(sorted(cset | {add}))
+                        if 2 <= len(combo) <= int(args.max_path_conds):
+                            mut_combos.append((combo, p))
+                rng.shuffle(mut_combos)
 
-        if not results:
-            break
+            hist: list[tuple[int, float, tuple[float, int, int]]] = []
+            for spec in shard_specs:
+                est_mem_gb = (batch_eff * max(1, len(pool)) * 8.0) / (1024 ** 3)
+                target_mem_gb = max(0.5, float(args.memory_soft_limit_gb) * 0.75)
+                while est_mem_gb > target_mem_gb and batch_eff > 256:
+                    batch_eff = max(256, batch_eff // 2)
+                    est_mem_gb = (batch_eff * max(1, len(pool)) * 8.0) / (1024 ** 3)
+                workers_eff = workers if est_mem_gb <= target_mem_gb else max(1, workers // 2)
+                if phase_a:
+                    _sid, rr, st, cnt = spec
+                    new_combos = list(itertools.islice(itertools.combinations(idxs, rr), st, st + cnt))
+                    combos = list(new_combos)
+                    parents = [None] * len(new_combos)
+                    # from pool 2 onward in phase A: also expand existing valid rules in parallel
+                    if mut_i < len(mut_combos):
+                        fill_n = max(1, batch_eff // 2)
+                        exp_part = mut_combos[mut_i: mut_i + fill_n]
+                        mut_i += len(exp_part)
+                        combos.extend([x[0] for x in exp_part])
+                        parents.extend([x[1] for x in exp_part])
+                else:
+                    combos_par = mut_combos[mut_i: mut_i + batch_eff]
+                    mut_i += len(combos_par)
+                    combos = [x[0] for x in combos_par]
+                    parents = [x[1] for x in combos_par]
+                    if not combos:
+                        break
+                out_batch: list[dict] = []
+                if workers_eff <= 1:
+                    for i, cb in enumerate(combos):
+                        rr = evaluate_combo(cb, pool, parents[i])
+                        if rr is not None:
+                            out_batch.append(rr)
+                else:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers_eff) as ex:
+                        futs = [ex.submit(evaluate_combo, cb, pool, parents[i]) for i, cb in enumerate(combos)]
+                        for f in futs:
+                            rr = f.result()
+                            if rr is not None:
+                                out_batch.append(rr)
+                tested += len(combos)
+                valid_round += len(out_batch)
+                valid_pool.extend(out_batch)
+                valid_pool = _dedupe_mask(valid_pool)
+                valid_pool = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
+                topk = valid_pool[: int(args.early_stop_top_k)]
+                a1 = _train_key(topk[0]) if topk else (-np.inf, -1, 1)
+                avg_ratio = float(np.mean([float(x["ratio"]) for x in topk])) if topk else float("nan")
+                hist.append((len(combos), avg_ratio, a1))
+                progress_state = {
+                    "round": int(unlocked_next),
+                    "pool_size": int(len(pool)),
+                    "combos_total": int(len(shard_specs) * max(1, batch_eff)),
+                    "tested": int(tested),
+                    "valid": int(valid_round),
+                    "batch_size": int(batch_eff),
+                    "workers": int(workers_eff),
+                    "best_a1": list(a1),
+                    "topk_summary": [{"ratio": float(x["ratio"]), "pos_hits": int(x["pos_hits"]), "neg_hits": int(x["neg_hits"])} for x in topk[:10]],
+                    "phase": "A" if phase_a else "B",
+                }
+                _save_progress(valid_pool, progress_state)
+                print(f"[prefilter-progress] round={unlocked_next} phase={'A' if phase_a else 'B'} tested={tested} valid={valid_round} bs={batch_eff} w={workers_eff}")
+                covered = 0
+                win = []
+                for h in reversed(hist):
+                    win.append(h)
+                    covered += int(h[0])
+                    if covered >= int(args.early_stop_window_combos):
+                        break
+                if covered >= int(args.early_stop_window_combos) and len(win) >= 2:
+                    old = win[-1][1]
+                    new = win[0][1]
+                    improve_pct = 0.0 if (not np.isfinite(old) or old == 0.0) else ((new - old) / abs(old) * 100.0)
+                    a1_improved = any(h[2] > win[-1][2] for h in win[:-1])
+                    if improve_pct < float(args.early_stop_avg_improve_pct) and not a1_improved:
+                        print("[prefilter-progress] early stop in round.")
+                        break
 
-        results = sorted(results, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))
-        best_paths = results[: int(args.top_paths)]
-        cur_best = float(best_paths[0]["ratio"]) if best_paths else -np.inf
-        if cur_best <= prev_best + 1e-12:
-            break
-        prev_best = cur_best
-        unlocked = unlocked_next
+            if not valid_pool:
+                break
+            best_paths = list(valid_pool)
+            cur_best = float(best_paths[0]["ratio"]) if best_paths else -np.inf
+            if cur_best <= prev_best + 1e-12:
+                break
+            prev_best = cur_best
+            unlocked = unlocked_next
+    except KeyboardInterrupt:
+        print("[prefilter] interrupted; checkpoint saved.")
+        _save_progress(valid_pool, progress_state)
 
     def _is_binned_continuous_eq(c: dict) -> bool:
         col = str(c.get("col"))
@@ -558,7 +759,24 @@ def main() -> None:
         return merged_rule
 
     best_paths = [_apply_neighbor_merge(r) for r in best_paths]
-    best_paths = sorted(best_paths, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))
+    best_paths = _dedupe_mask(best_paths)
+    train_ranked = sorted(best_paths, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))
+    train_rank_map = {id(r): i for i, r in enumerate(train_ranked)}
+    shortlist_n = max(100, int(args.top_paths) * 4)
+    shortlist = train_ranked[:shortlist_n]
+    shortlist = [r for r in shortlist if (int(r["test_pos_hits"]) + int(r["test_neg_hits"])) > 0]
+    shortlist = sorted(
+        shortlist,
+        key=lambda z: (
+            -float(z["test_ratio"]),
+            -int(z["test_pos_hits"]),
+            int(z["test_neg_hits"]),
+            int(train_rank_map.get(id(z), 10 ** 9)),
+        ),
+    )
+    best_paths = shortlist[: int(args.top_paths)]
+    if not best_paths:
+        print("[prefilter-warning] No rule with test hits found for final CSV export.")
 
     out_json = {
         "version": 2,
@@ -579,53 +797,11 @@ def main() -> None:
     }
     args.out_rules_json.write_text(json.dumps(out_json, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # Human-readable CSV
-    rows = []
-    for i, r in enumerate(best_paths, start=1):
-        decoded_parts = []
-        type_parts = []
-        for c in r["conds"]:
-            col = str(c["col"])
-            op = str(c["op"])
-            val = float(c["value"])
-            ftype = str(meta.get(col, {}).get("feature_type", "unknown"))
-            if op == "==":
-                if "lo_bin" in c and "hi_bin" in c and int(c["lo_bin"]) != int(c["hi_bin"]):
-                    lo_bin = float(c["lo_bin"])
-                    hi_bin = float(c["hi_bin"])
-                    lo_txt, _ = miner.decode_bin_condition_verbose(col, lo_bin, meta)
-                    hi_txt, _ = miner.decode_bin_condition_verbose(col, hi_bin, meta)
-                    decoded_parts.append(f"{col} in [{int(lo_bin)}, {int(hi_bin)}] ({lo_txt}; {hi_txt})")
-                else:
-                    decoded_parts.append(miner.decode_bin_condition(col, val, meta))
-            else:
-                decoded_parts.append(f"{col} {op} {val:.6g}")
-            type_parts.append(f"{col}:{ftype}")
-        txt = " & ".join(decoded_parts)
-        rows.append({
-            "path_index": i,
-            "rule_human": txt,
-            "rule_json_id": f"rule_{i}",
-            "decode_type_info": " | ".join(type_parts),
-            "pos_hits": r["pos_hits"],
-            "neg_hits": r["neg_hits"],
-            "remaining_hit_ratio": r["ratio"],
-            "precision_info": r["precision"],
-            "test_pos_hits": r["test_pos_hits"],
-            "test_neg_hits": r["test_neg_hits"],
-            "test_ratio": r["test_ratio"],
-            "wf_mean_ratio": r["wf_mean_ratio"],
-            "wf_min_ratio": r["wf_min_ratio"],
-            "wf_hits": r["wf_hits"],
-            "tp": ",".join([f"{x:.8g}" for x in tps]),
-            "sl": float(args.sl),
-            "hold": int(args.hold),
-            "trail": int(args.trail),
-            "trail_activate": float(args.trail_activate),
-            "trail_offset": float(args.trail_offset),
-            "trail_factor": float(args.trail_factor),
-        })
-    pd.DataFrame(rows).to_csv(args.out_rules_csv, index=False)
+    rows = _rules_to_rows(best_paths)
+    if rows:
+        _atomic_write_csv(args.out_rules_csv, pd.DataFrame(rows))
+    else:
+        _atomic_write_csv(args.out_rules_csv, pd.DataFrame(columns=csv_columns))
     print(f"Saved {len(rows)} rules -> {args.out_rules_json} and {args.out_rules_csv}")
 
 
