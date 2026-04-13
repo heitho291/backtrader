@@ -17,6 +17,7 @@ import math
 import os
 import random
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -78,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early-stop-window-combos", type=int, default=150000)
     p.add_argument("--early-stop-avg-improve-pct", type=float, default=0.25)
     p.add_argument("--batch-random-seed", type=int, default=42)
+    p.add_argument("--debug-reject-stats", action="store_true", default=False)
+    p.add_argument("--debug-timing-breakdown", action="store_true", default=False)
 
     p.add_argument("--min-pos-per-week", type=float, default=1.0)
     p.add_argument("--min-main-score", type=float, default=1.0)
@@ -234,10 +237,17 @@ def _calc_wf(mask: np.ndarray, y_test: np.ndarray, wf_folds: int) -> tuple[float
 def main() -> None:
     args = parse_args()
     miner = _load_miner_module(args.miner_script)
+    timing: dict[str, float] = {}
 
+    t0 = time.perf_counter()
     df = miner.load_features(args.features)
+    timing["load_features_sec"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     bdf = miner.load_binned_features(args.binned_features, tail_rows=0).reindex(df.index)
+    timing["load_binned_features_sec"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     meta = miner.load_binned_metadata(args.binned_metadata)
+    timing["load_binned_metadata_sec"] = time.perf_counter() - t0
 
     n = len(df)
     train_idx = max(1, min(int(n * float(args.train_frac)), n - 1))
@@ -262,6 +272,7 @@ def main() -> None:
     tps = tps_all if bool(args.use_multi_tp) else [tps_all[0]]
     tp_w = miner.parse_tp_weights(tps, str(args.tp_weights))
 
+    t0 = time.perf_counter()
     pnl, y, t_exit, t_qual, tp_hits = miner.simulate_multitp_trailing_pessimistic(
         high=high,
         low=low,
@@ -283,8 +294,11 @@ def main() -> None:
         tick_prices_all=tick_prices_all,
         tick_minute_bounds=tick_minute_bounds,
     )
+    timing["simulate_labels_sec"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     cols = miner.build_candidate_features(df, allow_absolute_price=False, max_features=0)
+    timing["build_candidate_features_sec"] = time.perf_counter() - t0
     y_train = y[:train_idx]
     y_test = y[train_idx:]
     tradable_train = ((y_train == 0) | (y_train == 1))
@@ -293,8 +307,11 @@ def main() -> None:
     # Build item pools from three ranked lists.
     items = []
     qs = [float(x) for x in str(args.quantiles).split(",") if x.strip()]
+    t0 = time.perf_counter()
     qmap = miner.quantile_thresholds(df.iloc[:train_idx], cols, qs)
+    timing["quantile_thresholds_sec"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     for c in cols:
         if c.startswith("dist_"):
             # raw threshold candidates from quantiles
@@ -328,9 +345,26 @@ def main() -> None:
                           "lift": (pos / max(1, int(np.sum(y_train == 1)))) / max(1e-12, (neg / max(1, int(np.sum(y_train == 0))))),
                           "ratio": pos / max(1, neg)})
 
+    timing["build_items_sec"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     rank_freq = _with_rank_context(sorted(items, key=lambda z: z["freq"], reverse=True), "freq")
     rank_lift = _with_rank_context(sorted(items, key=lambda z: z["lift"], reverse=True), "lift")
     rank_ratio = _with_rank_context(sorted(items, key=lambda z: z["ratio"], reverse=True), "ratio")
+    timing["ranking_prep_sec"] = time.perf_counter() - t0
+
+    if bool(args.debug_timing_breakdown):
+        print("[prefilter-timing] " + " | ".join([f"{k}={v:.3f}s" for k, v in timing.items()]))
+    if bool(args.debug_timing_breakdown) or bool(args.debug_reject_stats):
+        dist_items = sum(1 for x in items if str(x["col"]).startswith("dist_"))
+        non_dist_items = len(items) - dist_items
+        bin_items = sum(1 for x in items if bool(x.get("binary", False)))
+        non_bin_items = len(items) - bin_items
+        print(
+            f"[prefilter-items] cols={len(cols)} items={len(items)} "
+            f"rank_freq={len(rank_freq)} rank_lift={len(rank_lift)} rank_ratio={len(rank_ratio)} "
+            f"dist_items={dist_items} non_dist_items={non_dist_items} "
+            f"binary_items={bin_items} non_binary_items={non_bin_items}"
+        )
 
     workers = max(1, int(os.cpu_count() or 1)) if str(args.workers).lower() == "auto" else max(1, int(args.workers))
 
@@ -338,6 +372,16 @@ def main() -> None:
     unlocked = 0
     prev_best = -np.inf
     same_ref = miner._build_same_reference_groups(df.iloc[:train_idx], [(str(c), ">=", 0.0) for c in cols])
+    reject_stats: dict[str, int] = {
+        "rejected_min_pos_per_week": 0,
+        "rejected_min_main_score": 0,
+        "rejected_same_parent_mask": 0,
+        "rejected_not_strictly_better_than_parent": 0,
+        "rejected_same_reference": 0,
+        "rejected_bundle_anchor": 0,
+        "rejected_binary_cap": 0,
+        "rejected_duplicate_mask": 0,
+    }
 
     def _build_mask_from_conds(conds: list[dict]) -> np.ndarray:
         mask = np.ones(n, dtype=bool)
@@ -374,9 +418,13 @@ def main() -> None:
         days = max(1.0, float((df.index[train_idx - 1] - df.index[0]).total_seconds() / 86400.0))
         weeks = days / 7.0
         if pos_hits < float(args.min_pos_per_week) * weeks:
+            if bool(args.debug_reject_stats):
+                reject_stats["rejected_min_pos_per_week"] += 1
             return None
         ratio = pos_hits / max(1, neg_hits)
         if ratio < float(args.min_main_score):
+            if bool(args.debug_reject_stats):
+                reject_stats["rejected_min_main_score"] += 1
             return None
         mt_test = mask[train_idx:] & tradable_test
         pos_test = int(np.sum(mt_test & (y_test == 1)))
@@ -416,6 +464,8 @@ def main() -> None:
             if fam in {"dist_support", "dist_resist"}:
                 gid = int(same_ref.get(str(c["col"]), 0))
                 if gid > 0 and gid in seen_gid:
+                    if bool(args.debug_reject_stats):
+                        reject_stats["rejected_same_reference"] += 1
                     continue
                 if gid > 0:
                     seen_gid.add(gid)
@@ -423,11 +473,15 @@ def main() -> None:
         conds = dedup
         # Binary flood cap per unlocked block
         if sum(1 for c in conds if c["binary"]) > int(args.binary_cap_per_block):
+            if bool(args.debug_reject_stats):
+                reject_stats["rejected_binary_cap"] += 1
             return None
         # bundle/anchor validity
         cond_triplets = [(str(c["col"]), str(c["op"]), float(c["value"])) for c in conds]
         ok_bundle, _ = miner.validate_binary_anchor_invariant(cond_triplets, cols)
         if not ok_bundle:
+            if bool(args.debug_reject_stats):
+                reject_stats["rejected_bundle_anchor"] += 1
             return None
 
         mask = _build_mask_from_conds(
@@ -439,8 +493,12 @@ def main() -> None:
         mh = _mask_hash(mask)
         if parent is not None:
             if str(parent.get("_mask_hash", "")) == mh:
+                if bool(args.debug_reject_stats):
+                    reject_stats["rejected_same_parent_mask"] += 1
                 return None
             if _train_key(sc) <= _train_key(parent):
+                if bool(args.debug_reject_stats):
+                    reject_stats["rejected_not_strictly_better_than_parent"] += 1
                 return None
         return {
             "conds": [{"col": str(c["col"]), "op": str(c["op"]), "value": float(c["value"]), "domain": "auto"} for c in conds],
@@ -513,6 +571,8 @@ def main() -> None:
             if cur is None:
                 buckets[key][mh] = r
                 continue
+            if bool(args.debug_reject_stats):
+                reject_stats["rejected_duplicate_mask"] += 1
             if len(r.get("conds", [])) < len(cur.get("conds", [])):
                 buckets[key][mh] = r
             elif len(r.get("conds", [])) == len(cur.get("conds", [])):
@@ -526,8 +586,6 @@ def main() -> None:
     def _save_progress(valid_pool: list[dict], state: dict) -> None:
         rules_only = {"version": 2, "rules": valid_pool}
         _atomic_write_text(args.out_rules_json, json.dumps(rules_only, ensure_ascii=False, indent=2))
-        progress_path = args.out_rules_json.with_suffix(args.out_rules_json.suffix + ".progress.json")
-        _atomic_write_text(progress_path, json.dumps(state, ensure_ascii=False, indent=2))
         rows = _rules_to_rows(valid_pool[: int(args.top_paths)])
         if rows:
             _atomic_write_csv(args.out_rules_csv, pd.DataFrame(rows))
@@ -548,7 +606,7 @@ def main() -> None:
                 step_size=int(args.step_size),
                 binary_cap_per_list_block=int(args.binary_cap_per_list_block),
                 binary_anchor_lookahead_blocks=int(args.binary_anchor_lookahead_blocks),
-                binary_cap_per_block=int(args.binary_cap_per_list_block) * 3,
+                binary_cap_per_block=int(args.binary_cap_per_block),
             )
             if not pool:
                 break
@@ -656,7 +714,13 @@ def main() -> None:
                     "phase": "A" if phase_a else "B",
                 }
                 _save_progress(valid_pool, progress_state)
-                print(f"[prefilter-progress] round={unlocked_next} phase={'A' if phase_a else 'B'} tested={tested} valid={valid_round} bs={batch_eff} w={workers_eff}")
+                print(
+                    f"[prefilter-progress] round={unlocked_next} phase={'A' if phase_a else 'B'} "
+                    f"pool_size={len(pool)} combos_total={progress_state['combos_total']} "
+                    f"tested={tested} valid={valid_round} batch_size={batch_eff} workers={workers_eff}"
+                )
+                if bool(args.debug_reject_stats):
+                    print("[prefilter-reject-stats] " + " ".join([f"{k}={v}" for k, v in reject_stats.items()]))
                 covered = 0
                 win = []
                 for h in reversed(hist):
@@ -795,13 +859,15 @@ def main() -> None:
         },
         "rules": best_paths,
     }
-    args.out_rules_json.write_text(json.dumps(out_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_text(args.out_rules_json, json.dumps(out_json, ensure_ascii=False, indent=2))
 
     rows = _rules_to_rows(best_paths)
     if rows:
         _atomic_write_csv(args.out_rules_csv, pd.DataFrame(rows))
     else:
         _atomic_write_csv(args.out_rules_csv, pd.DataFrame(columns=csv_columns))
+    if bool(args.debug_reject_stats):
+        print("[prefilter-reject-stats-total] " + " ".join([f"{k}={v}" for k, v in reject_stats.items()]))
     print(f"Saved {len(rows)} rules -> {args.out_rules_json} and {args.out_rules_csv}")
 
 
