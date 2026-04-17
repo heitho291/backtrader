@@ -73,6 +73,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-breakout-features", dest="with_breakout_features", action="store_false")
     p.add_argument("--with-fvg-features", action="store_true", default=True)
     p.add_argument("--no-fvg-features", dest="with_fvg_features", action="store_false")
+    p.add_argument("--fvg-mode", choices=["strict3", "relaxed"], default="strict3")
+    p.add_argument("--min-fvg-size-atr-mult", type=float, default=0.0)
     p.add_argument("--with-session-features", action="store_true", default=True)
     p.add_argument("--no-session-features", dest="with_session_features", action="store_false")
     p.add_argument("--with-session-weekend", action="store_true", default=False,
@@ -81,6 +83,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-liquidity-sweeps", dest="with_liquidity_sweeps", action="store_false")
     p.add_argument("--with-market-structure", action="store_true", default=True)
     p.add_argument("--no-market-structure", dest="with_market_structure", action="store_false")
+    p.add_argument("--swing-left", type=int, default=3)
+    p.add_argument("--swing-right", type=int, default=3)
     p.add_argument("--with-orderblock-proximity", action="store_true", default=True)
     p.add_argument("--no-orderblock-proximity", dest="with_orderblock_proximity", action="store_false")
     p.add_argument("--horizons", type=str, default="5,15,60", help="Forward-return horizons in bars on base tf1 (optional)")
@@ -291,6 +295,10 @@ def compute_price_action_features(
     with_liquidity_sweeps: bool,
     with_market_structure: bool,
     with_orderblock_proximity: bool,
+    fvg_mode: str = "strict3",
+    min_fvg_size_atr_mult: float = 0.0,
+    swing_left: int = 3,
+    swing_right: int = 3,
 ) -> pd.DataFrame:
     f = pd.DataFrame(index=tf_df.index)
     h = tf_df["high"]
@@ -323,16 +331,33 @@ def compute_price_action_features(
             f[f"break_dn_bars_since{lb}_tf{tf}"] = _bars_since_event(dn)
 
     if with_fvg_features:
-        bull_flag = l > h.shift(2)
-        bear_flag = h < l.shift(2)
-        bull_size = ((l - h.shift(2)) / c).where(bull_flag, 0.0)
-        bear_size = ((l.shift(2) - h) / c).where(bear_flag, 0.0)
+        if str(fvg_mode) == "relaxed":
+            bull_flag = l > h.shift(1)
+            bear_flag = h < l.shift(1)
+            raw_bull_gap = (l - h.shift(1)).clip(lower=0.0)
+            raw_bear_gap = (l.shift(1) - h).clip(lower=0.0)
+        else:
+            bull_flag = l > h.shift(2)
+            bear_flag = h < l.shift(2)
+            raw_bull_gap = (l - h.shift(2)).clip(lower=0.0)
+            raw_bear_gap = (l.shift(2) - h).clip(lower=0.0)
+
+        prev_c = c.shift(1)
+        tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1.0 / 14.0, adjust=False).mean().replace(0, np.nan)
+        min_gap = atr * float(min_fvg_size_atr_mult)
+
+        bull_flag = bull_flag & (raw_bull_gap >= min_gap)
+        bear_flag = bear_flag & (raw_bear_gap >= min_gap)
+        bull_size = (raw_bull_gap / c).where(bull_flag, np.nan)
+        bear_size = (raw_bear_gap / c).where(bear_flag, np.nan)
+        any_size = pd.concat([bull_size, bear_size], axis=1).max(axis=1)
 
         f[f"fvg_bull_flag_tf{tf}"] = bull_flag.astype(float)
         f[f"fvg_bear_flag_tf{tf}"] = bear_flag.astype(float)
         f[f"fvg_bull_size_tf{tf}"] = bull_size
         f[f"fvg_bear_size_tf{tf}"] = bear_size
-        f[f"fvg_any_size_tf{tf}"] = bull_size + bear_size
+        f[f"fvg_any_size_tf{tf}"] = any_size
         f[f"fvg_bull_bars_since_tf{tf}"] = _bars_since_event(bull_flag)
         f[f"fvg_bear_bars_since_tf{tf}"] = _bars_since_event(bear_flag)
 
@@ -353,6 +378,36 @@ def compute_price_action_features(
         f[f"ms_ll_tf{tf}"] = ll.astype(float)
         f[f"ms_hh_bars_since_tf{tf}"] = _bars_since_event(hh)
         f[f"ms_ll_bars_since_tf{tf}"] = _bars_since_event(ll)
+        win = int(max(3, swing_left + swing_right + 1))
+        piv_hi_raw = h.where(h == h.rolling(win, center=True, min_periods=win).max())
+        piv_lo_raw = l.where(l == l.rolling(win, center=True, min_periods=win).min())
+        piv_hi = piv_hi_raw.shift(int(swing_right))
+        piv_lo = piv_lo_raw.shift(int(swing_right))
+        last_swing_hi = piv_hi.ffill()
+        last_swing_lo = piv_lo.ffill()
+        bos_up = (c > last_swing_hi) & (c.shift(1) <= last_swing_hi.shift(1))
+        bos_dn = (c < last_swing_lo) & (c.shift(1) >= last_swing_lo.shift(1))
+        bias = np.zeros(len(c), dtype=np.int8)
+        for i in range(1, len(bias)):
+            bias[i] = bias[i - 1]
+            if bos_up.iloc[i]:
+                bias[i] = 1
+            elif bos_dn.iloc[i]:
+                bias[i] = -1
+        bias_s = pd.Series(bias, index=c.index)
+        choch_up = bos_up & (bias_s.shift(1, fill_value=0) < 0)
+        choch_dn = bos_dn & (bias_s.shift(1, fill_value=0) > 0)
+        f[f"bos_up_tf{tf}"] = bos_up.astype(float)
+        f[f"bos_dn_tf{tf}"] = bos_dn.astype(float)
+        f[f"choch_up_tf{tf}"] = choch_up.astype(float)
+        f[f"choch_dn_tf{tf}"] = choch_dn.astype(float)
+        f[f"bos_up_bars_since_tf{tf}"] = _bars_since_event(bos_up)
+        f[f"bos_dn_bars_since_tf{tf}"] = _bars_since_event(bos_dn)
+        f[f"choch_up_bars_since_tf{tf}"] = _bars_since_event(choch_up)
+        f[f"choch_dn_bars_since_tf{tf}"] = _bars_since_event(choch_dn)
+        f[f"structure_bias_tf{tf}"] = bias_s.astype(float)
+        f[f"dist_to_last_swing_high_tf{tf}"] = (c / last_swing_hi) - 1.0
+        f[f"dist_to_last_swing_low_tf{tf}"] = (last_swing_lo / c) - 1.0
 
     if with_orderblock_proximity:
         atr20 = (h - l).rolling(20).mean().replace(0, np.nan)
@@ -430,6 +485,126 @@ def build_running_htf_frame(base: pd.DataFrame, tf: int) -> pd.DataFrame:
     return out
 
 
+def compute_close_family_snapshot_states(
+    base: pd.DataFrame,
+    tf: int,
+    ema_lens: list[int],
+    rsi_lens: list[int],
+) -> pd.DataFrame:
+    """Compute EMA/RSI/MACD as confirmed-HTF-history + one live snapshot per 1m row.
+
+    The current HTF bucket is treated as one temporary bar whose OHLCV snapshot
+    updates each minute; only at bucket close is it committed to confirmed state.
+    """
+    idx = base.index
+    n = len(base)
+    close = pd.to_numeric(base["close"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    bucket = pd.Series(idx.floor(f"{tf}min"), index=idx)
+    grp = bucket.ne(bucket.shift(1)).cumsum().to_numpy(dtype=np.int64)
+    out = pd.DataFrame(index=idx)
+
+    ema_state: dict[int, float | None] = {int(l): None for l in ema_lens}
+    ema_alpha: dict[int, float] = {int(l): (2.0 / (int(l) + 1.0)) for l in ema_lens}
+
+    rsi_state: dict[int, tuple[float | None, float | None]] = {int(l): (None, None) for l in rsi_lens}
+    rsi_seed_delta: dict[int, list[float]] = {int(l): [] for l in rsi_lens}
+
+    macd_fast_state: float | None = None
+    macd_slow_state: float | None = None
+    macd_sig_state: float | None = None
+    a_fast, a_slow, a_sig = (2.0 / 13.0), (2.0 / 27.0), (2.0 / 10.0)
+
+    confirmed_closes: list[float] = []
+    last_confirmed_close: float | None = None
+
+    unique_groups = np.unique(grp)
+    for g in unique_groups.tolist():
+        pos = np.where(grp == g)[0]
+        if pos.size == 0:
+            continue
+        for i in pos.tolist():
+            c = float(close[i])
+            for l in ema_lens:
+                l = int(l)
+                s = ema_state[l]
+                if s is None:
+                    ema_snap = c
+                else:
+                    a = ema_alpha[l]
+                    ema_snap = (a * c) + ((1.0 - a) * s)
+                out.at[idx[i], f"ema{l}_tf{tf}"] = ema_snap
+                out.at[idx[i], f"dist_ema{l}_tf{tf}"] = (c / ema_snap) - 1.0 if np.isfinite(ema_snap) and ema_snap != 0 else np.nan
+
+            for l in rsi_lens:
+                l = int(l)
+                avg_up, avg_dn = rsi_state[l]
+                if avg_up is not None and avg_dn is not None and last_confirmed_close is not None:
+                    d = c - float(last_confirmed_close)
+                    up = max(d, 0.0)
+                    dn = max(-d, 0.0)
+                    up_s = ((avg_up * (l - 1.0)) + up) / l
+                    dn_s = ((avg_dn * (l - 1.0)) + dn) / l
+                    rs = up_s / dn_s if dn_s > 0 else np.inf
+                    rsi_v = 100.0 - (100.0 / (1.0 + rs))
+                    out.at[idx[i], f"rsi{l}_tf{tf}"] = rsi_v
+                else:
+                    if len(confirmed_closes) >= 1:
+                        tmp = pd.Series(confirmed_closes + [c])
+                        out.at[idx[i], f"rsi{l}_tf{tf}"] = float(rsi(tmp, l).iloc[-1])
+                    else:
+                        out.at[idx[i], f"rsi{l}_tf{tf}"] = np.nan
+
+            # MACD snapshot
+            ef = c if macd_fast_state is None else (a_fast * c + (1.0 - a_fast) * macd_fast_state)
+            es = c if macd_slow_state is None else (a_slow * c + (1.0 - a_slow) * macd_slow_state)
+            m = ef - es
+            sg = m if macd_sig_state is None else (a_sig * m + (1.0 - a_sig) * macd_sig_state)
+            out.at[idx[i], f"macd_tf{tf}"] = m
+            out.at[idx[i], f"macd_signal_tf{tf}"] = sg
+            out.at[idx[i], f"macd_hist_tf{tf}"] = m - sg
+
+        # commit at official HTF bar close (group end)
+        i_end = int(pos[-1])
+        c_end = float(close[i_end])
+        for l in ema_lens:
+            l = int(l)
+            s = ema_state[l]
+            a = ema_alpha[l]
+            ema_state[l] = c_end if s is None else (a * c_end + (1.0 - a) * s)
+
+        if last_confirmed_close is not None:
+            d_commit = c_end - float(last_confirmed_close)
+            for l in rsi_lens:
+                l = int(l)
+                avg_up, avg_dn = rsi_state[l]
+                up = max(d_commit, 0.0)
+                dn = max(-d_commit, 0.0)
+                if avg_up is not None and avg_dn is not None:
+                    rsi_state[l] = (((avg_up * (l - 1.0)) + up) / l, ((avg_dn * (l - 1.0)) + dn) / l)
+                else:
+                    buf = rsi_seed_delta[l]
+                    buf.append(d_commit)
+                    if len(buf) > l:
+                        buf.pop(0)
+                    if len(buf) == l:
+                        ups = [max(x, 0.0) for x in buf]
+                        dns = [max(-x, 0.0) for x in buf]
+                        rsi_state[l] = (float(np.mean(ups)), float(np.mean(dns)))
+
+        ef_end = c_end if macd_fast_state is None else (a_fast * c_end + (1.0 - a_fast) * macd_fast_state)
+        es_end = c_end if macd_slow_state is None else (a_slow * c_end + (1.0 - a_slow) * macd_slow_state)
+        m_end = ef_end - es_end
+        sg_end = m_end if macd_sig_state is None else (a_sig * m_end + (1.0 - a_sig) * macd_sig_state)
+        macd_fast_state, macd_slow_state, macd_sig_state = ef_end, es_end, sg_end
+
+        last_confirmed_close = c_end
+        confirmed_closes.append(c_end)
+        if len(confirmed_closes) > 2000:
+            confirmed_closes = confirmed_closes[-2000:]
+
+    return out
+
+
 def compute_tf_features(
     base: pd.DataFrame,
     tf: int,
@@ -447,6 +622,10 @@ def compute_tf_features(
     with_liquidity_sweeps: bool,
     with_market_structure: bool,
     with_orderblock_proximity: bool,
+    fvg_mode: str,
+    min_fvg_size_atr_mult: float,
+    swing_left: int,
+    swing_right: int,
 ) -> pd.DataFrame:
     tf_df = build_running_htf_frame(base, tf)
 
@@ -459,21 +638,9 @@ def compute_tf_features(
     f[f"close_tf{tf}"] = tf_df["close"]
     f[f"volume_tf{tf}"] = tf_df["volume"]
 
-    # EMA distances
-    for l in ema_lens:
-        e = ema(tf_df["close"], l)
-        f[f"ema{l}_tf{tf}"] = e
-        f[f"dist_ema{l}_tf{tf}"] = (tf_df["close"] / e) - 1.0
-
-    # RSI
-    for l in rsi_lens:
-        f[f"rsi{l}_tf{tf}"] = rsi(tf_df["close"], l)
-
-    # MACD
-    m, s, h = macd(tf_df["close"])
-    f[f"macd_tf{tf}"] = m
-    f[f"macd_signal_tf{tf}"] = s
-    f[f"macd_hist_tf{tf}"] = h
+    # Close-based families via HTF confirmed-history + one intrabar snapshot
+    close_family = compute_close_family_snapshot_states(base=base, tf=tf, ema_lens=ema_lens, rsi_lens=rsi_lens)
+    f = pd.concat([f, close_family], axis=1)
 
     # DMI/ADX family
     for l in adx_lens:
@@ -482,6 +649,9 @@ def compute_tf_features(
         f[f"minus_di{l}_tf{tf}"] = minus_di
         f[f"dx{l}_tf{tf}"] = dx
         f[f"adx{l}_tf{tf}"] = adx_v
+    prev_c = tf_df["close"].shift(1)
+    tr = pd.concat([(tf_df["high"] - tf_df["low"]), (tf_df["high"] - prev_c).abs(), (tf_df["low"] - prev_c).abs()], axis=1).max(axis=1)
+    f[f"atr14_tf{tf}"] = tr.ewm(alpha=1.0 / 14.0, adjust=False).mean()
 
     for l in mfi_lens:
         f[f"mfi{l}_tf{tf}"] = mfi(tf_df, l)
@@ -526,6 +696,10 @@ def compute_tf_features(
         with_liquidity_sweeps=with_liquidity_sweeps,
         with_market_structure=with_market_structure,
         with_orderblock_proximity=with_orderblock_proximity,
+        fvg_mode=fvg_mode,
+        min_fvg_size_atr_mult=float(min_fvg_size_atr_mult),
+        swing_left=int(swing_left),
+        swing_right=int(swing_right),
     )
     if not paf.empty:
         f = pd.concat([f, paf], axis=1)
@@ -792,6 +966,10 @@ def main() -> None:
             with_liquidity_sweeps=args.with_liquidity_sweeps and (tf in pattern_tfs),
             with_market_structure=args.with_market_structure and (tf in pattern_tfs),
             with_orderblock_proximity=args.with_orderblock_proximity and (tf in pattern_tfs),
+            fvg_mode=str(args.fvg_mode),
+            min_fvg_size_atr_mult=float(args.min_fvg_size_atr_mult),
+            swing_left=int(args.swing_left),
+            swing_right=int(args.swing_right),
         )
         tf_frames.append(tf_features.reindex(feature_table.index))
         print(f"TF={tf} done. cols={tf_features.shape[1]}")

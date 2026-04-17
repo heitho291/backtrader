@@ -64,7 +64,7 @@ def build_candidate_columns(df: pd.DataFrame) -> list[str]:
             continue
         if c.startswith(("open_tf", "high_tf", "low_tf", "close_tf", "volume_tf", "ema", "vwap_tf", "regime_")):
             continue
-        if c.startswith(("delta_", "dist_", "dist_vwap", "rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "mfi", "kdj_", "candle_", "break_", "fvg_", "session_")):
+        if c.startswith(("delta_", "dist_", "dist_vwap", "rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "mfi", "kdj_", "candle_", "break_", "fvg_", "session_", "liq_sweep_", "ms_", "bos_", "choch_", "atr_")):
             if c in {"session_hour_sin", "session_hour_cos"}:
                 continue
             out.append(c)
@@ -72,10 +72,47 @@ def build_candidate_columns(df: pd.DataFrame) -> list[str]:
 
 
 def _parse_feature_family(name: str) -> str:
-    for prefix in ("dist_", "delta_", "rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "candle_", "break_", "fvg_", "session_"):
-        if name.startswith(prefix):
+    n = str(name)
+    if n.startswith("delta_"):
+        if "mfi" in n:
+            return "delta_mfi"
+        if "kdj" in n:
+            return "delta_kdj"
+        if "adx" in n:
+            return "delta_adx"
+        if "plus_di" in n:
+            return "delta_plus_di"
+        if "minus_di" in n:
+            return "delta_minus_di"
+        if "dx" in n:
+            return "delta_dx"
+        return "delta"
+    if n.startswith("mfi"):
+        return "mfi"
+    if n.startswith("kdj_"):
+        return "kdj"
+    if n.startswith("adx"):
+        return "adx"
+    if n.startswith("plus_di"):
+        return "plus_di"
+    if n.startswith("minus_di"):
+        return "minus_di"
+    if n.startswith("dx"):
+        return "dx"
+    if n.startswith("atr_"):
+        return "atr"
+    if n.startswith("liq_sweep_"):
+        return "liq_sweep"
+    if n.startswith("ms_"):
+        return "market_structure"
+    if n.startswith("bos_"):
+        return "bos"
+    if n.startswith("choch_"):
+        return "choch"
+    for prefix in ("dist_", "rsi", "macd", "vol_z", "candle_", "break_", "fvg_", "session_"):
+        if n.startswith(prefix):
             return prefix.rstrip("_")
-    return name.split("_")[0]
+    return n.split("_")[0]
 
 
 def bin_series(s: pd.Series, bins: int, dtype) -> tuple[pd.Series, dict[str, object]]:

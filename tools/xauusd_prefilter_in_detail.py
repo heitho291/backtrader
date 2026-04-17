@@ -81,6 +81,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-random-seed", type=int, default=42)
     p.add_argument("--debug-reject-stats", action="store_true", default=False)
     p.add_argument("--debug-timing-breakdown", action="store_true", default=False)
+    p.add_argument("--label-cache-npz", type=Path, default=None)
+    p.add_argument("--min-single-pos-hits", type=int, default=2)
+    p.add_argument("--min-single-lift", type=float, default=1.01)
+    p.add_argument("--max-single-mask-count", type=int, default=0)
+    p.add_argument("--family-top-n", type=int, default=40)
+    p.add_argument("--family-split-delta-window", action="store_true", default=False)
+    p.add_argument("--include-candidates-file", type=Path, default=None)
 
     p.add_argument("--min-pos-per-week", type=float, default=1.0)
     p.add_argument("--min-main-score", type=float, default=1.0)
@@ -126,6 +133,112 @@ def _atomic_write_csv(path: Path, frame: pd.DataFrame) -> None:
         frame.to_csv(tf.name, index=False)
         tmp = Path(tf.name)
     os.replace(tmp, path)
+
+
+def _file_sig(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        st = path.stat()
+        return f"{path.resolve()}|{int(st.st_mtime_ns)}|{int(st.st_size)}"
+    except Exception:
+        return str(path)
+
+
+def _load_allowlist(path: Path | None) -> set[str] | None:
+    if path is None:
+        return None
+    txt = path.read_text(encoding="utf-8").strip()
+    if not txt:
+        return set()
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path)
+        if "candidate_key" not in df.columns:
+            raise ValueError(f"{path}: missing column candidate_key")
+        return {str(x).strip() for x in df["candidate_key"].tolist() if str(x).strip()}
+    out = []
+    for i, ln in enumerate(txt.splitlines()):
+        s = ln.strip()
+        if not s:
+            continue
+        if i == 0 and s.lower() == "candidate_key":
+            continue
+        out.append(s)
+    return set(out)
+
+
+def _candidate_family(col: str, split_delta_window: bool) -> str:
+    c = str(col)
+    if c.startswith("delta_"):
+        parts = c.split("_")
+        if split_delta_window and len(parts) > 2 and parts[1].isdigit():
+            return f"delta_{parts[1]}_{parts[2]}"
+        if "rsi" in c:
+            return "delta_rsi"
+        if "macd" in c:
+            return "delta_macd"
+        if "adx" in c:
+            return "delta_adx"
+        if "plus_di" in c:
+            return "delta_plus_di"
+        if "minus_di" in c:
+            return "delta_minus_di"
+        if "dx" in c:
+            return "delta_dx"
+        if "mfi" in c:
+            return "delta_mfi"
+        if "kdj" in c:
+            return "delta_kdj"
+        if "vol_z" in c:
+            return "delta_vol_z"
+    if "dist_ema" in c:
+        return "dist_ema"
+    if c.startswith("ema"):
+        return "ema"
+    if c.startswith("rsi"):
+        return "rsi"
+    if c.startswith("macd"):
+        return "macd"
+    if c.startswith("adx"):
+        return "adx"
+    if c.startswith("plus_di"):
+        return "plus_di"
+    if c.startswith("minus_di"):
+        return "minus_di"
+    if c.startswith("dx"):
+        return "dx"
+    if c.startswith("mfi"):
+        return "mfi"
+    if c.startswith("kdj"):
+        return "kdj"
+    if "orderblock" in c:
+        return "orderblock"
+    if "support" in c:
+        return "support"
+    if "resist" in c:
+        return "resistance"
+    if c.startswith("break_up"):
+        return "break_up"
+    if c.startswith("break_dn"):
+        return "break_dn"
+    if c.startswith("candle_"):
+        return "candle"
+    if "vol_z" in c:
+        return "vol_z"
+    if c.startswith("fvg_"):
+        return "fvg"
+    if c.startswith("liq_sweep"):
+        return "liq_sweep"
+    if c.startswith("bos_") or c.startswith("choch_") or c.startswith("ms_"):
+        return "market_structure"
+    if c.startswith("atr_"):
+        return "atr"
+    return c.split("_")[0]
+
+
+def _mask_hash_arr(mask: np.ndarray) -> str:
+    packed = np.packbits(mask.astype(np.uint8, copy=False))
+    return hashlib.sha1(packed.tobytes()).hexdigest()
 
 
 def _with_rank_context(ranked: list[dict], rank_name: str) -> list[dict]:
@@ -272,28 +385,77 @@ def main() -> None:
     tps = tps_all if bool(args.use_multi_tp) else [tps_all[0]]
     tp_w = miner.parse_tp_weights(tps, str(args.tp_weights))
 
+    cache_key_obj = {
+        "features_sig": _file_sig(args.features),
+        "tick_sig": _file_sig(args.tick_data),
+        "tick_cache_sig": _file_sig(args.tick_cache_parquet),
+        "tps": [float(x) for x in tps],
+        "tp_weights": [float(x) for x in tp_w.tolist()],
+        "use_multi_tp": bool(args.use_multi_tp),
+        "sl": float(args.sl),
+        "hold": int(args.hold),
+        "slippage_bps": float(args.slippage_bps),
+        "spread_bps": float(args.spread_bps),
+        "trail": bool(args.trail),
+        "trail_activate": float(args.trail_activate),
+        "trail_offset": float(args.trail_offset),
+        "trail_factor": float(args.trail_factor),
+        "trail_min_level": float(args.trail_min_level),
+        "include_unrealized_at_test_end": bool(args.include_unrealized_at_test_end),
+        "tick_datetime_column": str(args.tick_datetime_column),
+        "tick_price_column": str(args.tick_price_column),
+        "tick_sep": str(args.tick_sep),
+    }
+    cache_key = hashlib.sha1(json.dumps(cache_key_obj, sort_keys=True).encode("utf-8")).hexdigest()
+    loaded_cache = False
+    if args.label_cache_npz is not None and args.label_cache_npz.exists():
+        try:
+            z = np.load(args.label_cache_npz, allow_pickle=False)
+            if str(z["cache_key"].item()) == cache_key:
+                pnl = z["pnl"]
+                y = z["y"]
+                t_exit = z["t_exit"]
+                t_qual = z["t_qual"]
+                tp_hits = z["tp_hits"]
+                loaded_cache = True
+                print(f"[prefilter-cache] loaded labels from {args.label_cache_npz}")
+        except Exception as e:
+            print(f"[prefilter-cache] failed to load cache: {e}")
     t0 = time.perf_counter()
-    pnl, y, t_exit, t_qual, tp_hits = miner.simulate_multitp_trailing_pessimistic(
-        high=high,
-        low=low,
-        close=close,
-        tps=tps,
-        tp_w=tp_w,
-        tp_enabled=bool(args.use_multi_tp),
-        sl=float(args.sl),
-        hold=int(args.hold),
-        slippage_bps=float(args.slippage_bps),
-        spread_bps=float(args.spread_bps),
-        trail=bool(args.trail),
-        trail_activate=float(args.trail_activate),
-        trail_offset=float(args.trail_offset),
-        trail_factor=float(args.trail_factor),
-        trail_min_level=float(args.trail_min_level),
-        include_unrealized_at_test_end=bool(args.include_unrealized_at_test_end),
-        bar_time_ns=bar_time_ns,
-        tick_prices_all=tick_prices_all,
-        tick_minute_bounds=tick_minute_bounds,
-    )
+    if not loaded_cache:
+        pnl, y, t_exit, t_qual, tp_hits = miner.simulate_multitp_trailing_pessimistic(
+            high=high,
+            low=low,
+            close=close,
+            tps=tps,
+            tp_w=tp_w,
+            tp_enabled=bool(args.use_multi_tp),
+            sl=float(args.sl),
+            hold=int(args.hold),
+            slippage_bps=float(args.slippage_bps),
+            spread_bps=float(args.spread_bps),
+            trail=bool(args.trail),
+            trail_activate=float(args.trail_activate),
+            trail_offset=float(args.trail_offset),
+            trail_factor=float(args.trail_factor),
+            trail_min_level=float(args.trail_min_level),
+            include_unrealized_at_test_end=bool(args.include_unrealized_at_test_end),
+            bar_time_ns=bar_time_ns,
+            tick_prices_all=tick_prices_all,
+            tick_minute_bounds=tick_minute_bounds,
+        )
+        if args.label_cache_npz is not None:
+            args.label_cache_npz.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                args.label_cache_npz,
+                cache_key=np.asarray(cache_key),
+                pnl=pnl,
+                y=y,
+                t_exit=t_exit,
+                t_qual=t_qual,
+                tp_hits=tp_hits,
+            )
+            print(f"[prefilter-cache] wrote labels cache to {args.label_cache_npz}")
     timing["simulate_labels_sec"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -347,9 +509,57 @@ def main() -> None:
 
     timing["build_items_sec"] = time.perf_counter() - t0
     t0 = time.perf_counter()
-    rank_freq = _with_rank_context(sorted(items, key=lambda z: z["freq"], reverse=True), "freq")
-    rank_lift = _with_rank_context(sorted(items, key=lambda z: z["lift"], reverse=True), "lift")
-    rank_ratio = _with_rank_context(sorted(items, key=lambda z: z["ratio"], reverse=True), "ratio")
+    allow_keys = _load_allowlist(args.include_candidates_file)
+    filtered_items: list[dict] = []
+    single_rejects = {"min_pos": 0, "min_lift": 0, "mask_count": 0, "allowlist": 0}
+    for i, it in enumerate(items, start=1):
+        x = dict(it)
+        x["candidate_key"] = f"cand_{i:06d}"
+        m = np.asarray(x["mask"], dtype=bool)
+        pos_hits = int(np.sum(m[:train_idx] & (y_train == 1)))
+        mask_count = int(np.sum(m[:train_idx]))
+        if pos_hits < int(args.min_single_pos_hits):
+            single_rejects["min_pos"] += 1
+            continue
+        if float(x["lift"]) < float(args.min_single_lift):
+            single_rejects["min_lift"] += 1
+            continue
+        if int(args.max_single_mask_count) > 0 and mask_count > int(args.max_single_mask_count):
+            single_rejects["mask_count"] += 1
+            continue
+        if allow_keys is not None and str(x["candidate_key"]) not in allow_keys:
+            single_rejects["allowlist"] += 1
+            continue
+        x["_single_pos_hits"] = pos_hits
+        x["_single_mask_count"] = mask_count
+        x["_family"] = _candidate_family(str(x["col"]), bool(args.family_split_delta_window))
+        filtered_items.append(x)
+
+    # dedupe same train mask, keep lower tf / earlier
+    by_mask: dict[str, dict] = {}
+    for it in filtered_items:
+        mh = _mask_hash_arr(np.asarray(it["mask"][:train_idx], dtype=bool))
+        cur = by_mask.get(mh)
+        if cur is None:
+            by_mask[mh] = it
+            continue
+        tf_cur = int(miner._parse_feature_meta(str(cur["col"])).get("tf") or 10**9)
+        tf_new = int(miner._parse_feature_meta(str(it["col"])).get("tf") or 10**9)
+        if tf_new < tf_cur:
+            by_mask[mh] = it
+    filtered_items = list(by_mask.values())
+
+    fam_top: list[dict] = []
+    fam_groups: dict[str, list[dict]] = {}
+    for it in filtered_items:
+        fam_groups.setdefault(str(it["_family"]), []).append(it)
+    for fam, arr in fam_groups.items():
+        arr = sorted(arr, key=lambda z: (-float(z["lift"]), -int(z["_single_pos_hits"]), int(z["_single_mask_count"])))
+        fam_top.extend(arr[: int(args.family_top_n)])
+
+    rank_lift = _with_rank_context(sorted(fam_top, key=lambda z: z["lift"], reverse=True), "lift")
+    rank_freq: list[dict] = []
+    rank_ratio: list[dict] = []
     timing["ranking_prep_sec"] = time.perf_counter() - t0
 
     if bool(args.debug_timing_breakdown):
@@ -361,10 +571,12 @@ def main() -> None:
         non_bin_items = len(items) - bin_items
         print(
             f"[prefilter-items] cols={len(cols)} items={len(items)} "
-            f"rank_freq={len(rank_freq)} rank_lift={len(rank_lift)} rank_ratio={len(rank_ratio)} "
+            f"filtered_items={len(filtered_items)} family_top_pool={len(rank_lift)} "
             f"dist_items={dist_items} non_dist_items={non_dist_items} "
             f"binary_items={bin_items} non_binary_items={non_bin_items}"
         )
+        if bool(args.debug_reject_stats):
+            print("[prefilter-single-rejects] " + " ".join([f"{k}={v}" for k, v in single_rejects.items()]))
 
     workers = max(1, int(os.cpu_count() or 1)) if str(args.workers).lower() == "auto" else max(1, int(args.workers))
 
@@ -452,8 +664,7 @@ def main() -> None:
         return (float(r["test_ratio"]), int(r["test_pos_hits"]), -int(r["test_neg_hits"]))
 
     def _mask_hash(mask: np.ndarray) -> str:
-        packed = np.packbits(mask.astype(np.uint8, copy=False))
-        return hashlib.sha1(packed.tobytes()).hexdigest()
+        return _mask_hash_arr(mask)
 
     def evaluate_combo(combo: Tuple[int, ...], pool_items: List[dict], parent: dict | None = None) -> dict | None:
         conds = [pool_items[i] for i in combo]
@@ -515,6 +726,20 @@ def main() -> None:
     ]
 
     def _rules_to_rows(rules: list[dict]) -> list[dict]:
+        def _decode_interval(col: str, lo: int, hi: int) -> str:
+            m = meta.get(col, {}) if isinstance(meta, dict) else {}
+            edges = m.get("bin_edges", [])
+            eff = int(m.get("effective_bin_count", 0) or 0)
+            if not isinstance(edges, list) or eff <= 0 or lo < 1 or hi > eff or lo > hi:
+                raise ValueError(f"Undecodable interval for {col}: lo={lo} hi={hi} eff={eff}")
+            lo_pair = edges[lo - 1]
+            hi_pair = edges[hi - 1]
+            if not (isinstance(lo_pair, list) and isinstance(hi_pair, list) and len(lo_pair) == 2 and len(hi_pair) == 2):
+                raise ValueError(f"Invalid bin_edges for {col}")
+            lo_raw = float(lo_pair[0])
+            hi_raw = float(hi_pair[1])
+            return f"{col} in [{lo_raw:.6g}, {hi_raw:.6g}] (bin[{lo}..{hi}])"
+
         rows: list[dict] = []
         for i, r in enumerate(rules, start=1):
             decoded_parts = []
@@ -526,11 +751,9 @@ def main() -> None:
                 ftype = str(meta.get(col, {}).get("feature_type", "unknown"))
                 if op == "==":
                     if "lo_bin" in c and "hi_bin" in c and int(c["lo_bin"]) != int(c["hi_bin"]):
-                        lo_bin = float(c["lo_bin"])
-                        hi_bin = float(c["hi_bin"])
-                        lo_txt, _ = miner.decode_bin_condition_verbose(col, lo_bin, meta)
-                        hi_txt, _ = miner.decode_bin_condition_verbose(col, hi_bin, meta)
-                        decoded_parts.append(f"{col} in [{int(lo_bin)}, {int(hi_bin)}] ({lo_txt}; {hi_txt})")
+                        lo_bin = int(c["lo_bin"])
+                        hi_bin = int(c["hi_bin"])
+                        decoded_parts.append(_decode_interval(col, lo_bin, hi_bin))
                     else:
                         decoded_parts.append(miner.decode_bin_condition(col, val, meta))
                 else:
@@ -561,6 +784,17 @@ def main() -> None:
             })
         return rows
 
+    def _validate_rows(rows: list[dict]) -> None:
+        if not rows:
+            return
+        keys0 = set(rows[0].keys())
+        for i, r in enumerate(rows, start=1):
+            if set(r.keys()) != keys0:
+                raise ValueError(f"CSV row key mismatch at row {i}")
+            txt = str(r.get("rule_human", ""))
+            if txt.count("(") != txt.count(")"):
+                raise ValueError(f"rule_human parentheses mismatch at row {i}: {txt!r}")
+
     def _dedupe_mask(rows: list[dict]) -> list[dict]:
         buckets: dict[tuple[int, int, int, int], dict[str, dict]] = {}
         for r in rows:
@@ -587,6 +821,7 @@ def main() -> None:
         rules_only = {"version": 2, "rules": valid_pool}
         _atomic_write_text(args.out_rules_json, json.dumps(rules_only, ensure_ascii=False, indent=2))
         rows = _rules_to_rows(valid_pool[: int(args.top_paths)])
+        _validate_rows(rows)
         if rows:
             _atomic_write_csv(args.out_rules_csv, pd.DataFrame(rows))
         else:
@@ -600,13 +835,13 @@ def main() -> None:
             unlocked_next = unlocked + int(args.step_size)
             pool = _build_unlocked_pool(
                 miner_mod=miner,
-                rank_lists=[rank_freq, rank_lift, rank_ratio],
+                rank_lists=[rank_lift],
                 all_candidate_cols=cols,
                 unlocked_next=unlocked_next,
                 step_size=int(args.step_size),
-                binary_cap_per_list_block=int(args.binary_cap_per_list_block),
+                binary_cap_per_list_block=10 ** 9,
                 binary_anchor_lookahead_blocks=int(args.binary_anchor_lookahead_blocks),
-                binary_cap_per_block=int(args.binary_cap_per_block),
+                binary_cap_per_block=10 ** 9,
             )
             if not pool:
                 break
@@ -651,6 +886,12 @@ def main() -> None:
                         if 2 <= len(combo) <= int(args.max_path_conds):
                             mut_combos.append((combo, p))
                 rng.shuffle(mut_combos)
+            combos_total_free = 0
+            rmax = min(int(args.max_path_conds), len(idxs))
+            for rr in range(2, rmax + 1):
+                combos_total_free += math.comb(len(idxs), rr)
+            combos_total_parent_extensions = int(len(mut_combos))
+            combos_total = int(combos_total_free + combos_total_parent_extensions)
 
             hist: list[tuple[int, float, tuple[float, int, int]]] = []
             for spec in shard_specs:
@@ -704,7 +945,9 @@ def main() -> None:
                 progress_state = {
                     "round": int(unlocked_next),
                     "pool_size": int(len(pool)),
-                    "combos_total": int(len(shard_specs) * max(1, batch_eff)),
+                    "combos_total_free": int(combos_total_free),
+                    "combos_total_parent_extensions": int(combos_total_parent_extensions),
+                    "combos_total": int(combos_total),
                     "tested": int(tested),
                     "valid": int(valid_round),
                     "batch_size": int(batch_eff),
@@ -716,7 +959,9 @@ def main() -> None:
                 _save_progress(valid_pool, progress_state)
                 print(
                     f"[prefilter-progress] round={unlocked_next} phase={'A' if phase_a else 'B'} "
-                    f"pool_size={len(pool)} combos_total={progress_state['combos_total']} "
+                    f"pool_size={len(pool)} combos_total_free={progress_state['combos_total_free']} "
+                    f"combos_total_parent_extensions={progress_state['combos_total_parent_extensions']} "
+                    f"combos_total={progress_state['combos_total']} "
                     f"tested={tested} valid={valid_round} batch_size={batch_eff} workers={workers_eff}"
                 )
                 if bool(args.debug_reject_stats):
@@ -738,7 +983,10 @@ def main() -> None:
                         break
 
             if not valid_pool:
-                break
+                unlocked = unlocked_next
+                if unlocked >= len(rank_lift):
+                    break
+                continue
             best_paths = list(valid_pool)
             cur_best = float(best_paths[0]["ratio"]) if best_paths else -np.inf
             if cur_best <= prev_best + 1e-12:
@@ -862,6 +1110,7 @@ def main() -> None:
     _atomic_write_text(args.out_rules_json, json.dumps(out_json, ensure_ascii=False, indent=2))
 
     rows = _rules_to_rows(best_paths)
+    _validate_rows(rows)
     if rows:
         _atomic_write_csv(args.out_rules_csv, pd.DataFrame(rows))
     else:

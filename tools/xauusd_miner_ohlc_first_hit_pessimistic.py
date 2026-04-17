@@ -455,7 +455,7 @@ def build_candidate_features(df: pd.DataFrame, allow_absolute_price: bool, max_f
 
         if c in {"session_hour_sin", "session_hour_cos"}:
             continue
-        if c.startswith("delta_") or c.startswith("dist_vwap") or c.startswith("dist_") or c.startswith(("rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "mfi", "kdj_", "candle_", "break_", "fvg_", "session_")):
+        if c.startswith("delta_") or c.startswith("dist_vwap") or c.startswith("dist_") or c.startswith(("rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "mfi", "kdj_", "candle_", "break_", "fvg_", "session_", "liq_sweep_", "ms_", "bos_", "choch_", "atr_")):
             cand.append(c)
 
     if max_features > 0:
