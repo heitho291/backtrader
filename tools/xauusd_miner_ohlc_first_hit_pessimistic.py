@@ -455,7 +455,7 @@ def build_candidate_features(df: pd.DataFrame, allow_absolute_price: bool, max_f
 
         if c in {"session_hour_sin", "session_hour_cos"}:
             continue
-        if c.startswith("delta_") or c.startswith("dist_vwap") or c.startswith("dist_") or c.startswith(("rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "mfi", "kdj_", "candle_", "break_", "fvg_", "session_", "liq_sweep_", "ms_", "bos_", "choch_", "atr_")):
+        if c.startswith("delta_") or c.startswith("dist_vwap") or c.startswith("dist_") or c.startswith(("rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "mfi", "kdj_", "candle_", "break_", "fvg_", "session_", "liq_sweep_", "ms_", "bos_", "choch_", "atr")):
             cand.append(c)
 
     if max_features > 0:
@@ -498,6 +498,18 @@ def _parse_feature_meta(col: str) -> dict[str, object]:
         tf = int(m.group(3))
         return {"family": family, "scale": scale, "tf": tf, "delta_w": delta_w}
 
+    m = re.match(r"^(mfi)(\d+)_tf(\d+)$", base)
+    if m:
+        return {"family": "mfi", "scale": int(m.group(2)) * int(m.group(3)), "tf": int(m.group(3)), "delta_w": delta_w}
+
+    m = re.match(r"^kdj_[kdj](\d+)_tf(\d+)$", base)
+    if m:
+        return {"family": "kdj", "scale": int(m.group(1)) * int(m.group(2)), "tf": int(m.group(2)), "delta_w": delta_w}
+
+    m = re.match(r"^atr(\d+)_tf(\d+)$", base)
+    if m:
+        return {"family": "atr", "scale": int(m.group(1)) * int(m.group(2)), "tf": int(m.group(2)), "delta_w": delta_w}
+
     m = re.match(r"^(macd(?:_signal|_hist)?)_tf(\d+)$", base)
     if m:
         family = m.group(1)
@@ -526,6 +538,15 @@ def _parse_feature_meta(col: str) -> dict[str, object]:
         tf = int(m.group(2))
         scale = tf
         return {"family": family, "scale": scale, "tf": tf, "delta_w": delta_w}
+
+    m = re.match(r"^liq_sweep_(high20|low20)(?:_bars_since)?_tf(\d+)$", base)
+    if m:
+        return {"family": "liq_sweep", "scale": int(m.group(2)), "tf": int(m.group(2)), "delta_w": delta_w}
+
+    m = re.match(r"^(ms_|bos_|choch_).+_tf(\d+)$", base)
+    if m:
+        fam = "market_structure" if m.group(1) == "ms_" else m.group(1).rstrip("_")
+        return {"family": fam, "scale": int(m.group(2)), "tf": int(m.group(2)), "delta_w": delta_w}
 
     if base.startswith("session_"):
         return {"family": base, "scale": None, "tf": None, "delta_w": delta_w}

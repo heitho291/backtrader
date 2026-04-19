@@ -88,6 +88,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--family-top-n", type=int, default=40)
     p.add_argument("--family-split-delta-window", action="store_true", default=False)
     p.add_argument("--include-candidates-file", type=Path, default=None)
+    p.add_argument("--out-candidates-csv", type=Path, default=None)
 
     p.add_argument("--min-pos-per-week", type=float, default=1.0)
     p.add_argument("--min-main-score", type=float, default=1.0)
@@ -231,7 +232,7 @@ def _candidate_family(col: str, split_delta_window: bool) -> str:
         return "liq_sweep"
     if c.startswith("bos_") or c.startswith("choch_") or c.startswith("ms_"):
         return "market_structure"
-    if c.startswith("atr_"):
+    if c.startswith("atr"):
         return "atr"
     return c.split("_")[0]
 
@@ -514,6 +515,7 @@ def main() -> None:
     single_rejects = {"min_pos": 0, "min_lift": 0, "mask_count": 0, "allowlist": 0}
     for i, it in enumerate(items, start=1):
         x = dict(it)
+        # Stable candidate key assignment from raw item build order (before dedupe/top-n).
         x["candidate_key"] = f"cand_{i:06d}"
         m = np.asarray(x["mask"], dtype=bool)
         pos_hits = int(np.sum(m[:train_idx] & (y_train == 1)))
@@ -556,6 +558,25 @@ def main() -> None:
     for fam, arr in fam_groups.items():
         arr = sorted(arr, key=lambda z: (-float(z["lift"]), -int(z["_single_pos_hits"]), int(z["_single_mask_count"])))
         fam_top.extend(arr[: int(args.family_top_n)])
+
+    if args.out_candidates_csv is not None:
+        cand_rows = []
+        for it in filtered_items:
+            cand_rows.append({
+                "candidate_key": str(it["candidate_key"]),
+                "col": str(it["col"]),
+                "op": str(it["op"]),
+                "value": float(it["value"]),
+                "family": str(it["_family"]),
+                "lift": float(it["lift"]),
+                "ratio": float(it["ratio"]),
+                "_single_pos_hits": int(it["_single_pos_hits"]),
+                "_single_mask_count": int(it["_single_mask_count"]),
+                "binary": int(bool(it.get("binary", False))),
+                "kept_after_family_topn": int(any(str(it["candidate_key"]) == str(z.get("candidate_key")) for z in fam_top)),
+            })
+        _atomic_write_csv(args.out_candidates_csv, pd.DataFrame(cand_rows))
+        print(f"[prefilter-candidates] wrote CSV: {args.out_candidates_csv} rows={len(cand_rows)}")
 
     rank_lift = _with_rank_context(sorted(fam_top, key=lambda z: z["lift"], reverse=True), "lift")
     rank_freq: list[dict] = []
@@ -894,6 +915,7 @@ def main() -> None:
             combos_total = int(combos_total_free + combos_total_parent_extensions)
 
             hist: list[tuple[int, float, tuple[float, int, int]]] = []
+            executor_cache: dict[int, concurrent.futures.ThreadPoolExecutor] = {}
             for spec in shard_specs:
                 est_mem_gb = (batch_eff * max(1, len(pool)) * 8.0) / (1024 ** 3)
                 target_mem_gb = max(0.5, float(args.memory_soft_limit_gb) * 0.75)
@@ -927,12 +949,15 @@ def main() -> None:
                         if rr is not None:
                             out_batch.append(rr)
                 else:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers_eff) as ex:
-                        futs = [ex.submit(evaluate_combo, cb, pool, parents[i]) for i, cb in enumerate(combos)]
-                        for f in futs:
-                            rr = f.result()
-                            if rr is not None:
-                                out_batch.append(rr)
+                    ex = executor_cache.get(int(workers_eff))
+                    if ex is None:
+                        ex = concurrent.futures.ThreadPoolExecutor(max_workers=int(workers_eff))
+                        executor_cache[int(workers_eff)] = ex
+                    futs = [ex.submit(evaluate_combo, cb, pool, parents[i]) for i, cb in enumerate(combos)]
+                    for f in futs:
+                        rr = f.result()
+                        if rr is not None:
+                            out_batch.append(rr)
                 tested += len(combos)
                 valid_round += len(out_batch)
                 valid_pool.extend(out_batch)
@@ -981,6 +1006,9 @@ def main() -> None:
                     if improve_pct < float(args.early_stop_avg_improve_pct) and not a1_improved:
                         print("[prefilter-progress] early stop in round.")
                         break
+
+            for ex in executor_cache.values():
+                ex.shutdown(wait=True)
 
             if not valid_pool:
                 unlocked = unlocked_next

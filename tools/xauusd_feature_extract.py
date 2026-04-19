@@ -605,6 +605,75 @@ def compute_close_family_snapshot_states(
     return out
 
 
+def compute_ohlcv_family_snapshot_states(
+    base: pd.DataFrame,
+    tf: int,
+    adx_lens: list[int],
+    mfi_lens: list[int],
+    kdj_lens: list[int],
+) -> pd.DataFrame:
+    """OHLCV-family snapshot states using confirmed HTF bars + one live snapshot."""
+    idx = base.index
+    out = pd.DataFrame(index=idx)
+    bucket = pd.Series(idx.floor(f"{tf}min"), index=idx)
+    grp = bucket.ne(bucket.shift(1)).cumsum().to_numpy(dtype=np.int64)
+    open_a = pd.to_numeric(base["open"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    high_a = pd.to_numeric(base["high"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    low_a = pd.to_numeric(base["low"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    close_a = pd.to_numeric(base["close"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    vol_a = pd.to_numeric(base["volume"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+
+    confirmed: list[dict[str, float]] = []
+    keep_max = 600
+    for g in np.unique(grp).tolist():
+        pos = np.where(grp == g)[0]
+        if pos.size == 0:
+            continue
+        g_open = float(open_a[int(pos[0])])
+        g_high = -np.inf
+        g_low = np.inf
+        g_vol = 0.0
+        g_close = np.nan
+        for i in pos.tolist():
+            g_high = max(g_high, float(high_a[i]))
+            g_low = min(g_low, float(low_a[i]))
+            g_close = float(close_a[i])
+            g_vol += float(vol_a[i]) if np.isfinite(vol_a[i]) else 0.0
+            cur = {"open": g_open, "high": g_high, "low": g_low, "close": g_close, "volume": g_vol}
+            bars = confirmed + [cur]
+            tdf = pd.DataFrame(bars)
+
+            for l in adx_lens:
+                pdi, mdi, dxv, adxv = dmi_components(tdf, int(l))
+                out.at[idx[i], f"plus_di{int(l)}_tf{tf}"] = float(pdi.iloc[-1])
+                out.at[idx[i], f"minus_di{int(l)}_tf{tf}"] = float(mdi.iloc[-1])
+                out.at[idx[i], f"dx{int(l)}_tf{tf}"] = float(dxv.iloc[-1])
+                out.at[idx[i], f"adx{int(l)}_tf{tf}"] = float(adxv.iloc[-1])
+
+            for l in mfi_lens:
+                out.at[idx[i], f"mfi{int(l)}_tf{tf}"] = float(mfi(tdf, int(l)).iloc[-1])
+
+            for l in kdj_lens:
+                k, d, j = kdj(tdf, period=int(l), smooth=3)
+                out.at[idx[i], f"kdj_k{int(l)}_tf{tf}"] = float(k.iloc[-1])
+                out.at[idx[i], f"kdj_d{int(l)}_tf{tf}"] = float(d.iloc[-1])
+                out.at[idx[i], f"kdj_j{int(l)}_tf{tf}"] = float(j.iloc[-1])
+
+            prev_c = tdf["close"].shift(1)
+            tr = pd.concat([(tdf["high"] - tdf["low"]), (tdf["high"] - prev_c).abs(), (tdf["low"] - prev_c).abs()], axis=1).max(axis=1)
+            out.at[idx[i], f"atr14_tf{tf}"] = float(tr.ewm(alpha=1.0 / 14.0, adjust=False).mean().iloc[-1])
+            vol_ma = tdf["volume"].rolling(50).mean().iloc[-1]
+            vol_std = tdf["volume"].rolling(50).std().iloc[-1]
+            vz = (g_vol - vol_ma) / vol_std if np.isfinite(vol_std) and vol_std != 0 else np.nan
+            out.at[idx[i], f"vol_z_tf{tf}"] = float(vz) if np.isfinite(vz) else np.nan
+
+        confirmed.append({"open": g_open, "high": g_high, "low": g_low, "close": g_close, "volume": g_vol})
+        if len(confirmed) > keep_max:
+            confirmed = confirmed[-keep_max:]
+
+    return out
+
+
 def compute_tf_features(
     base: pd.DataFrame,
     tf: int,
@@ -642,30 +711,15 @@ def compute_tf_features(
     close_family = compute_close_family_snapshot_states(base=base, tf=tf, ema_lens=ema_lens, rsi_lens=rsi_lens)
     f = pd.concat([f, close_family], axis=1)
 
-    # DMI/ADX family
-    for l in adx_lens:
-        plus_di, minus_di, dx, adx_v = dmi_components(tf_df, l)
-        f[f"plus_di{l}_tf{tf}"] = plus_di
-        f[f"minus_di{l}_tf{tf}"] = minus_di
-        f[f"dx{l}_tf{tf}"] = dx
-        f[f"adx{l}_tf{tf}"] = adx_v
-    prev_c = tf_df["close"].shift(1)
-    tr = pd.concat([(tf_df["high"] - tf_df["low"]), (tf_df["high"] - prev_c).abs(), (tf_df["low"] - prev_c).abs()], axis=1).max(axis=1)
-    f[f"atr14_tf{tf}"] = tr.ewm(alpha=1.0 / 14.0, adjust=False).mean()
-
-    for l in mfi_lens:
-        f[f"mfi{l}_tf{tf}"] = mfi(tf_df, l)
-
-    for l in kdj_lens:
-        k, d, j = kdj(tf_df, period=l, smooth=3)
-        f[f"kdj_k{l}_tf{tf}"] = k
-        f[f"kdj_d{l}_tf{tf}"] = d
-        f[f"kdj_j{l}_tf{tf}"] = j
-
-    # Volume z-score
-    vol_ma = tf_df["volume"].rolling(50).mean()
-    vol_std = tf_df["volume"].rolling(50).std()
-    f[f"vol_z_tf{tf}"] = (tf_df["volume"] - vol_ma) / vol_std.replace(0, np.nan)
+    # OHLCV-based families via same confirmed+snapshot architecture
+    ohlcv_family = compute_ohlcv_family_snapshot_states(
+        base=base,
+        tf=tf,
+        adx_lens=adx_lens,
+        mfi_lens=mfi_lens,
+        kdj_lens=kdj_lens,
+    )
+    f = pd.concat([f, ohlcv_family], axis=1)
 
     # Support/resistance distances
     for lb in support_lbs:
@@ -786,8 +840,8 @@ def miner_feature_usage(df: pd.DataFrame) -> dict[str, object]:
     kept_patterns = {
         "dist_vwap": re.compile(r"^dist_vwap"),
         "dist_generic": re.compile(r"^dist_"),
-        "indicator_family": re.compile(r"^(rsi|adx|plus_di|minus_di|dx|macd|vol_z)"),
-        "price_action_family": re.compile(r"^(candle_|break_|fvg_|session_)"),
+        "indicator_family": re.compile(r"^(rsi|adx|plus_di|minus_di|dx|macd|vol_z|mfi|kdj_|atr)"),
+        "price_action_family": re.compile(r"^(candle_|break_|fvg_|session_|liq_sweep_|bos_|choch_|ms_)"),
         "delta_family": re.compile(r"^delta_"),
     }
 
@@ -1064,3 +1118,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

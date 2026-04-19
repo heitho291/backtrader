@@ -64,7 +64,7 @@ def build_candidate_columns(df: pd.DataFrame) -> list[str]:
             continue
         if c.startswith(("open_tf", "high_tf", "low_tf", "close_tf", "volume_tf", "ema", "vwap_tf", "regime_")):
             continue
-        if c.startswith(("delta_", "dist_", "dist_vwap", "rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "mfi", "kdj_", "candle_", "break_", "fvg_", "session_", "liq_sweep_", "ms_", "bos_", "choch_", "atr_")):
+        if c.startswith(("delta_", "dist_", "dist_vwap", "rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "mfi", "kdj_", "candle_", "break_", "fvg_", "session_", "liq_sweep_", "ms_", "bos_", "choch_", "atr")):
             if c in {"session_hour_sin", "session_hour_cos"}:
                 continue
             out.append(c)
@@ -99,7 +99,7 @@ def _parse_feature_family(name: str) -> str:
         return "minus_di"
     if n.startswith("dx"):
         return "dx"
-    if n.startswith("atr_"):
+    if n.startswith("atr"):
         return "atr"
     if n.startswith("liq_sweep_"):
         return "liq_sweep"
