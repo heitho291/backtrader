@@ -10,6 +10,7 @@ Input format (your XAUUSD.txt):
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import gzip
 import json
@@ -94,6 +95,7 @@ def parse_args() -> argparse.Namespace:
                    help="Output path stem or full filename; extension is adjusted by --output-format")
     p.add_argument("--output-format", choices=["csv_gz", "parquet"], default="csv_gz",
                    help="Write exactly one features file format per run")
+    p.add_argument("--tf-workers", type=int, default=1, help="Parallel workers for per-TF feature computation (1=off)")
     p.add_argument("--out-summary", type=Path, default=Path("feature_scan_summary.json"),
                    help="Summary JSON path; set to false/none to skip summary writing")
     p.add_argument("--drop-warmup-rows", action="store_true", default=True)
@@ -501,7 +503,15 @@ def compute_close_family_snapshot_states(
     close = pd.to_numeric(base["close"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
     bucket = pd.Series(idx.floor(f"{tf}min"), index=idx)
     grp = bucket.ne(bucket.shift(1)).cumsum().to_numpy(dtype=np.int64)
-    out = pd.DataFrame(index=idx)
+    col_arrays: dict[str, np.ndarray] = {}
+    for l in ema_lens:
+        col_arrays[f"ema{int(l)}_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+        col_arrays[f"dist_ema{int(l)}_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+    for l in rsi_lens:
+        col_arrays[f"rsi{int(l)}_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+    col_arrays[f"macd_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+    col_arrays[f"macd_signal_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+    col_arrays[f"macd_hist_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
 
     ema_state: dict[int, float | None] = {int(l): None for l in ema_lens}
     ema_alpha: dict[int, float] = {int(l): (2.0 / (int(l) + 1.0)) for l in ema_lens}
@@ -532,8 +542,8 @@ def compute_close_family_snapshot_states(
                 else:
                     a = ema_alpha[l]
                     ema_snap = (a * c) + ((1.0 - a) * s)
-                out.at[idx[i], f"ema{l}_tf{tf}"] = ema_snap
-                out.at[idx[i], f"dist_ema{l}_tf{tf}"] = (c / ema_snap) - 1.0 if np.isfinite(ema_snap) and ema_snap != 0 else np.nan
+                col_arrays[f"ema{l}_tf{tf}"][i] = ema_snap
+                col_arrays[f"dist_ema{l}_tf{tf}"][i] = (c / ema_snap) - 1.0 if np.isfinite(ema_snap) and ema_snap != 0 else np.nan
 
             for l in rsi_lens:
                 l = int(l)
@@ -546,22 +556,22 @@ def compute_close_family_snapshot_states(
                     dn_s = ((avg_dn * (l - 1.0)) + dn) / l
                     rs = up_s / dn_s if dn_s > 0 else np.inf
                     rsi_v = 100.0 - (100.0 / (1.0 + rs))
-                    out.at[idx[i], f"rsi{l}_tf{tf}"] = rsi_v
+                    col_arrays[f"rsi{l}_tf{tf}"][i] = rsi_v
                 else:
                     if len(confirmed_closes) >= 1:
                         tmp = pd.Series(confirmed_closes + [c])
-                        out.at[idx[i], f"rsi{l}_tf{tf}"] = float(rsi(tmp, l).iloc[-1])
+                        col_arrays[f"rsi{l}_tf{tf}"][i] = float(rsi(tmp, l).iloc[-1])
                     else:
-                        out.at[idx[i], f"rsi{l}_tf{tf}"] = np.nan
+                        col_arrays[f"rsi{l}_tf{tf}"][i] = np.nan
 
             # MACD snapshot
             ef = c if macd_fast_state is None else (a_fast * c + (1.0 - a_fast) * macd_fast_state)
             es = c if macd_slow_state is None else (a_slow * c + (1.0 - a_slow) * macd_slow_state)
             m = ef - es
             sg = m if macd_sig_state is None else (a_sig * m + (1.0 - a_sig) * macd_sig_state)
-            out.at[idx[i], f"macd_tf{tf}"] = m
-            out.at[idx[i], f"macd_signal_tf{tf}"] = sg
-            out.at[idx[i], f"macd_hist_tf{tf}"] = m - sg
+            col_arrays[f"macd_tf{tf}"][i] = m
+            col_arrays[f"macd_signal_tf{tf}"][i] = sg
+            col_arrays[f"macd_hist_tf{tf}"][i] = m - sg
 
         # commit at official HTF bar close (group end)
         i_end = int(pos[-1])
@@ -602,7 +612,7 @@ def compute_close_family_snapshot_states(
         if len(confirmed_closes) > 2000:
             confirmed_closes = confirmed_closes[-2000:]
 
-    return out
+    return pd.DataFrame(col_arrays, index=idx)
 
 
 def compute_ohlcv_family_snapshot_states(
@@ -614,7 +624,21 @@ def compute_ohlcv_family_snapshot_states(
 ) -> pd.DataFrame:
     """OHLCV-family snapshot states using confirmed HTF bars + one live snapshot."""
     idx = base.index
-    out = pd.DataFrame(index=idx)
+    n = len(idx)
+    col_arrays: dict[str, np.ndarray] = {}
+    for l in adx_lens:
+        col_arrays[f"plus_di{int(l)}_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+        col_arrays[f"minus_di{int(l)}_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+        col_arrays[f"dx{int(l)}_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+        col_arrays[f"adx{int(l)}_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+    for l in mfi_lens:
+        col_arrays[f"mfi{int(l)}_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+    for l in kdj_lens:
+        col_arrays[f"kdj_k{int(l)}_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+        col_arrays[f"kdj_d{int(l)}_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+        col_arrays[f"kdj_j{int(l)}_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+    col_arrays[f"atr14_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
+    col_arrays[f"vol_z_tf{tf}"] = np.full(n, np.nan, dtype=np.float64)
     bucket = pd.Series(idx.floor(f"{tf}min"), index=idx)
     grp = bucket.ne(bucket.shift(1)).cumsum().to_numpy(dtype=np.int64)
     open_a = pd.to_numeric(base["open"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
@@ -645,33 +669,33 @@ def compute_ohlcv_family_snapshot_states(
 
             for l in adx_lens:
                 pdi, mdi, dxv, adxv = dmi_components(tdf, int(l))
-                out.at[idx[i], f"plus_di{int(l)}_tf{tf}"] = float(pdi.iloc[-1])
-                out.at[idx[i], f"minus_di{int(l)}_tf{tf}"] = float(mdi.iloc[-1])
-                out.at[idx[i], f"dx{int(l)}_tf{tf}"] = float(dxv.iloc[-1])
-                out.at[idx[i], f"adx{int(l)}_tf{tf}"] = float(adxv.iloc[-1])
+                col_arrays[f"plus_di{int(l)}_tf{tf}"][i] = float(pdi.iloc[-1])
+                col_arrays[f"minus_di{int(l)}_tf{tf}"][i] = float(mdi.iloc[-1])
+                col_arrays[f"dx{int(l)}_tf{tf}"][i] = float(dxv.iloc[-1])
+                col_arrays[f"adx{int(l)}_tf{tf}"][i] = float(adxv.iloc[-1])
 
             for l in mfi_lens:
-                out.at[idx[i], f"mfi{int(l)}_tf{tf}"] = float(mfi(tdf, int(l)).iloc[-1])
+                col_arrays[f"mfi{int(l)}_tf{tf}"][i] = float(mfi(tdf, int(l)).iloc[-1])
 
             for l in kdj_lens:
                 k, d, j = kdj(tdf, period=int(l), smooth=3)
-                out.at[idx[i], f"kdj_k{int(l)}_tf{tf}"] = float(k.iloc[-1])
-                out.at[idx[i], f"kdj_d{int(l)}_tf{tf}"] = float(d.iloc[-1])
-                out.at[idx[i], f"kdj_j{int(l)}_tf{tf}"] = float(j.iloc[-1])
+                col_arrays[f"kdj_k{int(l)}_tf{tf}"][i] = float(k.iloc[-1])
+                col_arrays[f"kdj_d{int(l)}_tf{tf}"][i] = float(d.iloc[-1])
+                col_arrays[f"kdj_j{int(l)}_tf{tf}"][i] = float(j.iloc[-1])
 
             prev_c = tdf["close"].shift(1)
             tr = pd.concat([(tdf["high"] - tdf["low"]), (tdf["high"] - prev_c).abs(), (tdf["low"] - prev_c).abs()], axis=1).max(axis=1)
-            out.at[idx[i], f"atr14_tf{tf}"] = float(tr.ewm(alpha=1.0 / 14.0, adjust=False).mean().iloc[-1])
+            col_arrays[f"atr14_tf{tf}"][i] = float(tr.ewm(alpha=1.0 / 14.0, adjust=False).mean().iloc[-1])
             vol_ma = tdf["volume"].rolling(50).mean().iloc[-1]
             vol_std = tdf["volume"].rolling(50).std().iloc[-1]
             vz = (g_vol - vol_ma) / vol_std if np.isfinite(vol_std) and vol_std != 0 else np.nan
-            out.at[idx[i], f"vol_z_tf{tf}"] = float(vz) if np.isfinite(vz) else np.nan
+            col_arrays[f"vol_z_tf{tf}"][i] = float(vz) if np.isfinite(vz) else np.nan
 
         confirmed.append({"open": g_open, "high": g_high, "low": g_low, "close": g_close, "volume": g_vol})
         if len(confirmed) > keep_max:
             confirmed = confirmed[-keep_max:]
 
-    return out
+    return pd.DataFrame(col_arrays, index=idx)
 
 
 def compute_tf_features(
@@ -759,6 +783,46 @@ def compute_tf_features(
         f = pd.concat([f, paf], axis=1)
 
     return f
+
+
+def _compute_tf_features_task(params: tuple) -> tuple[int, pd.DataFrame]:
+    (
+        base,
+        tf,
+        e_l,
+        r_l,
+        a_l,
+        mfi_lens,
+        kdj_lens,
+        support_lbs,
+        with_vwap,
+        breakout_lbs,
+        with_candle_patterns,
+        with_breakout_features,
+        with_fvg_features,
+        with_liquidity_sweeps,
+        with_market_structure,
+        with_orderblock_proximity,
+        fvg_mode,
+        min_fvg_size_atr_mult,
+        swing_left,
+        swing_right,
+    ) = params
+    df = compute_tf_features(
+        base, tf, e_l, r_l, a_l, mfi_lens, kdj_lens, support_lbs, with_vwap,
+        breakout_lbs=breakout_lbs,
+        with_candle_patterns=with_candle_patterns,
+        with_breakout_features=with_breakout_features,
+        with_fvg_features=with_fvg_features,
+        with_liquidity_sweeps=with_liquidity_sweeps,
+        with_market_structure=with_market_structure,
+        with_orderblock_proximity=with_orderblock_proximity,
+        fvg_mode=fvg_mode,
+        min_fvg_size_atr_mult=min_fvg_size_atr_mult,
+        swing_left=swing_left,
+        swing_right=swing_right,
+    )
+    return int(tf), df
 
 
 
@@ -1003,30 +1067,66 @@ def main() -> None:
     feature_table["volume"] = base["volume"].to_numpy()
 
     tf_frames = []
-    for tf in tfs:
-        print(f"Computing TF={tf} ...")
-        if tf in high_tfs:
-            e_l, r_l, a_l = ema_lens_high, rsi_lens_high, adx_lens_high
-        elif tf in mid_tfs:
-            e_l, r_l, a_l = ema_lens_mid, rsi_lens_mid, adx_lens_mid
-        else:
-            e_l, r_l, a_l = ema_lens_low, rsi_lens_low, adx_lens_low
-        tf_features = compute_tf_features(
-            base, tf, e_l, r_l, a_l, mfi_lens, kdj_lens, support_lbs, args.with_vwap,
-            breakout_lbs=breakout_lbs,
-            with_candle_patterns=args.with_candle_patterns and (tf in pattern_tfs),
-            with_breakout_features=args.with_breakout_features and (tf in pattern_tfs),
-            with_fvg_features=args.with_fvg_features and (tf in pattern_tfs),
-            with_liquidity_sweeps=args.with_liquidity_sweeps and (tf in pattern_tfs),
-            with_market_structure=args.with_market_structure and (tf in pattern_tfs),
-            with_orderblock_proximity=args.with_orderblock_proximity and (tf in pattern_tfs),
-            fvg_mode=str(args.fvg_mode),
-            min_fvg_size_atr_mult=float(args.min_fvg_size_atr_mult),
-            swing_left=int(args.swing_left),
-            swing_right=int(args.swing_right),
-        )
-        tf_frames.append(tf_features.reindex(feature_table.index))
-        print(f"TF={tf} done. cols={tf_features.shape[1]}")
+    tf_workers = max(1, int(args.tf_workers))
+    if tf_workers == 1:
+        for tf in tfs:
+            print(f"Computing TF={tf} ...")
+            if tf in high_tfs:
+                e_l, r_l, a_l = ema_lens_high, rsi_lens_high, adx_lens_high
+            elif tf in mid_tfs:
+                e_l, r_l, a_l = ema_lens_mid, rsi_lens_mid, adx_lens_mid
+            else:
+                e_l, r_l, a_l = ema_lens_low, rsi_lens_low, adx_lens_low
+            tf_features = compute_tf_features(
+                base, tf, e_l, r_l, a_l, mfi_lens, kdj_lens, support_lbs, args.with_vwap,
+                breakout_lbs=breakout_lbs,
+                with_candle_patterns=args.with_candle_patterns and (tf in pattern_tfs),
+                with_breakout_features=args.with_breakout_features and (tf in pattern_tfs),
+                with_fvg_features=args.with_fvg_features and (tf in pattern_tfs),
+                with_liquidity_sweeps=args.with_liquidity_sweeps and (tf in pattern_tfs),
+                with_market_structure=args.with_market_structure and (tf in pattern_tfs),
+                with_orderblock_proximity=args.with_orderblock_proximity and (tf in pattern_tfs),
+                fvg_mode=str(args.fvg_mode),
+                min_fvg_size_atr_mult=float(args.min_fvg_size_atr_mult),
+                swing_left=int(args.swing_left),
+                swing_right=int(args.swing_right),
+            )
+            tf_frames.append(tf_features.reindex(feature_table.index))
+            print(f"TF={tf} done. cols={tf_features.shape[1]}")
+    else:
+        print(f"Computing TFs in parallel with {tf_workers} workers ...")
+        task_params: list[tuple] = []
+        for tf in tfs:
+            if tf in high_tfs:
+                e_l, r_l, a_l = ema_lens_high, rsi_lens_high, adx_lens_high
+            elif tf in mid_tfs:
+                e_l, r_l, a_l = ema_lens_mid, rsi_lens_mid, adx_lens_mid
+            else:
+                e_l, r_l, a_l = ema_lens_low, rsi_lens_low, adx_lens_low
+            task_params.append((
+                base, tf, e_l, r_l, a_l, mfi_lens, kdj_lens, support_lbs, args.with_vwap,
+                breakout_lbs,
+                args.with_candle_patterns and (tf in pattern_tfs),
+                args.with_breakout_features and (tf in pattern_tfs),
+                args.with_fvg_features and (tf in pattern_tfs),
+                args.with_liquidity_sweeps and (tf in pattern_tfs),
+                args.with_market_structure and (tf in pattern_tfs),
+                args.with_orderblock_proximity and (tf in pattern_tfs),
+                str(args.fvg_mode),
+                float(args.min_fvg_size_atr_mult),
+                int(args.swing_left),
+                int(args.swing_right),
+            ))
+
+        tf_results: dict[int, pd.DataFrame] = {}
+        with concurrent.futures.ProcessPoolExecutor(max_workers=tf_workers) as executor:
+            futures = [executor.submit(_compute_tf_features_task, p) for p in task_params]
+            for fut in concurrent.futures.as_completed(futures):
+                tf_done, tf_df = fut.result()
+                tf_results[int(tf_done)] = tf_df
+                print(f"TF={tf_done} done. cols={tf_df.shape[1]}")
+        for tf in tfs:
+            tf_frames.append(tf_results[int(tf)].reindex(feature_table.index))
 
     if tf_frames:
         feature_table = pd.concat([feature_table] + tf_frames, axis=1)
