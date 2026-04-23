@@ -88,7 +88,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--family-top-n", type=int, default=40)
     p.add_argument("--family-split-delta-window", action="store_true", default=False)
     p.add_argument("--include-candidates-file", type=Path, default=None)
-    p.add_argument("--out-candidates-csv", type=Path, default=None)
+    p.add_argument("--out-candidates-coarse-csv", type=Path, default=None)
+    p.add_argument("--out-candidates-refined-csv", type=Path, default=None)
+    p.add_argument("--out-candidates-csv", type=Path, default=None, help="Deprecated alias: writes both coarse/refined if stage is available")
 
     p.add_argument("--min-pos-per-week", type=float, default=1.0)
     p.add_argument("--min-main-score", type=float, default=1.0)
@@ -146,26 +148,48 @@ def _file_sig(path: Path | None) -> str:
         return str(path)
 
 
-def _load_allowlist(path: Path | None) -> set[str] | None:
-    if path is None:
+def _ctx_sig(obj: dict) -> str:
+    return hashlib.sha1(json.dumps(obj, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _load_stage_csv_if_match(path: Path | None, expected_stage: str, expected_ctx_sig: str) -> pd.DataFrame | None:
+    if path is None or (not path.exists()):
         return None
+    df = pd.read_csv(path)
+    if df.empty:
+        return None
+    if "__stage" not in df.columns or "__ctx_sig" not in df.columns:
+        return None
+    stage_vals = {str(x) for x in df["__stage"].dropna().unique().tolist()}
+    sig_vals = {str(x) for x in df["__ctx_sig"].dropna().unique().tolist()}
+    if stage_vals != {expected_stage}:
+        return None
+    if sig_vals != {expected_ctx_sig}:
+        return None
+    return df
+
+
+def _load_allowlist(path: Path | None) -> tuple[set[str] | None, bool]:
+    if path is None:
+        return None, False
     txt = path.read_text(encoding="utf-8").strip()
     if not txt:
-        return set()
-    if path.suffix.lower() == ".csv":
-        df = pd.read_csv(path)
-        if "candidate_key" not in df.columns:
-            raise ValueError(f"{path}: missing column candidate_key")
-        return {str(x).strip() for x in df["candidate_key"].tolist() if str(x).strip()}
+        return set(), False
+    if path.suffix.lower() != ".txt":
+        raise ValueError(f"{path}: include-candidates-file must be a .txt file")
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+    if not lines:
+        return set(), False
+    header = lines[0]
+    if header not in {"candidate_key", "candidate_key_refined"}:
+        raise ValueError(f"{path}: first line must be exactly candidate_key or candidate_key_refined")
     out = []
-    for i, ln in enumerate(txt.splitlines()):
+    for ln in lines[1:]:
         s = ln.strip()
         if not s:
             continue
-        if i == 0 and s.lower() == "candidate_key":
-            continue
         out.append(s)
-    return set(out)
+    return set(out), (header == "candidate_key_refined")
 
 
 def _candidate_family(col: str, split_delta_window: bool) -> str:
@@ -235,6 +259,93 @@ def _candidate_family(col: str, split_delta_window: bool) -> str:
     if c.startswith("atr"):
         return "atr"
     return c.split("_")[0]
+
+
+def _critical_minutes_for_entries(
+    entry_indices: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    bar_time_ns: np.ndarray,
+    hold: int,
+    use_multi_tp: bool,
+    trail: bool,
+    trail_activate: float,
+    tps: np.ndarray,
+    sl: float,
+    slippage_bps: float,
+    spread_bps: float,
+) -> set[int]:
+    crit: set[int] = set()
+    if entry_indices.size == 0:
+        return crit
+    slip = (slippage_bps + spread_bps) / 10000.0
+    n = len(close)
+    for i in entry_indices.tolist():
+        if i >= n - 1:
+            continue
+        entry = float(close[i]) * (1.0 + slip)
+        stop_level = entry * (1.0 - float(sl))
+        end = min(n - 1, i + max(1, int(hold)))
+        for j in range(i + 1, end + 1):
+            h = float(high[j]); l = float(low[j])
+            stop_hit = l <= stop_level
+            tp_hit = bool(use_multi_tp and np.any(h >= entry * (1.0 + tps)))
+            trail_can_activate = bool(trail and ((h / entry) - 1.0) >= float(trail_activate))
+            is_critical = False
+            if (not trail) and (not use_multi_tp):
+                is_critical = stop_hit and tp_hit
+            elif (not trail) and use_multi_tp:
+                is_critical = stop_hit and tp_hit
+            elif trail and (not use_multi_tp):
+                is_critical = trail_can_activate or stop_hit
+            else:
+                event_count = int(stop_hit) + int(tp_hit) + int(trail_can_activate)
+                is_critical = event_count >= 2
+            if is_critical:
+                crit.add(int(bar_time_ns[j]))
+    return crit
+
+
+def _load_tick_minute_map_partial(path: Path, datetime_col: str, price_col: str, sep: str, minute_filter: set[int]) -> tuple[np.ndarray, dict[int, tuple[int, int]]]:
+    if not minute_filter:
+        return np.asarray([], dtype=np.float64), {}
+    use_price_col = None if str(price_col).lower() == "auto" else str(price_col)
+    chunks = pd.read_csv(path, sep=sep, chunksize=2_000_000)
+    frames = []
+    for ch in chunks:
+        if datetime_col not in ch.columns:
+            raise ValueError(f"tick-data missing datetime column: {datetime_col}")
+        pcol = use_price_col
+        if pcol is None:
+            for cand in ("price", "bid", "ask", "last", "close"):
+                if cand in ch.columns:
+                    pcol = cand
+                    break
+            if pcol is None:
+                raise ValueError("tick-data price column not found")
+        dt = pd.to_datetime(ch[datetime_col], errors="coerce", utc=True).dt.floor("min")
+        minute_ns = dt.view("int64")
+        keep = np.isin(minute_ns, np.asarray(list(minute_filter), dtype=np.int64))
+        if not np.any(keep):
+            continue
+        part = pd.DataFrame({"minute_ns": minute_ns[keep], "price": pd.to_numeric(ch.loc[keep, pcol], errors="coerce")}).dropna()
+        if not part.empty:
+            frames.append(part)
+    if not frames:
+        return np.asarray([], dtype=np.float64), {}
+    ticks = pd.concat(frames, axis=0).sort_values("minute_ns")
+    prices = pd.to_numeric(ticks["price"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    mins = ticks["minute_ns"].to_numpy(dtype=np.int64, copy=False)
+    bounds: dict[int, tuple[int, int]] = {}
+    i = 0
+    while i < len(mins):
+        m = int(mins[i]); j = i + 1
+        while j < len(mins) and int(mins[j]) == m:
+            j += 1
+        bounds[m] = (i, j)
+        i = j
+    return prices, bounds
 
 
 def _mask_hash_arr(mask: np.ndarray) -> str:
@@ -373,14 +484,6 @@ def main() -> None:
 
     tick_prices_all = None
     tick_minute_bounds = None
-    if args.tick_data is not None:
-        tick_prices_all, tick_minute_bounds = miner.load_tick_minute_map(
-            path=args.tick_data,
-            datetime_col=args.tick_datetime_column,
-            price_col=args.tick_price_column,
-            sep=args.tick_sep,
-            cache_parquet=args.tick_cache_parquet,
-        )
 
     tps_all = [float(x) for x in str(args.tps).split(",") if x.strip()]
     tps = tps_all if bool(args.use_multi_tp) else [tps_all[0]]
@@ -388,8 +491,6 @@ def main() -> None:
 
     cache_key_obj = {
         "features_sig": _file_sig(args.features),
-        "tick_sig": _file_sig(args.tick_data),
-        "tick_cache_sig": _file_sig(args.tick_cache_parquet),
         "tps": [float(x) for x in tps],
         "tp_weights": [float(x) for x in tp_w.tolist()],
         "use_multi_tp": bool(args.use_multi_tp),
@@ -403,9 +504,6 @@ def main() -> None:
         "trail_factor": float(args.trail_factor),
         "trail_min_level": float(args.trail_min_level),
         "include_unrealized_at_test_end": bool(args.include_unrealized_at_test_end),
-        "tick_datetime_column": str(args.tick_datetime_column),
-        "tick_price_column": str(args.tick_price_column),
-        "tick_sep": str(args.tick_sep),
     }
     cache_key = hashlib.sha1(json.dumps(cache_key_obj, sort_keys=True).encode("utf-8")).hexdigest()
     loaded_cache = False
@@ -442,8 +540,8 @@ def main() -> None:
             trail_min_level=float(args.trail_min_level),
             include_unrealized_at_test_end=bool(args.include_unrealized_at_test_end),
             bar_time_ns=bar_time_ns,
-            tick_prices_all=tick_prices_all,
-            tick_minute_bounds=tick_minute_bounds,
+            tick_prices_all=None,
+            tick_minute_bounds=None,
         )
         if args.label_cache_npz is not None:
             args.label_cache_npz.parent.mkdir(parents=True, exist_ok=True)
@@ -467,118 +565,312 @@ def main() -> None:
     tradable_train = ((y_train == 0) | (y_train == 1))
     tradable_test = ((y_test == 0) | (y_test == 1))
 
-    # Build item pools from three ranked lists.
+    t0 = time.perf_counter()
+    allow_keys, allow_keys_refined = _load_allowlist(args.include_candidates_file)
+    coarse_ctx = {
+        "features_sig": _file_sig(args.features),
+        "binned_sig": _file_sig(args.binned_features),
+        "meta_sig": _file_sig(args.binned_metadata),
+        "label_cache_key": cache_key,
+        "train_frac": float(args.train_frac),
+        "quantiles": str(args.quantiles),
+        "min_single_pos_hits": int(args.min_single_pos_hits),
+        "min_single_lift": float(args.min_single_lift),
+        "max_single_mask_count": int(args.max_single_mask_count),
+        "family_top_n": int(args.family_top_n),
+        "family_split_delta_window": int(bool(args.family_split_delta_window)),
+    }
+    coarse_ctx_sig = _ctx_sig(coarse_ctx)
+    coarse_out = args.out_candidates_coarse_csv or args.out_candidates_csv
+    refined_out = args.out_candidates_refined_csv or args.out_candidates_csv
+    coarse_resume = _load_stage_csv_if_match(coarse_out, "coarse", coarse_ctx_sig)
+
     items = []
-    qs = [float(x) for x in str(args.quantiles).split(",") if x.strip()]
-    t0 = time.perf_counter()
-    qmap = miner.quantile_thresholds(df.iloc[:train_idx], cols, qs)
-    timing["quantile_thresholds_sec"] = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    for c in cols:
-        if c.startswith("dist_"):
-            # raw threshold candidates from quantiles
-            x = pd.to_numeric(df[c], errors="coerce").to_numpy(copy=False)
-            for q, thr in qmap.get(c, {}).items():
-                for op in (">=", "<="):
-                    m = np.isfinite(x) & ((x >= thr) if op == ">=" else (x <= thr))
-                    pos = int(np.sum(m[:train_idx] & (y_train == 1)))
-                    neg = int(np.sum(m[:train_idx] & (y_train == 0)))
-                    if pos <= 0:
-                        continue
-                    items.append({"col": c, "op": op, "value": float(thr), "mask": m, "binary": False,
-                                  "freq": pos / max(1, int(np.sum(y_train == 1))),
-                                  "lift": (pos / max(1, int(np.sum(y_train == 1)))) / max(1e-12, (neg / max(1, int(np.sum(y_train == 0))))),
-                                  "ratio": pos / max(1, neg)})
-            continue
-
-        miss = int(meta.get(c, {}).get("missing_code", 0))
-        b = pd.to_numeric(bdf[c], errors="coerce").fillna(miss).to_numpy()
-        vals = np.unique(b[:train_idx])
-        vals = vals[vals != miss]
-        is_binary = str(meta.get(c, {}).get("feature_type", "")) == "binary"
-        for v in vals.tolist():
-            m = np.isfinite(b) & (np.abs(b - float(v)) <= 1e-6)
-            pos = int(np.sum(m[:train_idx] & (y_train == 1)))
-            neg = int(np.sum(m[:train_idx] & (y_train == 0)))
-            if pos <= 0:
-                continue
-            items.append({"col": c, "op": "==", "value": float(v), "mask": m, "binary": bool(is_binary),
-                          "freq": pos / max(1, int(np.sum(y_train == 1))),
-                          "lift": (pos / max(1, int(np.sum(y_train == 1)))) / max(1e-12, (neg / max(1, int(np.sum(y_train == 0))))),
-                          "ratio": pos / max(1, neg)})
-
-    timing["build_items_sec"] = time.perf_counter() - t0
-    t0 = time.perf_counter()
-    allow_keys = _load_allowlist(args.include_candidates_file)
     filtered_items: list[dict] = []
     single_rejects = {"min_pos": 0, "min_lift": 0, "mask_count": 0, "allowlist": 0}
-    for i, it in enumerate(items, start=1):
-        x = dict(it)
-        # Stable candidate key assignment from raw item build order (before dedupe/top-n).
-        x["candidate_key"] = f"cand_{i:06d}"
-        m = np.asarray(x["mask"], dtype=bool)
-        pos_hits = int(np.sum(m[:train_idx] & (y_train == 1)))
-        mask_count = int(np.sum(m[:train_idx]))
-        if pos_hits < int(args.min_single_pos_hits):
-            single_rejects["min_pos"] += 1
-            continue
-        if float(x["lift"]) < float(args.min_single_lift):
-            single_rejects["min_lift"] += 1
-            continue
-        if int(args.max_single_mask_count) > 0 and mask_count > int(args.max_single_mask_count):
-            single_rejects["mask_count"] += 1
-            continue
-        if allow_keys is not None and str(x["candidate_key"]) not in allow_keys:
-            single_rejects["allowlist"] += 1
-            continue
-        x["_single_pos_hits"] = pos_hits
-        x["_single_mask_count"] = mask_count
-        x["_family"] = _candidate_family(str(x["col"]), bool(args.family_split_delta_window))
-        filtered_items.append(x)
-
-    # dedupe same train mask, keep lower tf / earlier
-    by_mask: dict[str, dict] = {}
-    for it in filtered_items:
-        mh = _mask_hash_arr(np.asarray(it["mask"][:train_idx], dtype=bool))
-        cur = by_mask.get(mh)
-        if cur is None:
-            by_mask[mh] = it
-            continue
-        tf_cur = int(miner._parse_feature_meta(str(cur["col"])).get("tf") or 10**9)
-        tf_new = int(miner._parse_feature_meta(str(it["col"])).get("tf") or 10**9)
-        if tf_new < tf_cur:
-            by_mask[mh] = it
-    filtered_items = list(by_mask.values())
-
+    if coarse_resume is not None:
+        for _, r in coarse_resume.iterrows():
+            key = str(r.get("candidate_key", "")).strip()
+            if not key:
+                continue
+            if allow_keys is not None and key not in allow_keys:
+                continue
+            col = str(r["col"]); op = str(r["op"]); val = float(r["value"])
+            xvec = pd.to_numeric(bdf[col] if op == "==" else df[col], errors="coerce").to_numpy(copy=False)
+            if op == "==":
+                m = np.isfinite(xvec) & (np.abs(xvec - val) <= 1e-6)
+            elif op == ">=":
+                m = np.isfinite(xvec) & (xvec >= val)
+            else:
+                m = np.isfinite(xvec) & (xvec <= val)
+            filtered_items.append({
+                "candidate_key": key, "col": col, "op": op, "value": val, "mask": m,
+                "binary": bool(int(r.get("binary", 0))), "_family": str(r.get("family", _candidate_family(col, bool(args.family_split_delta_window)))),
+                "_single_pos_hits": int(r.get("coarse_single_pos_hits", 0)),
+                "_single_neg_hits": int(r.get("coarse_single_neg_hits", 0)),
+                "_single_mask_count": int(r.get("coarse_single_mask_count", 0)),
+                "_single_ratio": float(r.get("coarse_single_ratio", 0.0)),
+                "coarse_single_pos_hits": int(r.get("coarse_single_pos_hits", 0)),
+                "coarse_single_neg_hits": int(r.get("coarse_single_neg_hits", 0)),
+                "coarse_single_mask_count": int(r.get("coarse_single_mask_count", 0)),
+                "coarse_single_ratio": float(r.get("coarse_single_ratio", 0.0)),
+                "coarse_lift": float(r.get("coarse_lift", 0.0)),
+                "lift": float(r.get("coarse_lift", 0.0)),
+                "ratio": float(r.get("coarse_single_ratio", 0.0)),
+            })
+        print(f"[prefilter-resume] loaded coarse candidates from {coarse_out} rows={len(filtered_items)}")
+    else:
+        qs = [float(x) for x in str(args.quantiles).split(",") if x.strip()]
+        t0 = time.perf_counter()
+        qmap = miner.quantile_thresholds(df.iloc[:train_idx], cols, qs)
+        timing["quantile_thresholds_sec"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        for c in cols:
+            if c.startswith("dist_"):
+                x = pd.to_numeric(df[c], errors="coerce").to_numpy(copy=False)
+                for _, thr in qmap.get(c, {}).items():
+                    for op in (">=", "<="):
+                        m = np.isfinite(x) & ((x >= thr) if op == ">=" else (x <= thr))
+                        pos = int(np.sum(m[:train_idx] & (y_train == 1)))
+                        neg = int(np.sum(m[:train_idx] & (y_train == 0)))
+                        if pos <= 0:
+                            continue
+                        items.append({"col": c, "op": op, "value": float(thr), "mask": m, "binary": False,
+                                      "freq": pos / max(1, int(np.sum(y_train == 1))),
+                                      "lift": (pos / max(1, int(np.sum(y_train == 1)))) / max(1e-12, (neg / max(1, int(np.sum(y_train == 0))))),
+                                      "ratio": pos / max(1, neg)})
+                continue
+            miss = int(meta.get(c, {}).get("missing_code", 0))
+            b = pd.to_numeric(bdf[c], errors="coerce").fillna(miss).to_numpy()
+            vals = np.unique(b[:train_idx]); vals = vals[vals != miss]
+            is_binary = str(meta.get(c, {}).get("feature_type", "")) == "binary"
+            for v in vals.tolist():
+                m = np.isfinite(b) & (np.abs(b - float(v)) <= 1e-6)
+                pos = int(np.sum(m[:train_idx] & (y_train == 1))); neg = int(np.sum(m[:train_idx] & (y_train == 0)))
+                if pos <= 0:
+                    continue
+                items.append({"col": c, "op": "==", "value": float(v), "mask": m, "binary": bool(is_binary),
+                              "freq": pos / max(1, int(np.sum(y_train == 1))),
+                              "lift": (pos / max(1, int(np.sum(y_train == 1)))) / max(1e-12, (neg / max(1, int(np.sum(y_train == 0))))),
+                              "ratio": pos / max(1, neg)})
+        timing["build_items_sec"] = time.perf_counter() - t0
+        for i, it in enumerate(items, start=1):
+            x = dict(it); x["candidate_key"] = f"cand_{i:06d}"
+            m = np.asarray(x["mask"], dtype=bool)
+            pos_hits = int(np.sum(m[:train_idx] & (y_train == 1))); neg_hits = int(np.sum(m[:train_idx] & (y_train == 0)))
+            mask_count = int(np.sum(m[:train_idx]))
+            if pos_hits < int(args.min_single_pos_hits):
+                single_rejects["min_pos"] += 1; continue
+            if float(x["lift"]) < float(args.min_single_lift):
+                single_rejects["min_lift"] += 1; continue
+            if int(args.max_single_mask_count) > 0 and mask_count > int(args.max_single_mask_count):
+                single_rejects["mask_count"] += 1; continue
+            if allow_keys is not None and str(x["candidate_key"]) not in allow_keys:
+                single_rejects["allowlist"] += 1; continue
+            x["_single_pos_hits"] = pos_hits; x["_single_neg_hits"] = neg_hits; x["_single_mask_count"] = mask_count
+            x["_single_ratio"] = pos_hits / max(1, neg_hits)
+            x["coarse_single_pos_hits"] = int(pos_hits); x["coarse_single_neg_hits"] = int(neg_hits)
+            x["coarse_single_mask_count"] = int(mask_count); x["coarse_single_ratio"] = float(x["_single_ratio"]); x["coarse_lift"] = float(x["lift"])
+            x["_family"] = _candidate_family(str(x["col"]), bool(args.family_split_delta_window))
+            filtered_items.append(x)
+        by_mask: dict[str, dict] = {}
+        for it in filtered_items:
+            mh = _mask_hash_arr(np.asarray(it["mask"][:train_idx], dtype=bool))
+            cur = by_mask.get(mh)
+            if cur is None:
+                by_mask[mh] = it; continue
+            tf_cur = int(miner._parse_feature_meta(str(cur["col"])).get("tf") or 10**9)
+            tf_new = int(miner._parse_feature_meta(str(it["col"])).get("tf") or 10**9)
+            if tf_new < tf_cur:
+                by_mask[mh] = it
+        filtered_items = list(by_mask.values())
     fam_top: list[dict] = []
     fam_groups: dict[str, list[dict]] = {}
     for it in filtered_items:
         fam_groups.setdefault(str(it["_family"]), []).append(it)
-    for fam, arr in fam_groups.items():
+    for _, arr in fam_groups.items():
         arr = sorted(arr, key=lambda z: (-float(z["lift"]), -int(z["_single_pos_hits"]), int(z["_single_mask_count"])))
         fam_top.extend(arr[: int(args.family_top_n)])
 
-    if args.out_candidates_csv is not None:
-        cand_rows = []
+    tick_refined_mode = False
+    refined_ctx = {
+        **coarse_ctx,
+        "tick_data_sig": _file_sig(args.tick_data),
+        "tick_cache_sig": _file_sig(args.tick_cache_parquet),
+        "use_multi_tp": int(bool(args.use_multi_tp)),
+        "trail": int(bool(args.trail)),
+        "trail_activate": float(args.trail_activate),
+        "hold": int(args.hold),
+    }
+    refined_ctx_sig = _ctx_sig(refined_ctx)
+    refined_resume = _load_stage_csv_if_match(refined_out, "refined", refined_ctx_sig)
+    if refined_resume is not None:
+        by_key = {str(it["candidate_key"]): it for it in fam_top}
+        for _, r in refined_resume.iterrows():
+            k = str(r.get("candidate_key_refined", "")).strip()
+            if not k or k not in by_key:
+                continue
+            it = by_key[k]
+            it["tick_single_pos_hits"] = int(r.get("tick_single_pos_hits", 0))
+            it["tick_single_neg_hits"] = int(r.get("tick_single_neg_hits", 0))
+            it["tick_single_mask_count"] = int(r.get("tick_single_mask_count", 0))
+            it["tick_single_ratio"] = float(r.get("tick_single_ratio", 0.0))
+            it["tick_lift"] = float(r.get("tick_lift", 0.0))
+            it["_single_pos_hits"] = int(it["tick_single_pos_hits"])
+            it["_single_neg_hits"] = int(it["tick_single_neg_hits"])
+            it["_single_mask_count"] = int(it["tick_single_mask_count"])
+            it["_single_ratio"] = float(it["tick_single_ratio"])
+            it["ratio"] = float(it["tick_single_ratio"])
+            it["lift"] = float(it["tick_lift"])
+        tick_refined_mode = True
+        print(f"[prefilter-resume] loaded refined candidates from {refined_out}")
+    elif bool(allow_keys_refined):
+        if refined_out is None or not refined_out.exists():
+            raise ValueError("candidate_key_refined input requires --out-candidates-refined-csv (or --out-candidates-csv) file to reload refined metrics")
+        raise ValueError("Refined TXT header provided, but refined candidate CSV context did not match current run.")
+    elif args.tick_data is not None and len(fam_top) > 0:
+        fam_union = np.zeros(n, dtype=bool)
+        for it in fam_top:
+            fam_union |= np.asarray(it["mask"], dtype=bool)
+        entry_indices = np.flatnonzero(fam_union).astype(np.int64, copy=False)
+        critical_minutes = _critical_minutes_for_entries(
+            entry_indices=entry_indices,
+            high=high,
+            low=low,
+            close=close,
+            bar_time_ns=bar_time_ns,
+            hold=int(args.hold),
+            use_multi_tp=bool(args.use_multi_tp),
+            trail=bool(args.trail),
+            trail_activate=float(args.trail_activate),
+            tps=np.asarray(tps, dtype=np.float64),
+            sl=float(args.sl),
+            slippage_bps=float(args.slippage_bps),
+            spread_bps=float(args.spread_bps),
+        )
+        if critical_minutes:
+            tick_prices_all, tick_minute_bounds = _load_tick_minute_map_partial(
+                path=args.tick_data,
+                datetime_col=args.tick_datetime_column,
+                price_col=args.tick_price_column,
+                sep=args.tick_sep,
+                minute_filter=critical_minutes,
+            )
+        else:
+            tick_prices_all, tick_minute_bounds = np.asarray([], dtype=np.float64), {}
+        t0 = time.perf_counter()
+        tick_map = miner.simulate_selected_entries_with_ticks(
+            entry_indices=entry_indices,
+            high=high,
+            low=low,
+            close=close,
+            tps=tps,
+            tp_w=tp_w,
+            tp_enabled=bool(args.use_multi_tp),
+            sl=float(args.sl),
+            hold=int(args.hold),
+            slippage_bps=float(args.slippage_bps),
+            spread_bps=float(args.spread_bps),
+            trail=bool(args.trail),
+            trail_activate=float(args.trail_activate),
+            trail_offset=float(args.trail_offset),
+            trail_factor=float(args.trail_factor),
+            include_unrealized_at_test_end=bool(args.include_unrealized_at_test_end),
+            bar_time_ns=bar_time_ns,
+            tick_prices_all=tick_prices_all,
+            tick_minute_bounds=tick_minute_bounds,
+        )
+        timing["tick_refine_sec"] = time.perf_counter() - t0
+        y_ref = np.asarray(y, dtype=np.int8).copy()
+        for idx_i, rec in tick_map.items():
+            y_ref[int(idx_i)] = np.int8(int(rec.get("y", -1)))
+        y_ref_train = y_ref[:train_idx]
+        union_train_mask = fam_union[:train_idx] & tradable_train
+        union_pos = int(np.sum(union_train_mask & (y_ref_train == 1)))
+        union_neg = int(np.sum(union_train_mask & (y_ref_train == 0)))
+        for it in fam_top:
+            m_train = np.asarray(it["mask"][:train_idx], dtype=bool) & tradable_train
+            tick_pos = int(np.sum(m_train & (y_ref_train == 1)))
+            tick_neg = int(np.sum(m_train & (y_ref_train == 0)))
+            tick_ratio = tick_pos / max(1, tick_neg)
+            tick_lift = (tick_pos / max(1, union_pos)) / max(1e-12, (tick_neg / max(1, union_neg)))
+            it["tick_single_pos_hits"] = tick_pos
+            it["tick_single_neg_hits"] = tick_neg
+            it["tick_single_mask_count"] = int(np.sum(m_train))
+            it["tick_single_ratio"] = float(tick_ratio)
+            it["tick_lift"] = float(tick_lift)
+            # downstream combinatorics should use refined single stats
+            it["_single_pos_hits"] = tick_pos
+            it["_single_neg_hits"] = tick_neg
+            it["_single_mask_count"] = int(np.sum(m_train))
+            it["_single_ratio"] = float(tick_ratio)
+            it["ratio"] = float(tick_ratio)
+            it["lift"] = float(tick_lift)
+        tick_refined_mode = True
+        print(f"[prefilter] tick-refined family-top pool on {len(entry_indices)} union entry rows.")
+    if coarse_out is not None:
+        coarse_rows = []
+        fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
         for it in filtered_items:
-            cand_rows.append({
+            coarse_rows.append({
                 "candidate_key": str(it["candidate_key"]),
                 "col": str(it["col"]),
                 "op": str(it["op"]),
                 "value": float(it["value"]),
                 "family": str(it["_family"]),
-                "lift": float(it["lift"]),
-                "ratio": float(it["ratio"]),
-                "_single_pos_hits": int(it["_single_pos_hits"]),
-                "_single_mask_count": int(it["_single_mask_count"]),
+                "coarse_single_pos_hits": int(it.get("coarse_single_pos_hits", it.get("_single_pos_hits", 0))),
+                "coarse_single_neg_hits": int(it.get("coarse_single_neg_hits", it.get("_single_neg_hits", 0))),
+                "coarse_single_mask_count": int(it.get("coarse_single_mask_count", it.get("_single_mask_count", 0))),
+                "coarse_single_ratio": float(it.get("coarse_single_ratio", it.get("_single_ratio", it.get("ratio", 0.0)))),
+                "coarse_lift": float(it.get("coarse_lift", it.get("lift", 0.0))),
                 "binary": int(bool(it.get("binary", False))),
-                "kept_after_family_topn": int(any(str(it["candidate_key"]) == str(z.get("candidate_key")) for z in fam_top)),
+                "kept_after_family_topn": int(str(it["candidate_key"]) in fam_top_keys),
+                "__stage": "coarse",
+                "__ctx_sig": coarse_ctx_sig,
             })
-        _atomic_write_csv(args.out_candidates_csv, pd.DataFrame(cand_rows))
-        print(f"[prefilter-candidates] wrote CSV: {args.out_candidates_csv} rows={len(cand_rows)}")
+        _atomic_write_csv(coarse_out, pd.DataFrame(coarse_rows))
+        print(f"[prefilter-candidates] wrote coarse CSV: {coarse_out} rows={len(coarse_rows)}")
 
-    rank_lift = _with_rank_context(sorted(fam_top, key=lambda z: z["lift"], reverse=True), "lift")
+    if refined_out is not None:
+        fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
+        cand_rows = []
+        for it in filtered_items:
+            row = {
+                "candidate_key_refined": str(it["candidate_key"]),
+                "col": str(it["col"]),
+                "op": str(it["op"]),
+                "value": float(it["value"]),
+                "family": str(it["_family"]),
+                "coarse_single_pos_hits": int(it.get("coarse_single_pos_hits", it.get("_single_pos_hits", 0))),
+                "coarse_single_neg_hits": int(it.get("coarse_single_neg_hits", it.get("_single_neg_hits", 0))),
+                "coarse_single_mask_count": int(it.get("coarse_single_mask_count", it.get("_single_mask_count", 0))),
+                "coarse_single_ratio": float(it.get("coarse_single_ratio", it.get("_single_ratio", it.get("ratio", 0.0)))),
+                "coarse_lift": float(it.get("coarse_lift", it.get("lift", 0.0))),
+                "tick_single_pos_hits": float("nan"),
+                "tick_single_neg_hits": float("nan"),
+                "tick_single_mask_count": float("nan"),
+                "tick_single_ratio": float("nan"),
+                "tick_lift": float("nan"),
+                "binary": int(bool(it.get("binary", False))),
+                "kept_after_family_topn": int(str(it["candidate_key"]) in fam_top_keys),
+                "__stage": "refined",
+                "__ctx_sig": refined_ctx_sig,
+            }
+            top_hit = next((z for z in fam_top if str(z.get("candidate_key")) == str(it["candidate_key"])), None)
+            if top_hit is not None:
+                row["tick_single_pos_hits"] = float(top_hit.get("tick_single_pos_hits", np.nan))
+                row["tick_single_neg_hits"] = float(top_hit.get("tick_single_neg_hits", np.nan))
+                row["tick_single_mask_count"] = float(top_hit.get("tick_single_mask_count", np.nan))
+                row["tick_single_ratio"] = float(top_hit.get("tick_single_ratio", np.nan))
+                row["tick_lift"] = float(top_hit.get("tick_lift", np.nan))
+            cand_rows.append(row)
+        _atomic_write_csv(refined_out, pd.DataFrame(cand_rows))
+        print(f"[prefilter-candidates] wrote refined CSV: {refined_out} rows={len(cand_rows)}")
+
+    if tick_refined_mode:
+        rank_lift = _with_rank_context(sorted(fam_top, key=lambda z: (-float(z.get("ratio", 0.0)), -int(z.get("_single_pos_hits", 0)), int(z.get("_single_mask_count", 0)))), "ratio")
+    else:
+        rank_lift = _with_rank_context(sorted(fam_top, key=lambda z: z["lift"], reverse=True), "lift")
     rank_freq: list[dict] = []
     rank_ratio: list[dict] = []
     timing["ranking_prep_sec"] = time.perf_counter() - t0
@@ -743,10 +1035,10 @@ def main() -> None:
         "path_index", "rule_human", "rule_json_id", "decode_type_info", "pos_hits", "neg_hits",
         "remaining_hit_ratio", "precision_info", "test_pos_hits", "test_neg_hits", "test_ratio",
         "wf_mean_ratio", "wf_min_ratio", "wf_hits", "tp", "sl", "hold", "trail",
-        "trail_activate", "trail_offset", "trail_factor",
+        "trail_activate", "trail_offset", "trail_factor", "is_fallback_export",
     ]
 
-    def _rules_to_rows(rules: list[dict]) -> list[dict]:
+    def _rules_to_rows(rules: list[dict], is_fallback_export: bool = False) -> list[dict]:
         def _decode_interval(col: str, lo: int, hi: int) -> str:
             m = meta.get(col, {}) if isinstance(meta, dict) else {}
             edges = m.get("bin_edges", [])
@@ -802,6 +1094,7 @@ def main() -> None:
                 "trail_activate": float(args.trail_activate),
                 "trail_offset": float(args.trail_offset),
                 "trail_factor": float(args.trail_factor),
+                "is_fallback_export": int(bool(is_fallback_export)),
             })
         return rows
 
@@ -841,7 +1134,7 @@ def main() -> None:
     def _save_progress(valid_pool: list[dict], state: dict) -> None:
         rules_only = {"version": 2, "rules": valid_pool}
         _atomic_write_text(args.out_rules_json, json.dumps(rules_only, ensure_ascii=False, indent=2))
-        rows = _rules_to_rows(valid_pool[: int(args.top_paths)])
+        rows = _rules_to_rows(valid_pool[: int(args.top_paths)], is_fallback_export=False)
         _validate_rows(rows)
         if rows:
             _atomic_write_csv(args.out_rules_csv, pd.DataFrame(rows))
@@ -1115,8 +1408,13 @@ def main() -> None:
         ),
     )
     best_paths = shortlist[: int(args.top_paths)]
+    fallback_export_used = False
     if not best_paths:
         print("[prefilter-warning] No rule with test hits found for final CSV export.")
+        if len(train_ranked) > 0 and len(valid_pool) > 0:
+            best_paths = train_ranked[: int(args.top_paths)]
+            fallback_export_used = True
+            print(f"[prefilter-fallback] Exporting {len(best_paths)} train-valid rules (fallback: valid>0 but test_hits=0).")
 
     out_json = {
         "version": 2,
@@ -1134,10 +1432,11 @@ def main() -> None:
             "wf_folds": int(args.wf_folds),
         },
         "rules": best_paths,
+        "fallback_export_used": int(bool(fallback_export_used)),
     }
     _atomic_write_text(args.out_rules_json, json.dumps(out_json, ensure_ascii=False, indent=2))
 
-    rows = _rules_to_rows(best_paths)
+    rows = _rules_to_rows(best_paths, is_fallback_export=fallback_export_used)
     _validate_rows(rows)
     if rows:
         _atomic_write_csv(args.out_rules_csv, pd.DataFrame(rows))

@@ -1211,7 +1211,8 @@ def simulate_selected_entries_with_ticks(
         y_i = -1
         pnl_i = float("nan")
 
-        for k in range(1, len(close) - i):
+        max_k = min(len(close) - i - 1, max(1, int(hold)))
+        for k in range(1, max_k + 1):
             j = i + k
             h = float(high[j])
             l = float(low[j])
@@ -1302,10 +1303,11 @@ def simulate_selected_entries_with_ticks(
                     break
         else:
             if include_unrealized_at_test_end:
-                final_ret = (float(close[-1]) / entry) - 1.0
-                out[i] = {"pnl": final_ret, "y": (1 if qualified else (1 if final_ret > 0 else 0)), "t_exit": len(close) - 1 - i, "t_qual": qual_k, "tp_hits": hits}
+                j_end = i + max_k
+                final_ret = (float(close[j_end]) / entry) - 1.0
+                out[i] = {"pnl": final_ret, "y": (1 if qualified else (1 if final_ret > 0 else 0)), "t_exit": max_k, "t_qual": qual_k, "tp_hits": hits}
             elif qualified:
-                out[i] = {"pnl": trail_activate, "y": 1, "t_exit": len(close) - 1 - i, "t_qual": qual_k, "tp_hits": hits}
+                out[i] = {"pnl": trail_activate, "y": 1, "t_exit": max_k, "t_qual": qual_k, "tp_hits": hits}
 
     return out
 
