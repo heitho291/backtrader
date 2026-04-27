@@ -707,7 +707,7 @@ def main() -> None:
             x["_family"] = _candidate_family(str(x["col"]), bool(args.family_split_delta_window))
             filtered_items.append(x)
         by_mask: dict[str, dict] = {}
-        for it in full_filtered_items:
+        for it in filtered_items:
             mh = _mask_hash_arr(np.asarray(it["mask"][:train_idx], dtype=bool))
             cur = by_mask.get(mh)
             if cur is None:
