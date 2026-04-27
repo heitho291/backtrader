@@ -614,7 +614,6 @@ def main() -> None:
         "min_single_pos_hits": int(args.min_single_pos_hits),
         "min_single_lift": float(args.min_single_lift),
         "max_single_mask_count": int(args.max_single_mask_count),
-        "family_top_n": int(args.family_top_n),
         "family_split_delta_window": int(bool(args.family_split_delta_window)),
     }
     coarse_ctx_sig = _ctx_sig(coarse_ctx)
