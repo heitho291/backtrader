@@ -1184,11 +1184,15 @@ def simulate_selected_entries_with_ticks(
     bar_time_ns: np.ndarray,
     tick_prices_all: Optional[np.ndarray],
     tick_minute_bounds: Optional[Dict[int, tuple[int, int]]],
+    tick_bids_all: Optional[np.ndarray] = None,
+    tick_asks_all: Optional[np.ndarray] = None,
+    use_tick_bid_ask: bool = False,
 ) -> dict[int, dict[str, float]]:
     if tick_prices_all is None or tick_minute_bounds is None or entry_indices.size == 0:
         return {}
 
-    slip = (slippage_bps + spread_bps) / 10000.0
+    spread_component = 0.0 if bool(use_tick_bid_ask and tick_bids_all is not None and tick_asks_all is not None) else float(spread_bps)
+    slip = (slippage_bps + spread_component) / 10000.0
     tps_arr = np.asarray(tps, dtype=np.float64)
     k_max = len(tps_arr)
     out: dict[int, dict[str, float]] = {}
@@ -1196,7 +1200,12 @@ def simulate_selected_entries_with_ticks(
     for i in entry_indices.tolist():
         if i >= len(close) - 1:
             continue
-        entry = float(close[i]) * (1.0 + slip)
+        if bool(use_tick_bid_ask and tick_asks_all is not None):
+            b0 = tick_minute_bounds.get(int(bar_time_ns[i]))
+            entry_tick = float(tick_asks_all[b0[0]]) if b0 is not None and b0[1] > b0[0] else float(close[i])
+            entry = entry_tick * (1.0 + (slippage_bps / 10000.0))
+        else:
+            entry = float(close[i]) * (1.0 + slip)
         stop_ret = -sl
         stop_level = entry * (1.0 + stop_ret)
         tp_levels = entry * (1.0 + tps_arr)
@@ -1218,6 +1227,8 @@ def simulate_selected_entries_with_ticks(
             l = float(low[j])
             minute_ns = int(bar_time_ns[j])
             tick_prices = None
+            tick_bids = None
+            tick_asks = None
             bounds = tick_minute_bounds.get(minute_ns)
             if bounds is not None:
                 critical = (
@@ -1228,11 +1239,17 @@ def simulate_selected_entries_with_ticks(
                 if critical:
                     s_idx, e_idx = bounds
                     tick_prices = tick_prices_all[s_idx:e_idx]
+                    if tick_bids_all is not None:
+                        tick_bids = tick_bids_all[s_idx:e_idx]
+                    if tick_asks_all is not None:
+                        tick_asks = tick_asks_all[s_idx:e_idx]
 
             if tick_prices is not None and len(tick_prices) > 0:
-                for px in tick_prices:
-                    px = float(px)
-                    curr_profit_ret = (px / entry) - 1.0
+                for z, px in enumerate(tick_prices):
+                    px_val = float(px)
+                    px_exit = float(tick_bids[z]) if (use_tick_bid_ask and tick_bids is not None and z < len(tick_bids) and np.isfinite(tick_bids[z])) else px_val
+                    px_high = float(tick_asks[z]) if (use_tick_bid_ask and tick_asks is not None and z < len(tick_asks) and np.isfinite(tick_asks[z])) else px_val
+                    curr_profit_ret = (px_high / entry) - 1.0
                     if curr_profit_ret > max_profit_ret:
                         max_profit_ret = curr_profit_ret
                     if trail and (not trailing_active) and max_profit_ret >= trail_activate:
@@ -1245,14 +1262,14 @@ def simulate_selected_entries_with_ticks(
                     if (not qualified) and trail and k <= hold and max_profit_ret >= trail_activate:
                         qualified = True
                         qual_k = k
-                    if px <= stop_level:
+                    if px_exit <= stop_level:
                         realized += remaining * stop_ret
                         pnl_i = realized
                         y_i = 1 if qualified else (1 if realized > 0 else 0)
                         exit_k = k
                         break
                     if tp_enabled:
-                        while hits < k_max and px >= tp_levels[hits]:
+                        while hits < k_max and px_high >= tp_levels[hits]:
                             w = min(float(tp_w[hits]), remaining)
                             if w > 0:
                                 realized += w * float(tps_arr[hits])

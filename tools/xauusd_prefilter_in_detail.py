@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tp-weights", type=str, default="")
     p.add_argument("--use-multi-tp", action="store_true", default=True)
     p.add_argument("--no-use-multi-tp", dest="use_multi_tp", action="store_false")
+    p.add_argument("--no-tp", action="store_true", default=False, help="Disable TP exits (allowed only with --trail)")
     p.add_argument("--sl", type=float, default=0.0015)
     p.add_argument("--hold", type=int, default=90)
     p.add_argument("--slippage-bps", type=float, default=0.0)
@@ -90,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--include-candidates-file", type=Path, default=None)
     p.add_argument("--out-candidates-coarse-csv", type=Path, default=None)
     p.add_argument("--out-candidates-refined-csv", type=Path, default=None)
-    p.add_argument("--out-candidates-csv", type=Path, default=None, help="Deprecated alias: writes both coarse/refined if stage is available")
+    p.add_argument("--out-candidates-csv", type=Path, default=None, help="Deprecated (forbidden): use coarse/refined candidate CSV paths")
 
     p.add_argument("--min-pos-per-week", type=float, default=1.0)
     p.add_argument("--min-main-score", type=float, default=1.0)
@@ -268,7 +269,7 @@ def _critical_minutes_for_entries(
     close: np.ndarray,
     bar_time_ns: np.ndarray,
     hold: int,
-    use_multi_tp: bool,
+    tp_mode: str,
     trail: bool,
     trail_activate: float,
     tps: np.ndarray,
@@ -290,52 +291,70 @@ def _critical_minutes_for_entries(
         for j in range(i + 1, end + 1):
             h = float(high[j]); l = float(low[j])
             stop_hit = l <= stop_level
-            tp_hit = bool(use_multi_tp and np.any(h >= entry * (1.0 + tps)))
+            tp_hit = bool(tp_mode in {"single", "multi"} and np.any(h >= entry * (1.0 + tps)))
             trail_can_activate = bool(trail and ((h / entry) - 1.0) >= float(trail_activate))
             is_critical = False
-            if (not trail) and (not use_multi_tp):
+            if (not trail) and tp_mode == "single":
                 is_critical = stop_hit and tp_hit
-            elif (not trail) and use_multi_tp:
+            elif (not trail) and tp_mode == "multi":
                 is_critical = stop_hit and tp_hit
-            elif trail and (not use_multi_tp):
-                is_critical = trail_can_activate or stop_hit
+            elif trail and tp_mode == "none":
+                is_critical = trail_can_activate
             else:
                 event_count = int(stop_hit) + int(tp_hit) + int(trail_can_activate)
-                is_critical = event_count >= 2
+                is_critical = trail_can_activate or (event_count >= 2)
             if is_critical:
                 crit.add(int(bar_time_ns[j]))
     return crit
 
 
-def _load_tick_minute_map_partial(path: Path, datetime_col: str, price_col: str, sep: str, minute_filter: set[int]) -> tuple[np.ndarray, dict[int, tuple[int, int]]]:
+def _load_tick_minute_map_partial(
+    path: Path,
+    datetime_col: str,
+    price_col: str,
+    sep: str,
+    minute_filter: set[int],
+) -> tuple[np.ndarray, dict[int, tuple[int, int]], np.ndarray | None, np.ndarray | None, int]:
     if not minute_filter:
-        return np.asarray([], dtype=np.float64), {}
+        return np.asarray([], dtype=np.float64), {}, None, None, 0
     use_price_col = None if str(price_col).lower() == "auto" else str(price_col)
     chunks = pd.read_csv(path, sep=sep, chunksize=2_000_000)
     frames = []
+    matched_minute_set: set[int] = set()
     for ch in chunks:
         if datetime_col not in ch.columns:
             raise ValueError(f"tick-data missing datetime column: {datetime_col}")
         pcol = use_price_col
+        cols_lower = {str(c).lower(): str(c) for c in ch.columns}
+        bid_col = cols_lower.get("bid")
+        ask_col = cols_lower.get("ask")
         if pcol is None:
             for cand in ("price", "bid", "ask", "last", "close"):
-                if cand in ch.columns:
-                    pcol = cand
+                if cand in cols_lower:
+                    pcol = cols_lower[cand]
                     break
             if pcol is None:
                 raise ValueError("tick-data price column not found")
         dt = pd.to_datetime(ch[datetime_col], errors="coerce", utc=True).dt.floor("min")
-        minute_ns = dt.view("int64")
+        minute_ns = dt.astype("int64").to_numpy()
         keep = np.isin(minute_ns, np.asarray(list(minute_filter), dtype=np.int64))
         if not np.any(keep):
             continue
-        part = pd.DataFrame({"minute_ns": minute_ns[keep], "price": pd.to_numeric(ch.loc[keep, pcol], errors="coerce")}).dropna()
+        part = pd.DataFrame({"minute_ns": minute_ns[keep], "price": pd.to_numeric(ch.loc[keep, pcol], errors="coerce")})
+        if bid_col is not None:
+            part["bid"] = pd.to_numeric(ch.loc[keep, bid_col], errors="coerce")
+        if ask_col is not None:
+            part["ask"] = pd.to_numeric(ch.loc[keep, ask_col], errors="coerce")
+        part = part.dropna(subset=["minute_ns", "price"])
         if not part.empty:
+            matched_minute_set.update({int(x) for x in np.unique(part["minute_ns"].to_numpy(dtype=np.int64, copy=False)).tolist()})
             frames.append(part)
     if not frames:
-        return np.asarray([], dtype=np.float64), {}
+        return np.asarray([], dtype=np.float64), {}, None, None, 0
     ticks = pd.concat(frames, axis=0).sort_values("minute_ns")
     prices = pd.to_numeric(ticks["price"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    bids = pd.to_numeric(ticks["bid"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "bid" in ticks.columns else None
+    asks = pd.to_numeric(ticks["ask"], errors="coerce").to_numpy(dtype=np.float64, copy=False) if "ask" in ticks.columns else None
     mins = ticks["minute_ns"].to_numpy(dtype=np.int64, copy=False)
     bounds: dict[int, tuple[int, int]] = {}
     i = 0
@@ -345,7 +364,7 @@ def _load_tick_minute_map_partial(path: Path, datetime_col: str, price_col: str,
             j += 1
         bounds[m] = (i, j)
         i = j
-    return prices, bounds
+    return prices, bounds, bids, asks, int(len(matched_minute_set))
 
 
 def _mask_hash_arr(mask: np.ndarray) -> str:
@@ -461,6 +480,8 @@ def _calc_wf(mask: np.ndarray, y_test: np.ndarray, wf_folds: int) -> tuple[float
 
 def main() -> None:
     args = parse_args()
+    if args.out_candidates_csv is not None:
+        raise ValueError("--out-candidates-csv is deprecated. Use --out-candidates-coarse-csv and --out-candidates-refined-csv.")
     miner = _load_miner_module(args.miner_script)
     timing: dict[str, float] = {}
 
@@ -486,14 +507,30 @@ def main() -> None:
     tick_minute_bounds = None
 
     tps_all = [float(x) for x in str(args.tps).split(",") if x.strip()]
-    tps = tps_all if bool(args.use_multi_tp) else [tps_all[0]]
-    tp_w = miner.parse_tp_weights(tps, str(args.tp_weights))
+    if bool(args.no_tp):
+        tp_mode = "none"
+    else:
+        tp_mode = "multi" if bool(args.use_multi_tp) else "single"
+    if (not bool(args.trail)) and tp_mode == "none":
+        raise ValueError("Invalid TP mode: no TP is not allowed when --trail is disabled.")
+    if tp_mode == "multi":
+        tps = tps_all
+        tp_w = miner.parse_tp_weights(tps, str(args.tp_weights))
+        tp_enabled = True
+    elif tp_mode == "single":
+        tps = [tps_all[0]]
+        tp_w = np.asarray([1.0], dtype=np.float64)
+        tp_enabled = True
+    else:
+        tps = [tps_all[0]]
+        tp_w = np.asarray([1.0], dtype=np.float64)
+        tp_enabled = False
 
     cache_key_obj = {
         "features_sig": _file_sig(args.features),
         "tps": [float(x) for x in tps],
         "tp_weights": [float(x) for x in tp_w.tolist()],
-        "use_multi_tp": bool(args.use_multi_tp),
+        "tp_mode": str(tp_mode),
         "sl": float(args.sl),
         "hold": int(args.hold),
         "slippage_bps": float(args.slippage_bps),
@@ -528,7 +565,7 @@ def main() -> None:
             close=close,
             tps=tps,
             tp_w=tp_w,
-            tp_enabled=bool(args.use_multi_tp),
+            tp_enabled=bool(tp_enabled),
             sl=float(args.sl),
             hold=int(args.hold),
             slippage_bps=float(args.slippage_bps),
@@ -581,8 +618,8 @@ def main() -> None:
         "family_split_delta_window": int(bool(args.family_split_delta_window)),
     }
     coarse_ctx_sig = _ctx_sig(coarse_ctx)
-    coarse_out = args.out_candidates_coarse_csv or args.out_candidates_csv
-    refined_out = args.out_candidates_refined_csv or args.out_candidates_csv
+    coarse_out = args.out_candidates_coarse_csv
+    refined_out = args.out_candidates_refined_csv
     coarse_resume = _load_stage_csv_if_match(coarse_out, "coarse", coarse_ctx_sig)
 
     items = []
@@ -592,8 +629,6 @@ def main() -> None:
         for _, r in coarse_resume.iterrows():
             key = str(r.get("candidate_key", "")).strip()
             if not key:
-                continue
-            if allow_keys is not None and key not in allow_keys:
                 continue
             col = str(r["col"]); op = str(r["op"]); val = float(r["value"])
             xvec = pd.to_numeric(bdf[col] if op == "==" else df[col], errors="coerce").to_numpy(copy=False)
@@ -665,8 +700,6 @@ def main() -> None:
                 single_rejects["min_lift"] += 1; continue
             if int(args.max_single_mask_count) > 0 and mask_count > int(args.max_single_mask_count):
                 single_rejects["mask_count"] += 1; continue
-            if allow_keys is not None and str(x["candidate_key"]) not in allow_keys:
-                single_rejects["allowlist"] += 1; continue
             x["_single_pos_hits"] = pos_hits; x["_single_neg_hits"] = neg_hits; x["_single_mask_count"] = mask_count
             x["_single_ratio"] = pos_hits / max(1, neg_hits)
             x["coarse_single_pos_hits"] = int(pos_hits); x["coarse_single_neg_hits"] = int(neg_hits)
@@ -674,7 +707,7 @@ def main() -> None:
             x["_family"] = _candidate_family(str(x["col"]), bool(args.family_split_delta_window))
             filtered_items.append(x)
         by_mask: dict[str, dict] = {}
-        for it in filtered_items:
+        for it in full_filtered_items:
             mh = _mask_hash_arr(np.asarray(it["mask"][:train_idx], dtype=bool))
             cur = by_mask.get(mh)
             if cur is None:
@@ -684,6 +717,9 @@ def main() -> None:
             if tf_new < tf_cur:
                 by_mask[mh] = it
         filtered_items = list(by_mask.values())
+    full_filtered_items = list(filtered_items)
+    if allow_keys is not None:
+        filtered_items = [it for it in full_filtered_items if str(it.get("candidate_key")) in allow_keys]
     fam_top: list[dict] = []
     fam_groups: dict[str, list[dict]] = {}
     for it in filtered_items:
@@ -697,7 +733,7 @@ def main() -> None:
         **coarse_ctx,
         "tick_data_sig": _file_sig(args.tick_data),
         "tick_cache_sig": _file_sig(args.tick_cache_parquet),
-        "use_multi_tp": int(bool(args.use_multi_tp)),
+        "tp_mode": str(tp_mode),
         "trail": int(bool(args.trail)),
         "trail_activate": float(args.trail_activate),
         "hold": int(args.hold),
@@ -709,6 +745,15 @@ def main() -> None:
         for _, r in refined_resume.iterrows():
             k = str(r.get("candidate_key_refined", "")).strip()
             if not k or k not in by_key:
+                continue
+            req_vals = [
+                r.get("tick_single_pos_hits", np.nan),
+                r.get("tick_single_neg_hits", np.nan),
+                r.get("tick_single_mask_count", np.nan),
+                r.get("tick_single_ratio", np.nan),
+                r.get("tick_lift", np.nan),
+            ]
+            if any(pd.isna(v) for v in req_vals):
                 continue
             it = by_key[k]
             it["tick_single_pos_hits"] = int(r.get("tick_single_pos_hits", 0))
@@ -722,11 +767,11 @@ def main() -> None:
             it["_single_ratio"] = float(it["tick_single_ratio"])
             it["ratio"] = float(it["tick_single_ratio"])
             it["lift"] = float(it["tick_lift"])
-        tick_refined_mode = True
+        tick_refined_mode = any("tick_single_ratio" in x for x in by_key.values())
         print(f"[prefilter-resume] loaded refined candidates from {refined_out}")
     elif bool(allow_keys_refined):
         if refined_out is None or not refined_out.exists():
-            raise ValueError("candidate_key_refined input requires --out-candidates-refined-csv (or --out-candidates-csv) file to reload refined metrics")
+            raise ValueError("candidate_key_refined input requires --out-candidates-refined-csv file to reload refined metrics")
         raise ValueError("Refined TXT header provided, but refined candidate CSV context did not match current run.")
     elif args.tick_data is not None and len(fam_top) > 0:
         fam_union = np.zeros(n, dtype=bool)
@@ -740,7 +785,7 @@ def main() -> None:
             close=close,
             bar_time_ns=bar_time_ns,
             hold=int(args.hold),
-            use_multi_tp=bool(args.use_multi_tp),
+            tp_mode=str(tp_mode),
             trail=bool(args.trail),
             trail_activate=float(args.trail_activate),
             tps=np.asarray(tps, dtype=np.float64),
@@ -749,7 +794,7 @@ def main() -> None:
             spread_bps=float(args.spread_bps),
         )
         if critical_minutes:
-            tick_prices_all, tick_minute_bounds = _load_tick_minute_map_partial(
+            tick_prices_all, tick_minute_bounds, tick_bids_all, tick_asks_all, matched_critical_minutes_count = _load_tick_minute_map_partial(
                 path=args.tick_data,
                 datetime_col=args.tick_datetime_column,
                 price_col=args.tick_price_column,
@@ -758,60 +803,70 @@ def main() -> None:
             )
         else:
             tick_prices_all, tick_minute_bounds = np.asarray([], dtype=np.float64), {}
-        t0 = time.perf_counter()
-        tick_map = miner.simulate_selected_entries_with_ticks(
-            entry_indices=entry_indices,
-            high=high,
-            low=low,
-            close=close,
-            tps=tps,
-            tp_w=tp_w,
-            tp_enabled=bool(args.use_multi_tp),
-            sl=float(args.sl),
-            hold=int(args.hold),
-            slippage_bps=float(args.slippage_bps),
-            spread_bps=float(args.spread_bps),
-            trail=bool(args.trail),
-            trail_activate=float(args.trail_activate),
-            trail_offset=float(args.trail_offset),
-            trail_factor=float(args.trail_factor),
-            include_unrealized_at_test_end=bool(args.include_unrealized_at_test_end),
-            bar_time_ns=bar_time_ns,
-            tick_prices_all=tick_prices_all,
-            tick_minute_bounds=tick_minute_bounds,
+            tick_bids_all, tick_asks_all, matched_critical_minutes_count = None, None, 0
+        used_real_ticks = bool(len(tick_minute_bounds) > 0 and matched_critical_minutes_count > 0)
+        print(
+            f"[prefilter-tick] critical_minutes_count={len(critical_minutes)} "
+            f"matched_critical_minutes_count={int(matched_critical_minutes_count)} "
+            f"used_real_ticks={bool(used_real_ticks)}"
         )
-        timing["tick_refine_sec"] = time.perf_counter() - t0
-        y_ref = np.asarray(y, dtype=np.int8).copy()
-        for idx_i, rec in tick_map.items():
-            y_ref[int(idx_i)] = np.int8(int(rec.get("y", -1)))
-        y_ref_train = y_ref[:train_idx]
-        union_train_mask = fam_union[:train_idx] & tradable_train
-        union_pos = int(np.sum(union_train_mask & (y_ref_train == 1)))
-        union_neg = int(np.sum(union_train_mask & (y_ref_train == 0)))
-        for it in fam_top:
-            m_train = np.asarray(it["mask"][:train_idx], dtype=bool) & tradable_train
-            tick_pos = int(np.sum(m_train & (y_ref_train == 1)))
-            tick_neg = int(np.sum(m_train & (y_ref_train == 0)))
-            tick_ratio = tick_pos / max(1, tick_neg)
-            tick_lift = (tick_pos / max(1, union_pos)) / max(1e-12, (tick_neg / max(1, union_neg)))
-            it["tick_single_pos_hits"] = tick_pos
-            it["tick_single_neg_hits"] = tick_neg
-            it["tick_single_mask_count"] = int(np.sum(m_train))
-            it["tick_single_ratio"] = float(tick_ratio)
-            it["tick_lift"] = float(tick_lift)
-            # downstream combinatorics should use refined single stats
-            it["_single_pos_hits"] = tick_pos
-            it["_single_neg_hits"] = tick_neg
-            it["_single_mask_count"] = int(np.sum(m_train))
-            it["_single_ratio"] = float(tick_ratio)
-            it["ratio"] = float(tick_ratio)
-            it["lift"] = float(tick_lift)
-        tick_refined_mode = True
-        print(f"[prefilter] tick-refined family-top pool on {len(entry_indices)} union entry rows.")
+        if used_real_ticks:
+            t0 = time.perf_counter()
+            tick_map = miner.simulate_selected_entries_with_ticks(
+                entry_indices=entry_indices,
+                high=high,
+                low=low,
+                close=close,
+                tps=tps,
+                tp_w=tp_w,
+                tp_enabled=bool(tp_enabled),
+                sl=float(args.sl),
+                hold=int(args.hold),
+                slippage_bps=float(args.slippage_bps),
+                spread_bps=float(args.spread_bps),
+                trail=bool(args.trail),
+                trail_activate=float(args.trail_activate),
+                trail_offset=float(args.trail_offset),
+                trail_factor=float(args.trail_factor),
+                include_unrealized_at_test_end=bool(args.include_unrealized_at_test_end),
+                bar_time_ns=bar_time_ns,
+                tick_prices_all=tick_prices_all,
+                tick_minute_bounds=tick_minute_bounds,
+                tick_bids_all=tick_bids_all,
+                tick_asks_all=tick_asks_all,
+                use_tick_bid_ask=bool(tick_bids_all is not None and tick_asks_all is not None),
+            )
+            timing["tick_refine_sec"] = time.perf_counter() - t0
+            y_ref = np.asarray(y, dtype=np.int8).copy()
+            for idx_i, rec in tick_map.items():
+                y_ref[int(idx_i)] = np.int8(int(rec.get("y", -1)))
+            y_ref_train = y_ref[:train_idx]
+            union_train_mask = fam_union[:train_idx] & tradable_train
+            union_pos = int(np.sum(union_train_mask & (y_ref_train == 1)))
+            union_neg = int(np.sum(union_train_mask & (y_ref_train == 0)))
+            for it in fam_top:
+                m_train = np.asarray(it["mask"][:train_idx], dtype=bool) & tradable_train
+                tick_pos = int(np.sum(m_train & (y_ref_train == 1)))
+                tick_neg = int(np.sum(m_train & (y_ref_train == 0)))
+                tick_ratio = tick_pos / max(1, tick_neg)
+                tick_lift = (tick_pos / max(1, union_pos)) / max(1e-12, (tick_neg / max(1, union_neg)))
+                it["tick_single_pos_hits"] = tick_pos
+                it["tick_single_neg_hits"] = tick_neg
+                it["tick_single_mask_count"] = int(np.sum(m_train))
+                it["tick_single_ratio"] = float(tick_ratio)
+                it["tick_lift"] = float(tick_lift)
+                it["_single_pos_hits"] = tick_pos
+                it["_single_neg_hits"] = tick_neg
+                it["_single_mask_count"] = int(np.sum(m_train))
+                it["_single_ratio"] = float(tick_ratio)
+                it["ratio"] = float(tick_ratio)
+                it["lift"] = float(tick_lift)
+            tick_refined_mode = True
+            print(f"[prefilter] tick-refined family-top pool on {len(entry_indices)} union entry rows.")
     if coarse_out is not None:
         coarse_rows = []
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
-        for it in filtered_items:
+        for it in full_filtered_items:
             coarse_rows.append({
                 "candidate_key": str(it["candidate_key"]),
                 "col": str(it["col"]),
@@ -833,8 +888,9 @@ def main() -> None:
 
     if refined_out is not None:
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
+        fam_top_by_key = {str(z.get("candidate_key")): z for z in fam_top}
         cand_rows = []
-        for it in filtered_items:
+        for it in full_filtered_items:
             row = {
                 "candidate_key_refined": str(it["candidate_key"]),
                 "col": str(it["col"]),
@@ -856,7 +912,7 @@ def main() -> None:
                 "__stage": "refined",
                 "__ctx_sig": refined_ctx_sig,
             }
-            top_hit = next((z for z in fam_top if str(z.get("candidate_key")) == str(it["candidate_key"])), None)
+            top_hit = fam_top_by_key.get(str(it["candidate_key"]))
             if top_hit is not None:
                 row["tick_single_pos_hits"] = float(top_hit.get("tick_single_pos_hits", np.nan))
                 row["tick_single_neg_hits"] = float(top_hit.get("tick_single_neg_hits", np.nan))
