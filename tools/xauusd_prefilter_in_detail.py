@@ -166,6 +166,10 @@ def _load_stage_csv_if_match(path: Path | None, expected_stage: str, expected_ct
     if stage_vals != {expected_stage}:
         return None
     if sig_vals != {expected_ctx_sig}:
+        got_sig = next(iter(sig_vals), "")
+        print(f"[prefilter-resume] {expected_stage} CSV context mismatch")
+        print(f"[prefilter-resume] csv_ctx_sig={got_sig}")
+        print(f"[prefilter-resume] expected_ctx_sig={expected_ctx_sig}")
         return None
     return df
 
@@ -322,10 +326,16 @@ def _load_tick_minute_map_partial(
     frames = []
     matched_minute_set: set[int] = set()
     for ch in chunks:
-        if datetime_col not in ch.columns:
-            raise ValueError(f"tick-data missing datetime column: {datetime_col}")
         pcol = use_price_col
         cols_lower = {str(c).lower(): str(c) for c in ch.columns}
+        dt_col = cols_lower.get(str(datetime_col).strip().lower())
+        if dt_col is None:
+            for cand in ("datetime", "time", "timestamp", "date"):
+                if cand in cols_lower:
+                    dt_col = cols_lower[cand]
+                    break
+        if dt_col is None:
+            raise ValueError(f"tick-data missing datetime column: {datetime_col}")
         bid_col = cols_lower.get("bid")
         ask_col = cols_lower.get("ask")
         if pcol is None:
@@ -335,7 +345,7 @@ def _load_tick_minute_map_partial(
                     break
             if pcol is None:
                 raise ValueError("tick-data price column not found")
-        dt = pd.to_datetime(ch[datetime_col], errors="coerce", utc=True).dt.floor("min")
+        dt = pd.to_datetime(ch[dt_col], errors="coerce", utc=True).dt.floor("min")
         minute_ns = dt.astype("int64").to_numpy()
         keep = np.isin(minute_ns, np.asarray(list(minute_filter), dtype=np.int64))
         if not np.any(keep):
@@ -611,9 +621,7 @@ def main() -> None:
         "label_cache_key": cache_key,
         "train_frac": float(args.train_frac),
         "quantiles": str(args.quantiles),
-        "min_single_pos_hits": int(args.min_single_pos_hits),
         "min_single_lift": float(args.min_single_lift),
-        "max_single_mask_count": int(args.max_single_mask_count),
         "family_split_delta_window": int(bool(args.family_split_delta_window)),
     }
     coarse_ctx_sig = _ctx_sig(coarse_ctx)
@@ -693,12 +701,8 @@ def main() -> None:
             m = np.asarray(x["mask"], dtype=bool)
             pos_hits = int(np.sum(m[:train_idx] & (y_train == 1))); neg_hits = int(np.sum(m[:train_idx] & (y_train == 0)))
             mask_count = int(np.sum(m[:train_idx]))
-            if pos_hits < int(args.min_single_pos_hits):
-                single_rejects["min_pos"] += 1; continue
             if float(x["lift"]) < float(args.min_single_lift):
                 single_rejects["min_lift"] += 1; continue
-            if int(args.max_single_mask_count) > 0 and mask_count > int(args.max_single_mask_count):
-                single_rejects["mask_count"] += 1; continue
             x["_single_pos_hits"] = pos_hits; x["_single_neg_hits"] = neg_hits; x["_single_mask_count"] = mask_count
             x["_single_ratio"] = pos_hits / max(1, neg_hits)
             x["coarse_single_pos_hits"] = int(pos_hits); x["coarse_single_neg_hits"] = int(neg_hits)
@@ -717,8 +721,19 @@ def main() -> None:
                 by_mask[mh] = it
         filtered_items = list(by_mask.values())
     full_filtered_items = list(filtered_items)
+    filtered_items = list(full_filtered_items)
+    if int(args.min_single_pos_hits) > 0:
+        before = len(filtered_items)
+        filtered_items = [it for it in filtered_items if int(it.get("coarse_single_pos_hits", it.get("_single_pos_hits", 0))) >= int(args.min_single_pos_hits)]
+        single_rejects["min_pos"] = max(0, before - len(filtered_items))
+    if int(args.max_single_mask_count) > 0:
+        before = len(filtered_items)
+        filtered_items = [it for it in filtered_items if int(it.get("coarse_single_mask_count", it.get("_single_mask_count", 0))) <= int(args.max_single_mask_count)]
+        single_rejects["mask_count"] = max(0, before - len(filtered_items))
     if allow_keys is not None:
-        filtered_items = [it for it in full_filtered_items if str(it.get("candidate_key")) in allow_keys]
+        before = len(filtered_items)
+        filtered_items = [it for it in filtered_items if str(it.get("candidate_key")) in allow_keys]
+        single_rejects["allowlist"] = max(0, before - len(filtered_items))
     fam_top: list[dict] = []
     fam_groups: dict[str, list[dict]] = {}
     for it in filtered_items:
@@ -741,6 +756,9 @@ def main() -> None:
     refined_resume = _load_stage_csv_if_match(refined_out, "refined", refined_ctx_sig)
     if refined_resume is not None:
         by_key = {str(it["candidate_key"]): it for it in fam_top}
+        refined_rows_total = int(len(refined_resume))
+        refined_rows_with_tick = 0
+        refined_rows_missing_tick = 0
         for _, r in refined_resume.iterrows():
             k = str(r.get("candidate_key_refined", "")).strip()
             if not k or k not in by_key:
@@ -753,7 +771,9 @@ def main() -> None:
                 r.get("tick_lift", np.nan),
             ]
             if any(pd.isna(v) for v in req_vals):
+                refined_rows_missing_tick += 1
                 continue
+            refined_rows_with_tick += 1
             it = by_key[k]
             it["tick_single_pos_hits"] = int(r.get("tick_single_pos_hits", 0))
             it["tick_single_neg_hits"] = int(r.get("tick_single_neg_hits", 0))
@@ -768,6 +788,11 @@ def main() -> None:
             it["lift"] = float(it["tick_lift"])
         tick_refined_mode = any("tick_single_ratio" in x for x in by_key.values())
         print(f"[prefilter-resume] loaded refined candidates from {refined_out}")
+        print(f"[prefilter-resume] refined_rows_total={refined_rows_total}")
+        print(f"[prefilter-resume] refined_rows_with_tick_metrics={refined_rows_with_tick}")
+        print(f"[prefilter-resume] refined_rows_missing_tick_metrics={refined_rows_missing_tick}")
+        print(f"[prefilter-resume] requested_allowlist_keys={len(allow_keys) if allow_keys is not None else 0}")
+        print(f"[prefilter-resume] usable_refined_keys_for_current_run={sum(1 for it in fam_top if 'tick_single_ratio' in it)}")
     elif bool(allow_keys_refined):
         if refined_out is None or not refined_out.exists():
             raise ValueError("candidate_key_refined input requires --out-candidates-refined-csv file to reload refined metrics")
@@ -792,23 +817,27 @@ def main() -> None:
             slippage_bps=float(args.slippage_bps),
             spread_bps=float(args.spread_bps),
         )
-        if critical_minutes:
-            tick_prices_all, tick_minute_bounds, tick_bids_all, tick_asks_all, matched_critical_minutes_count = _load_tick_minute_map_partial(
+        entry_minutes = {int(bar_time_ns[int(i)]) for i in entry_indices.tolist()}
+        minutes_to_load = set(critical_minutes) | entry_minutes
+        if minutes_to_load:
+            tick_prices_all, tick_minute_bounds, tick_bids_all, tick_asks_all, matched_total_minutes_count = _load_tick_minute_map_partial(
                 path=args.tick_data,
                 datetime_col=args.tick_datetime_column,
                 price_col=args.tick_price_column,
                 sep=args.tick_sep,
-                minute_filter=critical_minutes,
+                minute_filter=minutes_to_load,
             )
+            matched_critical_minutes_count = sum(1 for m in critical_minutes if int(m) in tick_minute_bounds)
         else:
             tick_prices_all, tick_minute_bounds = np.asarray([], dtype=np.float64), {}
-            tick_bids_all, tick_asks_all, matched_critical_minutes_count = None, None, 0
+            tick_bids_all, tick_asks_all, matched_critical_minutes_count, matched_total_minutes_count = None, None, 0, 0
         used_real_ticks = bool(len(tick_minute_bounds) > 0 and matched_critical_minutes_count > 0)
-        print(
-            f"[prefilter-tick] critical_minutes_count={len(critical_minutes)} "
-            f"matched_critical_minutes_count={int(matched_critical_minutes_count)} "
-            f"used_real_ticks={bool(used_real_ticks)}"
-        )
+        print(f"[prefilter-tick] critical_minutes_count={len(critical_minutes)}")
+        print(f"[prefilter-tick] entry_minutes_count={len(entry_minutes)}")
+        print(f"[prefilter-tick] minutes_to_load_count={len(minutes_to_load)}")
+        print(f"[prefilter-tick] matched_critical_minutes_count={int(matched_critical_minutes_count)}")
+        print(f"[prefilter-tick] matched_total_minutes_count={int(matched_total_minutes_count)}")
+        print(f"[prefilter-tick] used_real_ticks={bool(used_real_ticks)}")
         if used_real_ticks:
             t0 = time.perf_counter()
             tick_map = miner.simulate_selected_entries_with_ticks(

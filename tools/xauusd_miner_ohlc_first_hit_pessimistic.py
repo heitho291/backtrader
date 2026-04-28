@@ -1036,7 +1036,7 @@ def simulate_multitp_trailing_pessimistic(
         max_profit_ret = 0.0
         trailing_active = (not trail)
 
-        max_k = n - 1 - i
+        max_k = min(n - 1 - i, max(1, int(hold)))
         qualified = False
         for k in range(1, max_k + 1):
             j = i + k
@@ -1150,15 +1150,16 @@ def simulate_multitp_trailing_pessimistic(
 
         if y[i] == -1:
             if include_unrealized_at_test_end:
-                final_ret = (close[-1] / entry) - 1.0
+                j_end = i + max_k
+                final_ret = (close[j_end] / entry) - 1.0
                 pnl[i] = final_ret
                 y[i] = 1 if qualified else (1 if final_ret > 0 else 0)
-                t_exit[i] = n - 1 - i
+                t_exit[i] = max_k
                 tp_hits[i] = hits
             elif qualified:
                 pnl[i] = trail_activate
                 y[i] = 1
-                t_exit[i] = n - 1 - i
+                t_exit[i] = max_k
                 tp_hits[i] = hits
 
     return pnl, y, t_exit, t_qual, tp_hits
