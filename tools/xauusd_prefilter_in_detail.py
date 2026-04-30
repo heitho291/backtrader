@@ -175,6 +175,24 @@ def _iter_combinations_with_new(idxs: list[int], r: int, new_start: int):
                     yield tuple(sorted(o_part + n_part))
 
 
+def _iter_parent_extensions(parent: dict, idxs: list[int], max_path_conds: int):
+    cset = set(int(x) for x in parent.get("_combo", ()))
+    remaining = int(max_path_conds) - len(cset)
+    if remaining <= 0:
+        return
+    add_candidates = [x for x in idxs if x not in cset]
+    for add_k in range(1, remaining + 1):
+        for adds in itertools.combinations(add_candidates, add_k):
+            combo = tuple(sorted(cset | set(adds)))
+            if 2 <= len(combo) <= int(max_path_conds):
+                yield combo, parent
+
+
+def _iter_all_parent_extensions(seeds: list[dict], idxs: list[int], max_path_conds: int):
+    for p in seeds:
+        yield from _iter_parent_extensions(p, idxs, max_path_conds)
+
+
 def _file_sig(path: Path | None) -> str:
     if path is None:
         return ""
@@ -1266,6 +1284,8 @@ def main() -> None:
     progress_state: dict = {}
     phase_c_was_active = False
     original_early_stop_window_combos = int(args.early_stop_window_combos)
+    stop_after_batch_requested = False
+    force_phase_b_requested = False
     if args.control_file is not None:
         _write_control_none(args.control_file)
     try:
@@ -1286,7 +1306,7 @@ def main() -> None:
                 break
             idxs = list(range(len(pool)))
             old_pool_size = max(0, len(pool) - int(args.step_size))
-            phase_a = len(valid_pool) < int(args.max_valids)
+            phase_a = (len(valid_pool) < int(args.max_valids)) and (not force_phase_b_requested)
             shard_specs: list[tuple[int, int, int, int]] = []
             batch_eff = max(256, int(args.batch_size))
             sid = 0
@@ -1317,18 +1337,12 @@ def main() -> None:
             seeds = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
             mut_combos: list[tuple[tuple[int, ...], dict]] = []
             if (not phase_a) or (phase_a and len(seeds) > 0 and unlocked_next > int(args.step_size)):
-                for p in seeds:
-                    cset = set(int(x) for x in p.get("_combo", ()))
-                    remaining = int(args.max_path_conds) - len(cset)
-                    if remaining <= 0:
-                        continue
-                    add_candidates = [x for x in idxs if x not in cset]
-                    for add_k in range(1, remaining + 1):
-                        for adds in itertools.combinations(add_candidates, add_k):
-                            combo = tuple(sorted(cset | set(adds)))
-                            if 2 <= len(combo) <= int(args.max_path_conds):
-                                mut_combos.append((combo, p))
-                rng.shuffle(mut_combos)
+                mut_combos = []
+                # phase A keeps mixed random behavior as before
+                if phase_a:
+                    mut_combos = list(_iter_all_parent_extensions(seeds, idxs, int(args.max_path_conds)))
+                    rng.shuffle(mut_combos)
+            parent_ext_iter = None if phase_a else _iter_all_parent_extensions(seeds, idxs, int(args.max_path_conds))
             combos_total_free = 0
             rmax = min(int(args.max_path_conds), len(idxs))
             if phase_a:
@@ -1337,7 +1351,7 @@ def main() -> None:
             else:
                 for rr in range(2, rmax + 1):
                     combos_total_free += math.comb(len(idxs), rr)
-            combos_total_parent_extensions = int(len(mut_combos))
+            combos_total_parent_extensions = int(len(mut_combos)) if phase_a else -1
             combos_total = int(combos_total_free + combos_total_parent_extensions)
 
             hist: list[tuple[int, float, tuple[float, int, int]]] = []
@@ -1362,8 +1376,7 @@ def main() -> None:
                         combos.extend([x[0] for x in exp_part])
                         parents.extend([x[1] for x in exp_part])
                 else:
-                    combos_par = mut_combos[mut_i: mut_i + batch_eff]
-                    mut_i += len(combos_par)
+                    combos_par = list(itertools.islice(parent_ext_iter, batch_eff)) if parent_ext_iter is not None else []
                     combos = [x[0] for x in combos_par]
                     parents = [x[1] for x in combos_par]
                     if not combos:
@@ -1398,7 +1411,7 @@ def main() -> None:
                     "pool_size": int(len(pool)),
                     "combos_total_free": int(combos_total_free),
                     "combos_total_parent_extensions": int(combos_total_parent_extensions),
-                    "combos_total": int(combos_total),
+                    "combos_total": int(combos_total) if combos_total_parent_extensions >= 0 else -1,
                     "tested": int(tested),
                     "valid_kept": int(len(valid_pool)),
                     "valid_new_round": int(valid_round),
@@ -1430,15 +1443,17 @@ def main() -> None:
                     args.early_stop_window_combos = int(original_early_stop_window_combos)
                     _write_control_none(args.control_file)
                 elif cmd == "stop_after_batch":
-                    print("[prefilter-control] stop_after_batch")
+                    print("[prefilter-control] stop_after_batch requested; will stop cleanly after batch")
                     _save_progress(valid_pool, progress_state)
                     _write_control_none(args.control_file)
-                    raise KeyboardInterrupt
-                elif cmd == "force_phase_b":
-                    print("[prefilter-control] force_phase_b")
-                    force_phase = "B"
-                    _write_control_none(args.control_file)
+                    stop_after_batch_requested = True
                     break
+                elif cmd == "force_phase_b":
+                    print("[prefilter-control] force_phase_b requested; will end phase A and continue with phase B")
+                    force_phase_b_requested = True
+                    _write_control_none(args.control_file)
+                    if phase_a:
+                        break
                 elif cmd == "force_phase_c":
                     print("[prefilter-control] force_phase_c")
                     force_phase = "C"
@@ -1467,14 +1482,19 @@ def main() -> None:
                     improve_pct = 0.0 if (not np.isfinite(old) or old == 0.0) else ((new - old) / abs(old) * 100.0)
                     a1_improved = any(h[2] > win[-1][2] for h in win[:-1])
                     if improve_pct < float(args.early_stop_avg_improve_pct) and not a1_improved:
-                        print("[prefilter-progress] early stop in round.")
+                        print("[prefilter-progress] early stop in phase A round; continuing with phase B next.")
+                        force_phase_b_requested = True
                         break
 
             for ex in executor_cache.values():
                 ex.shutdown(wait=True)
 
+            if stop_after_batch_requested:
+                print("[prefilter-progress] stopped after batch as requested.")
+                break
             if force_phase in {"C", "D"}:
                 phase_c_was_active = phase_c_was_active or (force_phase == "C")
+                print("[prefilter-progress] Phase C/D not implemented in this task.")
                 break
             if not valid_pool:
                 unlocked = unlocked_next
