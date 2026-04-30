@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import collections
 import hashlib
 import importlib.util
 import itertools
@@ -1335,7 +1336,7 @@ def main() -> None:
             valid_round = 0
             mut_i = 0
             seeds = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
-            mut_combos: list[tuple[tuple[int, ...], dict]] = []
+            mut_combos: collections.deque[tuple[tuple[int, ...], dict]] = collections.deque()
             parent_ext_iter = None
             if (not phase_a) or (phase_a and len(seeds) > 0 and unlocked_next > int(args.step_size)):
                 parent_ext_iter = _iter_all_parent_extensions(seeds, idxs, int(args.max_path_conds))
@@ -1349,7 +1350,10 @@ def main() -> None:
                     if nxt is None:
                         break
                     mut_combos.append(nxt)
-                rng.shuffle(mut_combos)
+                if mut_combos:
+                    tmp = list(mut_combos)
+                    rng.shuffle(tmp)
+                    mut_combos = collections.deque(tmp)
             else:
                 combos_total_free = -1
             combos_total_parent_extensions = int(len(mut_combos)) if phase_a else -1
@@ -1370,13 +1374,16 @@ def main() -> None:
                     combos = list(new_combos)
                     parents = [None] * len(new_combos)
                     # from pool 2 onward in phase A: also expand existing valid rules in parallel
-                    if mut_i < len(mut_combos):
+                    if mut_combos:
                         fill_n = max(1, batch_eff // 2)
-                        exp_part = mut_combos[mut_i: mut_i + fill_n]
-                        mut_i += len(exp_part)
+                        exp_part = []
+                        for _ in range(fill_n):
+                            if not mut_combos:
+                                break
+                            exp_part.append(mut_combos.popleft())
                         combos.extend([x[0] for x in exp_part])
                         parents.extend([x[1] for x in exp_part])
-                    if parent_ext_iter is not None and mut_i >= len(mut_combos):
+                    if parent_ext_iter is not None and len(mut_combos) < max(1, batch_eff // 2):
                         refill = []
                         for _ in range(max(1, batch_eff // 2)):
                             nxt = next(parent_ext_iter, None)
