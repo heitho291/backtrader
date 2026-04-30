@@ -1336,23 +1336,24 @@ def main() -> None:
             mut_i = 0
             seeds = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
             mut_combos: list[tuple[tuple[int, ...], dict]] = []
+            parent_ext_iter = None
             if (not phase_a) or (phase_a and len(seeds) > 0 and unlocked_next > int(args.step_size)):
-                mut_combos = []
-                # phase A keeps mixed random behavior as before
-                if phase_a:
-                    mut_combos = list(_iter_all_parent_extensions(seeds, idxs, int(args.max_path_conds)))
-                    rng.shuffle(mut_combos)
-            parent_ext_iter = None if phase_a else _iter_all_parent_extensions(seeds, idxs, int(args.max_path_conds))
+                parent_ext_iter = _iter_all_parent_extensions(seeds, idxs, int(args.max_path_conds))
             combos_total_free = 0
             rmax = min(int(args.max_path_conds), len(idxs))
             if phase_a:
                 for rr in range(2, rmax + 1):
                     combos_total_free += sum(1 for _ in _iter_combinations_with_new(idxs, rr, old_pool_size))
+                for _ in range(max(1, batch_eff // 2)):
+                    nxt = next(parent_ext_iter, None) if parent_ext_iter is not None else None
+                    if nxt is None:
+                        break
+                    mut_combos.append(nxt)
+                rng.shuffle(mut_combos)
             else:
-                for rr in range(2, rmax + 1):
-                    combos_total_free += math.comb(len(idxs), rr)
+                combos_total_free = -1
             combos_total_parent_extensions = int(len(mut_combos)) if phase_a else -1
-            combos_total = int(combos_total_free + combos_total_parent_extensions)
+            combos_total = int(combos_total_free + combos_total_parent_extensions) if phase_a else -1
 
             hist: list[tuple[int, float, tuple[float, int, int]]] = []
             executor_cache: dict[int, concurrent.futures.ThreadPoolExecutor] = {}
@@ -1375,6 +1376,16 @@ def main() -> None:
                         mut_i += len(exp_part)
                         combos.extend([x[0] for x in exp_part])
                         parents.extend([x[1] for x in exp_part])
+                    if parent_ext_iter is not None and mut_i >= len(mut_combos):
+                        refill = []
+                        for _ in range(max(1, batch_eff // 2)):
+                            nxt = next(parent_ext_iter, None)
+                            if nxt is None:
+                                break
+                            refill.append(nxt)
+                        if refill:
+                            rng.shuffle(refill)
+                            mut_combos.extend(refill)
                 else:
                     combos_par = list(itertools.islice(parent_ext_iter, batch_eff)) if parent_ext_iter is not None else []
                     combos = [x[0] for x in combos_par]
