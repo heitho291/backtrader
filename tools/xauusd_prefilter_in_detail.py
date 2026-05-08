@@ -85,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-random-seed", type=int, default=42)
     p.add_argument("--debug-reject-stats", action="store_true", default=False)
     p.add_argument("--debug-timing-breakdown", action="store_true", default=False)
+    p.add_argument("--debug-atr-candidates", action="store_true", default=False)
     p.add_argument("--label-cache-npz", type=Path, default=None)
     p.add_argument("--min-single-pos-hits", type=int, default=2)
     p.add_argument("--min-single-lift", type=float, default=1.01)
@@ -205,6 +206,14 @@ def _iter_all_parent_extensions(seeds: list[dict], idxs: list[int], max_path_con
         yield from _iter_parent_extensions(p, idxs, max_path_conds)
 
 
+
+def _is_atr_candidate_col(col: str) -> bool:
+    c = str(col).lower()
+    if c.startswith("delta_"):
+        parts = c.split("_", 2)
+        c = parts[2] if len(parts) == 3 and parts[1].isdigit() else c[6:]
+    return bool(c.startswith("atr") or "_atr" in c)
+
 def _file_sig(path: Path | None) -> str:
     if path is None:
         return ""
@@ -287,6 +296,8 @@ def _candidate_family(col: str, split_delta_window: bool) -> str:
             return "delta_kdj"
         if "vol_z" in c:
             return "delta_vol_z"
+        if "atr" in c:
+            return "delta_atr"
     if "dist_ema" in c:
         return "dist_ema"
     if c.startswith("ema"):
@@ -619,6 +630,7 @@ def main() -> None:
         "trail_factor": float(args.trail_factor),
         "trail_min_level": float(args.trail_min_level),
         "include_unrealized_at_test_end": bool(args.include_unrealized_at_test_end),
+        "label_semantics_version": "hold_endpoint_v2",
     }
     cache_key = hashlib.sha1(json.dumps(cache_key_obj, sort_keys=True).encode("utf-8")).hexdigest()
     loaded_cache = False
@@ -657,6 +669,7 @@ def main() -> None:
             bar_time_ns=bar_time_ns,
             tick_prices_all=None,
             tick_minute_bounds=None,
+            period_end_indices=np.where(np.arange(n) < train_idx, train_idx - 1, n - 1).astype(np.int64),
         )
         if args.label_cache_npz is not None:
             args.label_cache_npz.parent.mkdir(parents=True, exist_ok=True)
@@ -675,6 +688,8 @@ def main() -> None:
     t0 = time.perf_counter()
     cols = miner.build_candidate_features(df, allow_absolute_price=False, max_features=0)
     timing["build_candidate_features_sec"] = time.perf_counter() - t0
+    atr_cols_available = sum(1 for c in cols if _is_atr_candidate_col(c))
+    atr_cols_sample = [str(c) for c in cols if _is_atr_candidate_col(c)][:30]
     y_train = y[:train_idx]
     y_test = y[train_idx:]
     tradable_train = ((y_train == 0) | (y_train == 1))
@@ -813,6 +828,25 @@ def main() -> None:
             if tf_new < tf_cur:
                 by_mask[mh] = it
         filtered_items = list(by_mask.values())
+    atr_debug_source = list(items) if items else list(filtered_items)
+    def _atr_debug_pass_counts(source_items: list[dict]) -> tuple[int, int, int, int]:
+        atr_items = [it for it in source_items if _is_atr_candidate_col(str(it.get("col", "")))]
+        after_pos = []
+        after_lift = []
+        after_mask = []
+        for it in atr_items:
+            m = np.asarray(it.get("mask"), dtype=bool)
+            pos_hits = int(it.get("coarse_single_pos_hits", it.get("_single_pos_hits", np.sum(m[:train_idx] & (y_train == 1)))))
+            mask_count = int(it.get("coarse_single_mask_count", it.get("_single_mask_count", np.sum(m[:train_idx]))))
+            lift_v = float(it.get("coarse_lift", it.get("lift", 0.0)))
+            if pos_hits >= int(args.min_single_pos_hits):
+                after_pos.append(it)
+                if lift_v >= float(args.min_single_lift):
+                    after_lift.append(it)
+                    if int(args.max_single_mask_count) <= 0 or mask_count <= int(args.max_single_mask_count):
+                        after_mask.append(it)
+        return len(atr_items), len(after_pos), len(after_lift), len(after_mask)
+    atr_candidates_built, atr_candidates_after_min_pos, atr_candidates_after_min_lift, atr_candidates_after_mask_count = _atr_debug_pass_counts(atr_debug_source)
     full_filtered_items = list(filtered_items)
     filtered_items = list(full_filtered_items)
     if int(args.min_single_pos_hits) > 0:
@@ -974,6 +1008,7 @@ def main() -> None:
                 tick_bids_all=tick_bids_all,
                 tick_asks_all=tick_asks_all,
                 use_tick_bid_ask=bool(tick_bids_all is not None and tick_asks_all is not None),
+                period_end_indices=np.where(np.arange(n) < train_idx, train_idx - 1, n - 1).astype(np.int64),
             )
             y_ref = np.asarray(y, dtype=np.int8).copy()
             for idx_i, rec in tick_map.items():
@@ -1031,6 +1066,20 @@ def main() -> None:
             })
         _atomic_write_csv(coarse_out, pd.DataFrame(coarse_rows))
         print(f"[prefilter-candidates] wrote coarse CSV: {coarse_out} rows={len(coarse_rows)}")
+
+    if bool(args.debug_atr_candidates):
+        atr_candidates_written_to_csv = sum(1 for it in full_filtered_items if _is_atr_candidate_col(str(it.get("col", ""))))
+        print(
+            "[prefilter-atr-debug] "
+            f"atr_cols_available={atr_cols_available} "
+            f"atr_candidates_built={atr_candidates_built} "
+            f"atr_candidates_after_min_pos={atr_candidates_after_min_pos} "
+            f"atr_candidates_after_min_lift={atr_candidates_after_min_lift} "
+            f"atr_candidates_after_mask_count={atr_candidates_after_mask_count} "
+            f"atr_candidates_written_to_csv={atr_candidates_written_to_csv}"
+        )
+        if atr_cols_sample:
+            print("[prefilter-atr-debug] atr_cols_sample=" + ",".join(atr_cols_sample))
 
     if refined_out is not None:
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
@@ -1237,11 +1286,54 @@ def main() -> None:
         }
 
     csv_columns = [
-        "path_index", "rule_human", "rule_json_id", "decode_type_info", "pos_hits", "neg_hits",
+        "path_index", "rule_human", "rule_json_id", "decode_type_info", "decode_bin_info", "pos_hits", "neg_hits",
         "remaining_hit_ratio", "precision_info", "test_pos_hits", "test_neg_hits", "test_ratio",
         "wf_mean_ratio", "wf_min_ratio", "wf_hits", "tp", "sl", "hold", "trail",
         "trail_activate", "trail_offset", "trail_factor", "search_source", "is_fallback_export",
     ]
+
+    def _decode_cond_struct(c: dict) -> dict:
+        col = str(c.get("col", ""))
+        op = str(c.get("op", ""))
+        m = meta.get(col, {}) if isinstance(meta, dict) else {}
+        ftype = str(m.get("feature_type", "unknown"))
+        out = {"feature_type": ftype, "lo_bin": None, "hi_bin": None, "raw_lo": None, "raw_hi": None, "bin_range_text": ""}
+        if op != "==":
+            return out
+        try:
+            lo = int(c.get("lo_bin", round(float(c.get("value", 0.0)))))
+            hi = int(c.get("hi_bin", lo))
+        except Exception:
+            return out
+        missing = int(m.get("missing_code", 0) or 0)
+        eff = int(m.get("effective_bin_count", 0) or 0)
+        if lo == missing or hi == missing or lo < 1 or hi < lo or (eff > 0 and hi > eff):
+            return out
+        out["lo_bin"] = int(lo)
+        out["hi_bin"] = int(hi)
+        out["bin_range_text"] = f"bin[{lo}]" if lo == hi else f"bin[{lo}..{hi}]"
+        edges = m.get("bin_edges", [])
+        if isinstance(edges, list) and len(edges) >= hi:
+            lo_pair = edges[lo - 1]
+            hi_pair = edges[hi - 1]
+            if isinstance(lo_pair, list) and isinstance(hi_pair, list) and len(lo_pair) == 2 and len(hi_pair) == 2:
+                out["raw_lo"] = float(lo_pair[0])
+                out["raw_hi"] = float(hi_pair[1])
+        return out
+
+    def _attach_decode_info(rule: dict) -> dict:
+        rr = dict(rule)
+        conds = []
+        decodes = []
+        for c in rr.get("conds", []):
+            cc = dict(c)
+            dec = _decode_cond_struct(cc)
+            cc["decode"] = dec
+            conds.append(cc)
+            decodes.append(dec)
+        rr["conds"] = conds
+        rr["decode_type_info_structured"] = decodes
+        return rr
 
     def _rules_to_rows(rules: list[dict], is_fallback_export: bool = False) -> list[dict]:
         def _decode_interval(col: str, lo: int, hi: int) -> str:
@@ -1262,6 +1354,7 @@ def main() -> None:
         for i, r in enumerate(rules, start=1):
             decoded_parts = []
             type_parts = []
+            bin_parts = []
             for c in r["conds"]:
                 col = str(c["col"])
                 op = str(c["op"])
@@ -1276,12 +1369,21 @@ def main() -> None:
                         decoded_parts.append(miner.decode_bin_condition(col, val, meta))
                 else:
                     decoded_parts.append(f"{col} {op} {val:.6g}")
-                type_parts.append(f"{col}:{ftype}")
+                dec = c.get("decode") if isinstance(c.get("decode"), dict) else _decode_cond_struct(c)
+                if dec.get("bin_range_text"):
+                    raw_lo = dec.get("raw_lo")
+                    raw_hi = dec.get("raw_hi")
+                    raw_txt = "" if raw_lo is None or raw_hi is None else f" raw[{float(raw_lo):.6g}..{float(raw_hi):.6g}]"
+                    type_parts.append(f"{col}:{ftype} {dec.get('bin_range_text')}{raw_txt}")
+                    bin_parts.append(json.dumps({"col": col, **dec}, ensure_ascii=False, sort_keys=True))
+                else:
+                    type_parts.append(f"{col}:{ftype}")
             rows.append({
                 "path_index": i,
                 "rule_human": " & ".join(decoded_parts),
                 "rule_json_id": f"rule_{i}",
                 "decode_type_info": " | ".join(type_parts),
+                "decode_bin_info": " | ".join(bin_parts),
                 "pos_hits": r["pos_hits"],
                 "neg_hits": r["neg_hits"],
                 "remaining_hit_ratio": r["ratio"],
@@ -1338,9 +1440,9 @@ def main() -> None:
         return out
 
     def _save_progress(valid_pool: list[dict], state: dict) -> None:
-        rules_only = {"version": 2, "rules": valid_pool}
+        rules_only = {"version": 2, "rules": [_attach_decode_info(r) for r in valid_pool]}
         _atomic_write_text(args.out_rules_json, json.dumps(rules_only, ensure_ascii=False, indent=2))
-        rows = _rules_to_rows(valid_pool[: int(args.top_paths)], is_fallback_export=False)
+        rows = _rules_to_rows([_attach_decode_info(r) for r in valid_pool[: int(args.top_paths)]], is_fallback_export=False)
         _validate_rows(rows)
         if rows:
             _atomic_write_csv(args.out_rules_csv, pd.DataFrame(rows))
@@ -1785,7 +1887,7 @@ def main() -> None:
         merged_rule.update(best_sc)
         return merged_rule
 
-    best_paths = [_apply_neighbor_merge(r) for r in best_paths]
+    best_paths = [_attach_decode_info(_apply_neighbor_merge(r)) for r in best_paths]
     best_paths = _dedupe_mask(best_paths)
     train_ranked = sorted(best_paths, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))
     train_rank_map = {id(r): i for i, r in enumerate(train_ranked)}
