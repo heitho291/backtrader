@@ -214,6 +214,10 @@ def _is_atr_candidate_col(col: str) -> bool:
         c = parts[2] if len(parts) == 3 and parts[1].isdigit() else c[6:]
     return bool(c.startswith("atr") or "_atr" in c)
 
+
+def _stable_candidate_key(col: str, op: str, value: float) -> str:
+    return f"{str(col)}|{str(op)}|{float(value):.17g}"
+
 def _file_sig(path: Path | None) -> str:
     if path is None:
         return ""
@@ -883,9 +887,12 @@ def main() -> None:
         "trail": int(bool(args.trail)),
         "trail_activate": float(args.trail_activate),
         "hold": int(args.hold),
-        "tick_refine_scope": str(args.tick_refine_scope),
+        "tick_datetime_column": str(args.tick_datetime_column),
+        "tick_price_column": str(args.tick_price_column),
+        "tick_sep": str(args.tick_sep),
     }
     refined_ctx_sig = _ctx_sig(refined_ctx)
+    tick_refine_t0 = time.perf_counter() if (args.tick_data is not None or (refined_out is not None and refined_out.exists())) else None
     refined_resume = _load_stage_csv_if_match(refined_out, "refined", refined_ctx_sig)
     if str(args.tick_refine_scope) == "fam_top":
         tick_scope_items = fam_top
@@ -894,6 +901,13 @@ def main() -> None:
     else:
         tick_scope_items = full_filtered_items
     all_by_key = {str(it["candidate_key"]): it for it in full_filtered_items}
+    req_tick_cols = ["tick_single_pos_hits", "tick_single_neg_hits", "tick_single_mask_count", "tick_single_ratio", "tick_lift"]
+    def _has_full_tick_metrics(obj: dict) -> bool:
+        try:
+            return all(np.isfinite(float(obj.get(k, np.nan))) for k in req_tick_cols)
+        except Exception:
+            return False
+
     if refined_resume is not None:
         by_key = {str(it["candidate_key"]): it for it in tick_scope_items}
         refined_rows_total = int(len(refined_resume))
@@ -901,35 +915,35 @@ def main() -> None:
         refined_rows_missing_tick = 0
         for _, r in refined_resume.iterrows():
             k = str(r.get("candidate_key_refined", "")).strip()
-            if not k or k not in by_key:
+            stable_k = str(r.get("stable_candidate_key", "")).strip()
+            col_r = str(r.get("col", ""))
+            op_r = str(r.get("op", ""))
+            val_r = float(r.get("value", np.nan)) if pd.notna(r.get("value", np.nan)) else np.nan
+            if not stable_k and col_r and op_r and np.isfinite(val_r):
+                stable_k = _stable_candidate_key(col_r, op_r, val_r)
+            it = all_by_key.get(k)
+            if it is None and stable_k:
+                it = next((x for x in full_filtered_items if _stable_candidate_key(str(x["col"]), str(x["op"]), float(x["value"])) == stable_k), None)
+            if it is None:
                 continue
-            req_vals = [
-                r.get("tick_single_pos_hits", np.nan),
-                r.get("tick_single_neg_hits", np.nan),
-                r.get("tick_single_mask_count", np.nan),
-                r.get("tick_single_ratio", np.nan),
-                r.get("tick_lift", np.nan),
-            ]
+            req_vals = [r.get(c, np.nan) for c in req_tick_cols]
             if any(pd.isna(v) for v in req_vals):
                 refined_rows_missing_tick += 1
                 continue
             refined_rows_with_tick += 1
-            it = all_by_key.get(k)
-            if it is None:
-                continue
             it["tick_single_pos_hits"] = int(r.get("tick_single_pos_hits", 0))
             it["tick_single_neg_hits"] = int(r.get("tick_single_neg_hits", 0))
             it["tick_single_mask_count"] = int(r.get("tick_single_mask_count", 0))
             it["tick_single_ratio"] = float(r.get("tick_single_ratio", 0.0))
             it["tick_lift"] = float(r.get("tick_lift", 0.0))
-            if k in by_key:
+            if str(it.get("candidate_key")) in by_key:
                 it["_single_pos_hits"] = int(it["tick_single_pos_hits"])
                 it["_single_neg_hits"] = int(it["tick_single_neg_hits"])
                 it["_single_mask_count"] = int(it["tick_single_mask_count"])
                 it["_single_ratio"] = float(it["tick_single_ratio"])
                 it["ratio"] = float(it["tick_single_ratio"])
                 it["lift"] = float(it["tick_lift"])
-        tick_refined_mode = any(np.isfinite(float(x.get("tick_single_ratio", np.nan))) for x in by_key.values())
+        tick_refined_mode = any(_has_full_tick_metrics(x) for x in by_key.values())
         print(f"[prefilter-resume] loaded refined candidates from {refined_out}")
         print(f"[prefilter-resume] refined_rows_total={refined_rows_total}")
         print(f"[prefilter-resume] refined_rows_with_tick_metrics={refined_rows_with_tick}")
@@ -940,10 +954,11 @@ def main() -> None:
         if refined_out is None or not refined_out.exists():
             raise ValueError("candidate_key_refined input requires --out-candidates-refined-csv file to reload refined metrics")
         raise ValueError("Refined TXT header provided, but refined candidate CSV context did not match current run.")
-    elif args.tick_data is not None and len(tick_scope_items) > 0:
-        t_ref_start = time.perf_counter()
+    tick_missing_items = [it for it in tick_scope_items if not _has_full_tick_metrics(it)]
+    if args.tick_data is not None and len(tick_scope_items) > 0 and tick_missing_items:
         print(f"[prefilter-tick] tick_refine_scope={args.tick_refine_scope}")
         print(f"[prefilter-tick] tick_refine_candidates_count={len(tick_scope_items)}")
+        print(f"[prefilter-tick] tick_refine_missing_to_compute={len(tick_missing_items)}")
         fam_union = np.zeros(n, dtype=bool)
         for it in tick_scope_items:
             fam_union |= np.asarray(it["mask"], dtype=bool)
@@ -1022,7 +1037,7 @@ def main() -> None:
             union_train_mask = fam_union[:train_idx] & tradable_train
             union_pos = int(np.sum(union_train_mask & (y_ref_train == 1)))
             union_neg = int(np.sum(union_train_mask & (y_ref_train == 0)))
-            for it in tick_scope_items:
+            for it in tick_missing_items:
                 m_train = np.asarray(it["mask"][:train_idx], dtype=bool) & tradable_train
                 tick_pos = int(np.sum(m_train & (y_ref_train == 1)))
                 tick_neg = int(np.sum(m_train & (y_ref_train == 0)))
@@ -1041,9 +1056,10 @@ def main() -> None:
                 it["lift"] = float(tick_lift)
             tick_refined_mode = True
             print(f"[prefilter] tick-refined family-top pool on {len(entry_indices)} union entry rows.")
-        with_tick = sum(1 for it in tick_scope_items if np.isfinite(float(it.get("tick_single_ratio", np.nan))))
-        print(f"[prefilter-tick] tick_refine_candidates_with_tick_metrics={with_tick}")
-        print(f"[prefilter-tick] tick_refine_candidates_missing_tick_metrics={max(0, len(tick_scope_items)-with_tick)}")
+    elif args.tick_data is not None and len(tick_scope_items) > 0:
+        print(f"[prefilter-tick] tick_refine_scope={args.tick_refine_scope}")
+        print(f"[prefilter-tick] tick_refine_candidates_count={len(tick_scope_items)}")
+        print("[prefilter-tick] all requested candidates already have full tick metrics")
     elif args.tick_data is not None:
         print(f"[prefilter-tick] skipped: tick_refine_scope={args.tick_refine_scope} produced empty candidate scope")
     if coarse_out is not None:
@@ -1086,13 +1102,78 @@ def main() -> None:
         if atr_cols_sample:
             print("[prefilter-atr-debug] atr_cols_sample=" + ",".join(atr_cols_sample))
 
+    phase_d_pool_base: list[dict] = []
+    tick_scope_keys = {str(it.get("candidate_key")) for it in tick_scope_items}
+    current_by_stable = {_stable_candidate_key(str(it["col"]), str(it["op"]), float(it["value"])): it for it in full_filtered_items}
+    for it in full_filtered_items:
+        if _has_full_tick_metrics(it):
+            phase_d_pool_base.append(it)
+    if refined_resume is not None:
+        for _, r in refined_resume.iterrows():
+            stable_k = str(r.get("stable_candidate_key", "")).strip()
+            if not stable_k:
+                try:
+                    stable_k = _stable_candidate_key(str(r.get("col", "")), str(r.get("op", "")), float(r.get("value", np.nan)))
+                except Exception:
+                    stable_k = ""
+            if not stable_k or stable_k in current_by_stable:
+                continue
+            row_dict = {k: r.get(k) for k in r.index}
+            if all(np.isfinite(float(row_dict.get(k, np.nan))) for k in req_tick_cols):
+                try:
+                    col = str(row_dict["col"]); op = str(row_dict["op"]); val = float(row_dict["value"])
+                    xvec = pd.to_numeric(bdf[col] if op == "==" else df[col], errors="coerce").to_numpy(copy=False)
+                    if op == "==":
+                        mask = np.isfinite(xvec) & (np.abs(xvec - val) <= 1e-6)
+                    elif op == ">=":
+                        mask = np.isfinite(xvec) & (xvec >= val)
+                    else:
+                        mask = np.isfinite(xvec) & (xvec <= val)
+                    phase_d_pool_base.append({
+                        "candidate_key": str(row_dict.get("candidate_key_refined", stable_k)),
+                        "col": col,
+                        "op": op,
+                        "value": val,
+                        "mask": mask,
+                        "binary": bool(int(row_dict.get("binary", 0) or 0)),
+                        "_family": str(row_dict.get("family", _candidate_family(col, bool(args.family_split_delta_window)))),
+                        "_single_pos_hits": int(float(row_dict.get("tick_single_pos_hits", 0))),
+                        "_single_neg_hits": int(float(row_dict.get("tick_single_neg_hits", 0))),
+                        "_single_mask_count": int(float(row_dict.get("tick_single_mask_count", 0))),
+                        "_single_ratio": float(row_dict.get("tick_single_ratio", 0.0)),
+                        "ratio": float(row_dict.get("tick_single_ratio", 0.0)),
+                        "lift": float(row_dict.get("tick_lift", 0.0)),
+                        "tick_single_pos_hits": int(float(row_dict.get("tick_single_pos_hits", 0))),
+                        "tick_single_neg_hits": int(float(row_dict.get("tick_single_neg_hits", 0))),
+                        "tick_single_mask_count": int(float(row_dict.get("tick_single_mask_count", 0))),
+                        "tick_single_ratio": float(row_dict.get("tick_single_ratio", 0.0)),
+                        "tick_lift": float(row_dict.get("tick_lift", 0.0)),
+                    })
+                except Exception as e:
+                    print(f"[prefilter-phase-d] skipped refined row without reconstructable mask: {stable_k} err={e}")
+
     if refined_out is not None:
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
-        tick_scope_by_key = {str(z.get("candidate_key")): z for z in tick_scope_items}
-        cand_rows = []
+        existing_rows: dict[str, dict] = {}
+        if refined_resume is not None:
+            for _, r in refined_resume.iterrows():
+                try:
+                    stable_k = str(r.get("stable_candidate_key", "")).strip() or _stable_candidate_key(str(r.get("col", "")), str(r.get("op", "")), float(r.get("value", np.nan)))
+                except Exception:
+                    stable_k = str(r.get("candidate_key_refined", "")).strip()
+                if not stable_k:
+                    continue
+                row = {k: r.get(k) for k in r.index}
+                row["stable_candidate_key"] = stable_k
+                row["tick_metric_status"] = "out_of_scope"
+                row["__ctx_sig"] = refined_ctx_sig
+                existing_rows[stable_k] = row
         for it in full_filtered_items:
-            row = {
+            stable_k = _stable_candidate_key(str(it["col"]), str(it["op"]), float(it["value"]))
+            row = existing_rows.get(stable_k, {})
+            row.update({
                 "candidate_key_refined": str(it["candidate_key"]),
+                "stable_candidate_key": stable_k,
                 "col": str(it["col"]),
                 "op": str(it["op"]),
                 "value": float(it["value"]),
@@ -1102,28 +1183,35 @@ def main() -> None:
                 "coarse_single_mask_count": int(it.get("coarse_single_mask_count", it.get("_single_mask_count", 0))),
                 "coarse_single_ratio": float(it.get("coarse_single_ratio", it.get("_single_ratio", it.get("ratio", 0.0)))),
                 "coarse_lift": float(it.get("coarse_lift", it.get("lift", 0.0))),
-                "tick_single_pos_hits": float("nan"),
-                "tick_single_neg_hits": float("nan"),
-                "tick_single_mask_count": float("nan"),
-                "tick_single_ratio": float("nan"),
-                "tick_lift": float("nan"),
                 "binary": int(bool(it.get("binary", False))),
                 "kept_after_family_topn": int(str(it["candidate_key"]) in fam_top_keys),
                 "__stage": "refined",
                 "__ctx_sig": refined_ctx_sig,
-            }
-            top_hit = tick_scope_by_key.get(str(it["candidate_key"]))
-            if top_hit is not None:
-                row["tick_single_pos_hits"] = float(top_hit.get("tick_single_pos_hits", np.nan))
-                row["tick_single_neg_hits"] = float(top_hit.get("tick_single_neg_hits", np.nan))
-                row["tick_single_mask_count"] = float(top_hit.get("tick_single_mask_count", np.nan))
-                row["tick_single_ratio"] = float(top_hit.get("tick_single_ratio", np.nan))
-                row["tick_lift"] = float(top_hit.get("tick_lift", np.nan))
-            cand_rows.append(row)
+            })
+            for col_tick in req_tick_cols:
+                row[col_tick] = float(it.get(col_tick, row.get(col_tick, np.nan)))
+            if str(it.get("candidate_key")) not in tick_scope_keys:
+                row["tick_metric_status"] = "out_of_scope"
+            elif _has_full_tick_metrics(row):
+                row["tick_metric_status"] = "full"
+            else:
+                row["tick_metric_status"] = "missing"
+            existing_rows[stable_k] = row
+        cand_rows = list(existing_rows.values())
         _atomic_write_csv(refined_out, pd.DataFrame(cand_rows))
         print(f"[prefilter-candidates] wrote refined CSV: {refined_out} rows={len(cand_rows)}")
-        if args.tick_data is not None:
-            timing["tick_refine_sec"] = time.perf_counter() - t_ref_start if 't_ref_start' in locals() else timing.get("tick_refine_sec", 0.0)
+
+    tick_candidates_requested = len(tick_scope_items)
+    tick_candidates_with_metrics = sum(1 for it in tick_scope_items if _has_full_tick_metrics(it))
+    tick_candidates_missing_metrics = max(0, tick_candidates_requested - tick_candidates_with_metrics)
+    tick_refined_mode = bool(tick_refined_mode or len(phase_d_pool_base) > 0)
+    print(f"[prefilter-tick] tick_candidates_requested={tick_candidates_requested}")
+    print(f"[prefilter-tick] tick_candidates_with_metrics={tick_candidates_with_metrics}")
+    print(f"[prefilter-tick] tick_candidates_missing_metrics={tick_candidates_missing_metrics}")
+    print(f"[prefilter-tick] tick_candidates_used_for_phase_d={len(phase_d_pool_base)}")
+    if tick_refine_t0 is not None:
+        timing["tick_refine_sec"] = time.perf_counter() - tick_refine_t0
+
 
     if tick_refined_mode:
         rank_lift = _with_rank_context(sorted(fam_top, key=lambda z: (-float(z.get("ratio", 0.0)), -int(z.get("_single_pos_hits", 0)), int(z.get("_single_mask_count", 0)))), "ratio")
@@ -1790,15 +1878,13 @@ def main() -> None:
     if not tick_refined_mode:
         print("[prefilter-phase-d] skipped: no tick metrics available")
     else:
-        req_tick_cols = ["tick_single_pos_hits", "tick_single_neg_hits", "tick_single_mask_count", "tick_single_ratio", "tick_lift"]
-        tick_pool_raw = list(rank_lift)
-        tick_pool = [r for r in tick_pool_raw if all(np.isfinite(float(r.get(k, np.nan))) for k in req_tick_cols)]
-        print(f"[prefilter-phase-d] tick_candidates_available={len(tick_pool_raw)} tick_candidates_with_full_metrics={len(tick_pool)} (source=current ranked family-top pool)")
+        tick_pool_raw = list(phase_d_pool_base)
+        tick_pool = [r for r in tick_pool_raw if _has_full_tick_metrics(r)]
+        print(f"[prefilter-phase-d] tick_candidates_available={len(tick_pool_raw)} tick_candidates_with_full_metrics={len(tick_pool)} (source=all current/refined tick-metric candidates)")
         if not tick_pool:
             print("[prefilter-phase-d] skipped: tick pool empty")
         else:
-            tick_pool = sorted(tick_pool, key=lambda z: (-float(z.get("tick_single_ratio", -np.inf)), -int(z.get("_single_pos_hits", 0))))
-            tick_pool = tick_pool[: max(1, int(args.phase_d_beam_width) * 8)]
+            tick_pool = sorted(tick_pool, key=lambda z: (-float(z.get("tick_single_ratio", -np.inf)), -int(z.get("tick_single_pos_hits", z.get("_single_pos_hits", 0)))))
             idxs_d = list(range(len(tick_pool)))
             beam = [tuple([i]) for i in idxs_d[: max(1, min(len(idxs_d), int(args.phase_d_beam_width)))]]
             beam = [b for b in beam if len(b) >= int(args.phase_d_start_conds)]
@@ -1825,6 +1911,10 @@ def main() -> None:
                             out_d.append(rr)
                 if not had_any:
                     break
+                if not out_d:
+                    break
+                existing_non_d_masks = {str(r.get("_mask_hash", "")) for r in valid_pool if str(r.get("search_source", "")) != "D"}
+                out_d = [r for r in out_d if str(r.get("_mask_hash", "")) not in existing_non_d_masks]
                 if not out_d:
                     break
                 valid_pool.extend(out_d)
