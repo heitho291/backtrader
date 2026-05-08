@@ -69,6 +69,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tick-datetime-column", type=str, default="datetime")
     p.add_argument("--tick-price-column", type=str, default="auto")
     p.add_argument("--tick-sep", type=str, default=",")
+    p.add_argument("--tick-refine-scope", type=str, default="fam_top", choices=["fam_top", "filtered", "all_coarse"])
+    p.add_argument("--tick-chunk-size", type=str, default="auto")
 
     p.add_argument("--step-size", type=int, default=5)
     p.add_argument("--top-paths", type=int, default=24)
@@ -103,6 +105,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-rules-json", type=Path, default=Path("prefilter_in_detail_rules.json"))
     p.add_argument("--out-rules-csv", type=Path, default=Path("prefilter_in_detail_rules.csv"))
     p.add_argument("--control-file", type=Path, default=None)
+    p.add_argument("--phase-c-beam-width", type=int, default=64)
+    p.add_argument("--phase-c-add-min", type=int, default=1)
+    p.add_argument("--phase-c-add-max", type=int, default=2)
+    p.add_argument("--phase-c-max-conds", type=int, default=9)
+    p.add_argument("--phase-d-beam-width", type=int, default=64)
+    p.add_argument("--phase-d-start-conds", type=int, default=2)
+    p.add_argument("--phase-d-add-min", type=int, default=1)
+    p.add_argument("--phase-d-add-max", type=int, default=2)
+    p.add_argument("--phase-d-max-conds", type=int, default=9)
     return p.parse_args()
 
 
@@ -373,11 +384,13 @@ def _load_tick_minute_map_partial(
     price_col: str,
     sep: str,
     minute_filter: set[int],
+    tick_chunk_size: int | str = "auto",
 ) -> tuple[np.ndarray, dict[int, tuple[int, int]], np.ndarray | None, np.ndarray | None, int]:
     if not minute_filter:
         return np.asarray([], dtype=np.float64), {}, None, None, 0
     use_price_col = None if str(price_col).lower() == "auto" else str(price_col)
-    chunks = pd.read_csv(path, sep=sep, chunksize=2_000_000)
+    chunk_size_eff = 250_000 if str(tick_chunk_size).lower() == "auto" else max(10_000, int(tick_chunk_size))
+    chunks = pd.read_csv(path, sep=sep, chunksize=chunk_size_eff)
     frames = []
     matched_minute_set: set[int] = set()
     for ch in chunks:
@@ -676,13 +689,38 @@ def main() -> None:
         "label_cache_key": cache_key,
         "train_frac": float(args.train_frac),
         "quantiles": str(args.quantiles),
-        "min_single_lift": float(args.min_single_lift),
         "family_split_delta_window": int(bool(args.family_split_delta_window)),
     }
     coarse_ctx_sig = _ctx_sig(coarse_ctx)
     coarse_out = args.out_candidates_coarse_csv
     refined_out = args.out_candidates_refined_csv
     coarse_resume = _load_stage_csv_if_match(coarse_out, "coarse", coarse_ctx_sig)
+    if coarse_resume is not None and len(coarse_resume) > 0:
+        b_pos = int(coarse_resume.get("build_min_single_pos_hits", pd.Series([args.min_single_pos_hits])).iloc[0])
+        b_mask = int(coarse_resume.get("build_max_single_mask_count", pd.Series([args.max_single_mask_count])).iloc[0])
+        b_lift = float(coarse_resume.get("build_min_single_lift", pd.Series([args.min_single_lift])).iloc[0])
+        c_pos = int(args.min_single_pos_hits)
+        c_mask = int(args.max_single_mask_count)
+        c_lift = float(args.min_single_lift)
+        too_narrow_reasons = []
+        if b_mask == 0:
+            pass
+        elif c_mask == 0:
+            too_narrow_reasons.append("max_single_mask_count")
+        elif c_mask > b_mask:
+            too_narrow_reasons.append("max_single_mask_count")
+        if c_pos < b_pos:
+            too_narrow_reasons.append("min_single_pos_hits")
+        if c_lift < b_lift:
+            too_narrow_reasons.append("min_single_lift")
+        print(f"[prefilter-resume] coarse_build_min_single_pos_hits={b_pos} current_min_single_pos_hits={c_pos}")
+        print(f"[prefilter-resume] coarse_build_max_single_mask_count={b_mask} current_max_single_mask_count={c_mask}")
+        print(f"[prefilter-resume] coarse_build_min_single_lift={b_lift} current_min_single_lift={c_lift}")
+        if too_narrow_reasons:
+            print(f"[prefilter-resume] discard coarse CSV (too narrow): {','.join(too_narrow_reasons)}")
+            coarse_resume = None
+        else:
+            print("[prefilter-resume] coarse CSV reused (build width is sufficient)")
 
     items = []
     filtered_items: list[dict] = []
@@ -806,11 +844,19 @@ def main() -> None:
         "trail": int(bool(args.trail)),
         "trail_activate": float(args.trail_activate),
         "hold": int(args.hold),
+        "tick_refine_scope": str(args.tick_refine_scope),
     }
     refined_ctx_sig = _ctx_sig(refined_ctx)
     refined_resume = _load_stage_csv_if_match(refined_out, "refined", refined_ctx_sig)
+    if str(args.tick_refine_scope) == "fam_top":
+        tick_scope_items = fam_top
+    elif str(args.tick_refine_scope) == "filtered":
+        tick_scope_items = filtered_items
+    else:
+        tick_scope_items = full_filtered_items
+    all_by_key = {str(it["candidate_key"]): it for it in full_filtered_items}
     if refined_resume is not None:
-        by_key = {str(it["candidate_key"]): it for it in fam_top}
+        by_key = {str(it["candidate_key"]): it for it in tick_scope_items}
         refined_rows_total = int(len(refined_resume))
         refined_rows_with_tick = 0
         refined_rows_missing_tick = 0
@@ -829,19 +875,22 @@ def main() -> None:
                 refined_rows_missing_tick += 1
                 continue
             refined_rows_with_tick += 1
-            it = by_key[k]
+            it = all_by_key.get(k)
+            if it is None:
+                continue
             it["tick_single_pos_hits"] = int(r.get("tick_single_pos_hits", 0))
             it["tick_single_neg_hits"] = int(r.get("tick_single_neg_hits", 0))
             it["tick_single_mask_count"] = int(r.get("tick_single_mask_count", 0))
             it["tick_single_ratio"] = float(r.get("tick_single_ratio", 0.0))
             it["tick_lift"] = float(r.get("tick_lift", 0.0))
-            it["_single_pos_hits"] = int(it["tick_single_pos_hits"])
-            it["_single_neg_hits"] = int(it["tick_single_neg_hits"])
-            it["_single_mask_count"] = int(it["tick_single_mask_count"])
-            it["_single_ratio"] = float(it["tick_single_ratio"])
-            it["ratio"] = float(it["tick_single_ratio"])
-            it["lift"] = float(it["tick_lift"])
-        tick_refined_mode = any("tick_single_ratio" in x for x in by_key.values())
+            if k in by_key:
+                it["_single_pos_hits"] = int(it["tick_single_pos_hits"])
+                it["_single_neg_hits"] = int(it["tick_single_neg_hits"])
+                it["_single_mask_count"] = int(it["tick_single_mask_count"])
+                it["_single_ratio"] = float(it["tick_single_ratio"])
+                it["ratio"] = float(it["tick_single_ratio"])
+                it["lift"] = float(it["tick_lift"])
+        tick_refined_mode = any(np.isfinite(float(x.get("tick_single_ratio", np.nan))) for x in by_key.values())
         print(f"[prefilter-resume] loaded refined candidates from {refined_out}")
         print(f"[prefilter-resume] refined_rows_total={refined_rows_total}")
         print(f"[prefilter-resume] refined_rows_with_tick_metrics={refined_rows_with_tick}")
@@ -852,9 +901,12 @@ def main() -> None:
         if refined_out is None or not refined_out.exists():
             raise ValueError("candidate_key_refined input requires --out-candidates-refined-csv file to reload refined metrics")
         raise ValueError("Refined TXT header provided, but refined candidate CSV context did not match current run.")
-    elif args.tick_data is not None and len(fam_top) > 0:
+    elif args.tick_data is not None and len(tick_scope_items) > 0:
+        t_ref_start = time.perf_counter()
+        print(f"[prefilter-tick] tick_refine_scope={args.tick_refine_scope}")
+        print(f"[prefilter-tick] tick_refine_candidates_count={len(tick_scope_items)}")
         fam_union = np.zeros(n, dtype=bool)
-        for it in fam_top:
+        for it in tick_scope_items:
             fam_union |= np.asarray(it["mask"], dtype=bool)
         entry_indices = np.flatnonzero(fam_union).astype(np.int64, copy=False)
         critical_minutes = _critical_minutes_for_entries(
@@ -881,20 +933,24 @@ def main() -> None:
                 price_col=args.tick_price_column,
                 sep=args.tick_sep,
                 minute_filter=minutes_to_load,
+                tick_chunk_size=args.tick_chunk_size,
             )
             matched_critical_minutes_count = sum(1 for m in critical_minutes if int(m) in tick_minute_bounds)
         else:
             tick_prices_all, tick_minute_bounds = np.asarray([], dtype=np.float64), {}
             tick_bids_all, tick_asks_all, matched_critical_minutes_count, matched_total_minutes_count = None, None, 0, 0
-        used_real_ticks = bool(len(tick_minute_bounds) > 0 and matched_critical_minutes_count > 0)
+        used_real_ticks_partial = bool(matched_critical_minutes_count > 0)
+        used_real_ticks_full = bool(len(minutes_to_load) > 0 and matched_total_minutes_count >= len(minutes_to_load) and matched_critical_minutes_count >= len(critical_minutes))
+        used_real_ticks = bool(used_real_ticks_partial)
         print(f"[prefilter-tick] critical_minutes_count={len(critical_minutes)}")
         print(f"[prefilter-tick] entry_minutes_count={len(entry_minutes)}")
         print(f"[prefilter-tick] minutes_to_load_count={len(minutes_to_load)}")
         print(f"[prefilter-tick] matched_critical_minutes_count={int(matched_critical_minutes_count)}")
         print(f"[prefilter-tick] matched_total_minutes_count={int(matched_total_minutes_count)}")
         print(f"[prefilter-tick] used_real_ticks={bool(used_real_ticks)}")
+        print(f"[prefilter-tick] used_real_ticks_partial={bool(used_real_ticks_partial)}")
+        print(f"[prefilter-tick] used_real_ticks_full={bool(used_real_ticks_full)}")
         if used_real_ticks:
-            t0 = time.perf_counter()
             tick_map = miner.simulate_selected_entries_with_ticks(
                 entry_indices=entry_indices,
                 high=high,
@@ -919,7 +975,6 @@ def main() -> None:
                 tick_asks_all=tick_asks_all,
                 use_tick_bid_ask=bool(tick_bids_all is not None and tick_asks_all is not None),
             )
-            timing["tick_refine_sec"] = time.perf_counter() - t0
             y_ref = np.asarray(y, dtype=np.int8).copy()
             for idx_i, rec in tick_map.items():
                 y_ref[int(idx_i)] = np.int8(int(rec.get("y", -1)))
@@ -927,7 +982,7 @@ def main() -> None:
             union_train_mask = fam_union[:train_idx] & tradable_train
             union_pos = int(np.sum(union_train_mask & (y_ref_train == 1)))
             union_neg = int(np.sum(union_train_mask & (y_ref_train == 0)))
-            for it in fam_top:
+            for it in tick_scope_items:
                 m_train = np.asarray(it["mask"][:train_idx], dtype=bool) & tradable_train
                 tick_pos = int(np.sum(m_train & (y_ref_train == 1)))
                 tick_neg = int(np.sum(m_train & (y_ref_train == 0)))
@@ -946,6 +1001,11 @@ def main() -> None:
                 it["lift"] = float(tick_lift)
             tick_refined_mode = True
             print(f"[prefilter] tick-refined family-top pool on {len(entry_indices)} union entry rows.")
+        with_tick = sum(1 for it in tick_scope_items if np.isfinite(float(it.get("tick_single_ratio", np.nan))))
+        print(f"[prefilter-tick] tick_refine_candidates_with_tick_metrics={with_tick}")
+        print(f"[prefilter-tick] tick_refine_candidates_missing_tick_metrics={max(0, len(tick_scope_items)-with_tick)}")
+    elif args.tick_data is not None:
+        print(f"[prefilter-tick] skipped: tick_refine_scope={args.tick_refine_scope} produced empty candidate scope")
     if coarse_out is not None:
         coarse_rows = []
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
@@ -963,6 +1023,9 @@ def main() -> None:
                 "coarse_lift": float(it.get("coarse_lift", it.get("lift", 0.0))),
                 "binary": int(bool(it.get("binary", False))),
                 "kept_after_family_topn": int(str(it["candidate_key"]) in fam_top_keys),
+                "build_min_single_pos_hits": int(args.min_single_pos_hits),
+                "build_max_single_mask_count": int(args.max_single_mask_count),
+                "build_min_single_lift": float(args.min_single_lift),
                 "__stage": "coarse",
                 "__ctx_sig": coarse_ctx_sig,
             })
@@ -971,7 +1034,7 @@ def main() -> None:
 
     if refined_out is not None:
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
-        fam_top_by_key = {str(z.get("candidate_key")): z for z in fam_top}
+        tick_scope_by_key = {str(z.get("candidate_key")): z for z in tick_scope_items}
         cand_rows = []
         for it in full_filtered_items:
             row = {
@@ -995,7 +1058,7 @@ def main() -> None:
                 "__stage": "refined",
                 "__ctx_sig": refined_ctx_sig,
             }
-            top_hit = fam_top_by_key.get(str(it["candidate_key"]))
+            top_hit = tick_scope_by_key.get(str(it["candidate_key"]))
             if top_hit is not None:
                 row["tick_single_pos_hits"] = float(top_hit.get("tick_single_pos_hits", np.nan))
                 row["tick_single_neg_hits"] = float(top_hit.get("tick_single_neg_hits", np.nan))
@@ -1005,6 +1068,8 @@ def main() -> None:
             cand_rows.append(row)
         _atomic_write_csv(refined_out, pd.DataFrame(cand_rows))
         print(f"[prefilter-candidates] wrote refined CSV: {refined_out} rows={len(cand_rows)}")
+        if args.tick_data is not None:
+            timing["tick_refine_sec"] = time.perf_counter() - t_ref_start if 't_ref_start' in locals() else timing.get("tick_refine_sec", 0.0)
 
     if tick_refined_mode:
         rank_lift = _with_rank_context(sorted(fam_top, key=lambda z: (-float(z.get("ratio", 0.0)), -int(z.get("_single_pos_hits", 0)), int(z.get("_single_mask_count", 0)))), "ratio")
@@ -1118,7 +1183,7 @@ def main() -> None:
     def _mask_hash(mask: np.ndarray) -> str:
         return _mask_hash_arr(mask)
 
-    def evaluate_combo(combo: Tuple[int, ...], pool_items: List[dict], parent: dict | None = None) -> dict | None:
+    def evaluate_combo(combo: Tuple[int, ...], pool_items: List[dict], parent: dict | None = None, source: str = "A") -> dict | None:
         conds = [pool_items[i] for i in combo]
         dedup = []
         seen_gid = set()
@@ -1167,6 +1232,7 @@ def main() -> None:
             "conds": [{"col": str(c["col"]), "op": str(c["op"]), "value": float(c["value"]), "domain": "auto"} for c in conds],
             "_combo": tuple(sorted(int(x) for x in combo)),
             "_mask_hash": mh,
+            "search_source": str(source),
             **sc,
         }
 
@@ -1174,7 +1240,7 @@ def main() -> None:
         "path_index", "rule_human", "rule_json_id", "decode_type_info", "pos_hits", "neg_hits",
         "remaining_hit_ratio", "precision_info", "test_pos_hits", "test_neg_hits", "test_ratio",
         "wf_mean_ratio", "wf_min_ratio", "wf_hits", "tp", "sl", "hold", "trail",
-        "trail_activate", "trail_offset", "trail_factor", "is_fallback_export",
+        "trail_activate", "trail_offset", "trail_factor", "search_source", "is_fallback_export",
     ]
 
     def _rules_to_rows(rules: list[dict], is_fallback_export: bool = False) -> list[dict]:
@@ -1233,6 +1299,7 @@ def main() -> None:
                 "trail_activate": float(args.trail_activate),
                 "trail_offset": float(args.trail_offset),
                 "trail_factor": float(args.trail_factor),
+                "search_source": str(r.get("search_source", "")),
                 "is_fallback_export": int(bool(is_fallback_export)),
             })
         return rows
@@ -1402,7 +1469,7 @@ def main() -> None:
                 out_batch: list[dict] = []
                 if workers_eff <= 1:
                     for i, cb in enumerate(combos):
-                        rr = evaluate_combo(cb, pool, parents[i])
+                        rr = evaluate_combo(cb, pool, parents[i], source=("A" if phase_a else "B"))
                         if rr is not None:
                             out_batch.append(rr)
                 else:
@@ -1410,7 +1477,7 @@ def main() -> None:
                     if ex is None:
                         ex = concurrent.futures.ThreadPoolExecutor(max_workers=int(workers_eff))
                         executor_cache[int(workers_eff)] = ex
-                    futs = [ex.submit(evaluate_combo, cb, pool, parents[i]) for i, cb in enumerate(combos)]
+                    futs = [ex.submit(evaluate_combo, cb, pool, parents[i], ("A" if phase_a else "B")) for i, cb in enumerate(combos)]
                     for f in futs:
                         rr = f.result()
                         if rr is not None:
@@ -1512,7 +1579,7 @@ def main() -> None:
                 break
             if force_phase in {"C", "D"}:
                 phase_c_was_active = phase_c_was_active or (force_phase == "C")
-                print("[prefilter-progress] Phase C/D not implemented in this task.")
+                print("[prefilter-progress] force phase switch requested; continuing with implemented post A/B phases.")
                 break
             if not valid_pool:
                 unlocked = unlocked_next
@@ -1528,6 +1595,122 @@ def main() -> None:
     except KeyboardInterrupt:
         print("[prefilter] interrupted; checkpoint saved.")
         _save_progress(valid_pool, progress_state)
+
+    # Phase C: family-top-pool beam search
+    pool_c = _build_unlocked_pool(
+        miner_mod=miner,
+        rank_lists=[rank_lift],
+        all_candidate_cols=cols,
+        unlocked_next=len(rank_lift),
+        step_size=int(args.step_size),
+        binary_cap_per_list_block=10 ** 9,
+        binary_anchor_lookahead_blocks=int(args.binary_anchor_lookahead_blocks),
+        binary_cap_per_block=10 ** 9,
+    )
+    if len(pool_c) == 0:
+        print("[prefilter-phase-c] skipped: empty family-top pool")
+    else:
+        idxs_c = list(range(len(pool_c)))
+        seed_rules = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: max(1, int(args.phase_c_beam_width))]
+        cond_to_idx_c = {(str(c["col"]), str(c["op"]), float(c["value"])): i for i, c in enumerate(pool_c)}
+        mapped_beam: list[tuple[int, ...]] = []
+        for s in seed_rules:
+            mapped = []
+            ok = True
+            for c in s.get("conds", []):
+                key = (str(c["col"]), str(c["op"]), float(c["value"]))
+                idx = cond_to_idx_c.get(key)
+                if idx is None:
+                    ok = False
+                    break
+                mapped.append(int(idx))
+            if ok and mapped:
+                mapped_beam.append(tuple(sorted(set(mapped))))
+        if not mapped_beam:
+            mapped_beam = [tuple([i]) for i in idxs_c[: max(1, min(int(args.phase_c_beam_width), len(idxs_c)))]]
+        beam = mapped_beam
+        beam = [b for b in beam if 1 <= len(b) <= int(args.phase_c_max_conds)]
+        print(f"[prefilter-phase-c] start beam={len(beam)} pool={len(pool_c)}")
+        while beam:
+            out_c: list[dict] = []
+            def _iter_cands_c():
+                for base in beam:
+                    cset = set(base)
+                    add_cands = [x for x in idxs_c if x not in cset]
+                    for add_k in range(max(1, int(args.phase_c_add_min)), max(1, int(args.phase_c_add_max)) + 1):
+                        if len(base) + add_k > int(args.phase_c_max_conds) or len(base) + add_k > int(args.max_path_conds):
+                            continue
+                        for adds in itertools.combinations(add_cands, add_k):
+                            yield tuple(sorted(cset | set(adds)))
+            had_any = False
+            for chunk in _batched(_iter_cands_c(), max(64, int(args.batch_size))):
+                had_any = True
+                for cb in chunk:
+                    rr = evaluate_combo(cb, pool_c, None, source="C")
+                    if rr is not None:
+                        out_c.append(rr)
+            if not had_any:
+                break
+            if not out_c:
+                break
+            valid_pool.extend(out_c)
+            valid_pool = _dedupe_mask(valid_pool)
+            valid_pool = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
+            _save_progress(valid_pool, progress_state)
+            beam_rules = sorted(out_c, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.phase_c_beam_width)]
+            beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
+        print("[prefilter-phase-c] done")
+
+    # Phase D: full tick beam search
+    if not tick_refined_mode:
+        print("[prefilter-phase-d] skipped: no tick metrics available")
+    else:
+        req_tick_cols = ["tick_single_pos_hits", "tick_single_neg_hits", "tick_single_mask_count", "tick_single_ratio", "tick_lift"]
+        tick_pool_raw = list(rank_lift)
+        tick_pool = [r for r in tick_pool_raw if all(np.isfinite(float(r.get(k, np.nan))) for k in req_tick_cols)]
+        print(f"[prefilter-phase-d] tick_candidates_available={len(tick_pool_raw)} tick_candidates_with_full_metrics={len(tick_pool)} (source=current ranked family-top pool)")
+        if not tick_pool:
+            print("[prefilter-phase-d] skipped: tick pool empty")
+        else:
+            tick_pool = sorted(tick_pool, key=lambda z: (-float(z.get("tick_single_ratio", -np.inf)), -int(z.get("_single_pos_hits", 0))))
+            tick_pool = tick_pool[: max(1, int(args.phase_d_beam_width) * 8)]
+            idxs_d = list(range(len(tick_pool)))
+            beam = [tuple([i]) for i in idxs_d[: max(1, min(len(idxs_d), int(args.phase_d_beam_width)))]]
+            beam = [b for b in beam if len(b) >= int(args.phase_d_start_conds)]
+            if not beam:
+                beam = [tuple(sorted(x)) for x in itertools.combinations(idxs_d, min(int(args.phase_d_start_conds), len(idxs_d)))][: int(args.phase_d_beam_width)]
+            print(f"[prefilter-phase-d] start beam={len(beam)} tick_pool={len(tick_pool)}")
+            while beam:
+                out_d: list[dict] = []
+                def _iter_cands_d():
+                    for base in beam:
+                        cset = set(base)
+                        add_cands = [x for x in idxs_d if x not in cset]
+                        for add_k in range(max(1, int(args.phase_d_add_min)), max(1, int(args.phase_d_add_max)) + 1):
+                            if len(base) + add_k > int(args.phase_d_max_conds) or len(base) + add_k > int(args.max_path_conds):
+                                continue
+                            for adds in itertools.combinations(add_cands, add_k):
+                                yield tuple(sorted(cset | set(adds)))
+                had_any = False
+                for chunk in _batched(_iter_cands_d(), max(64, int(args.batch_size))):
+                    had_any = True
+                    for cb in chunk:
+                        rr = evaluate_combo(cb, tick_pool, None, source="D")
+                        if rr is not None:
+                            out_d.append(rr)
+                if not had_any:
+                    break
+                if not out_d:
+                    break
+                valid_pool.extend(out_d)
+                valid_pool = _dedupe_mask(valid_pool)
+                valid_pool = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
+                _save_progress(valid_pool, progress_state)
+                beam_rules = sorted(out_d, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.phase_d_beam_width)]
+                beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
+            print("[prefilter-phase-d] done")
+
+    best_paths = list(valid_pool)
 
     def _is_binned_continuous_eq(c: dict) -> bool:
         col = str(c.get("col"))

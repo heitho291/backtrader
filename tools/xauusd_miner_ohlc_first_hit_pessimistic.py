@@ -1249,8 +1249,7 @@ def simulate_selected_entries_with_ticks(
                 for z, px in enumerate(tick_prices):
                     px_val = float(px)
                     px_exit = float(tick_bids[z]) if (use_tick_bid_ask and tick_bids is not None and z < len(tick_bids) and np.isfinite(tick_bids[z])) else px_val
-                    px_high = float(tick_asks[z]) if (use_tick_bid_ask and tick_asks is not None and z < len(tick_asks) and np.isfinite(tick_asks[z])) else px_val
-                    curr_profit_ret = (px_high / entry) - 1.0
+                    curr_profit_ret = (px_exit / entry) - 1.0
                     if curr_profit_ret > max_profit_ret:
                         max_profit_ret = curr_profit_ret
                     if trail and (not trailing_active) and max_profit_ret >= trail_activate:
@@ -1270,7 +1269,7 @@ def simulate_selected_entries_with_ticks(
                         exit_k = k
                         break
                     if tp_enabled:
-                        while hits < k_max and px_high >= tp_levels[hits]:
+                        while hits < k_max and px_exit >= tp_levels[hits]:
                             w = min(float(tp_w[hits]), remaining)
                             if w > 0:
                                 realized += w * float(tps_arr[hits])
