@@ -1010,6 +1010,7 @@ def simulate_multitp_trailing_pessimistic(
     bar_time_ns: Optional[np.ndarray] = None,
     tick_prices_all: Optional[np.ndarray] = None,
     tick_minute_bounds: Optional[Dict[int, tuple[int, int]]] = None,
+    period_end_indices: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n = close.shape[0]
     pnl = np.full(n, np.nan, dtype=np.float64)
@@ -1036,7 +1037,12 @@ def simulate_multitp_trailing_pessimistic(
         max_profit_ret = 0.0
         trailing_active = (not trail)
 
-        max_k = min(n - 1 - i, max(1, int(hold)))
+        period_end = int(period_end_indices[i]) if period_end_indices is not None else (n - 1)
+        period_end = max(i, min(period_end, n - 1))
+        max_k = min(period_end - i, max(1, int(hold)))
+        if max_k <= 0:
+            continue
+        hold_reached = (i + max(1, int(hold))) <= period_end
         qualified = False
         for k in range(1, max_k + 1):
             j = i + k
@@ -1149,16 +1155,12 @@ def simulate_multitp_trailing_pessimistic(
                     break
 
         if y[i] == -1:
-            if include_unrealized_at_test_end:
+            if hold_reached or include_unrealized_at_test_end:
                 j_end = i + max_k
-                final_ret = (close[j_end] / entry) - 1.0
-                pnl[i] = final_ret
-                y[i] = 1 if qualified else (1 if final_ret > 0 else 0)
-                t_exit[i] = max_k
-                tp_hits[i] = hits
-            elif qualified:
-                pnl[i] = trail_activate
-                y[i] = 1
+                endpoint_ret = float(stop_ret) if (trail and trailing_active) else ((float(close[j_end]) / entry) - 1.0)
+                final_pnl = realized + remaining * endpoint_ret
+                pnl[i] = final_pnl
+                y[i] = 1 if qualified else (1 if final_pnl > 0 else 0)
                 t_exit[i] = max_k
                 tp_hits[i] = hits
 
@@ -1188,6 +1190,7 @@ def simulate_selected_entries_with_ticks(
     tick_bids_all: Optional[np.ndarray] = None,
     tick_asks_all: Optional[np.ndarray] = None,
     use_tick_bid_ask: bool = False,
+    period_end_indices: Optional[np.ndarray] = None,
 ) -> dict[int, dict[str, float]]:
     if tick_prices_all is None or tick_minute_bounds is None or entry_indices.size == 0:
         return {}
@@ -1221,7 +1224,12 @@ def simulate_selected_entries_with_ticks(
         y_i = -1
         pnl_i = float("nan")
 
-        max_k = min(len(close) - i - 1, max(1, int(hold)))
+        period_end = int(period_end_indices[i]) if period_end_indices is not None else (len(close) - 1)
+        period_end = max(i, min(period_end, len(close) - 1))
+        max_k = min(period_end - i, max(1, int(hold)))
+        if max_k <= 0:
+            continue
+        hold_reached = (i + max(1, int(hold))) <= period_end
         for k in range(1, max_k + 1):
             j = i + k
             h = float(high[j])
@@ -1319,12 +1327,19 @@ def simulate_selected_entries_with_ticks(
                     out[i] = {"pnl": pnl_i, "y": y_i, "t_exit": exit_k, "t_qual": qual_k, "tp_hits": hits}
                     break
         else:
-            if include_unrealized_at_test_end:
+            if hold_reached or include_unrealized_at_test_end:
                 j_end = i + max_k
-                final_ret = (float(close[j_end]) / entry) - 1.0
-                out[i] = {"pnl": final_ret, "y": (1 if qualified else (1 if final_ret > 0 else 0)), "t_exit": max_k, "t_qual": qual_k, "tp_hits": hits}
-            elif qualified:
-                out[i] = {"pnl": trail_activate, "y": 1, "t_exit": max_k, "t_qual": qual_k, "tp_hits": hits}
+                endpoint_px = float(close[j_end])
+                if use_tick_bid_ask and tick_bids_all is not None:
+                    b_end = tick_minute_bounds.get(int(bar_time_ns[j_end]))
+                    if b_end is not None and b_end[1] > b_end[0]:
+                        bid_slice = tick_bids_all[b_end[0]:b_end[1]]
+                        finite_bid = bid_slice[np.isfinite(bid_slice)]
+                        if finite_bid.size > 0:
+                            endpoint_px = float(finite_bid[-1])
+                endpoint_ret = float(stop_ret) if (trail and trailing_active) else ((endpoint_px / entry) - 1.0)
+                final_pnl = realized + remaining * endpoint_ret
+                out[i] = {"pnl": final_pnl, "y": (1 if qualified else (1 if final_pnl > 0 else 0)), "t_exit": max_k, "t_qual": qual_k, "tp_hits": hits}
 
     return out
 
@@ -2568,6 +2583,7 @@ def mine_best_rule(
             bar_time_ns=bar_time_ns,
             tick_prices_all=tick_prices_all,
             tick_minute_bounds=tick_minute_bounds,
+            period_end_indices=np.full(len(close), train_idx - 1, dtype=np.int64),
         )
         refined_test = simulate_selected_entries_with_ticks(
             entry_indices=test_abs_idx.astype(np.int64, copy=False),
@@ -2589,6 +2605,7 @@ def mine_best_rule(
             bar_time_ns=bar_time_ns,
             tick_prices_all=tick_prices_all,
             tick_minute_bounds=tick_minute_bounds,
+            period_end_indices=np.full(len(close), len(close) - 1, dtype=np.int64),
         )
         for local_idx, abs_idx in enumerate(train_abs_idx.tolist()):
             upd = refined_train.get(abs_idx)
@@ -2866,6 +2883,7 @@ def run_single_config(
         bar_time_ns=bar_time_ns,
         tick_prices_all=tick_prices_all,
         tick_minute_bounds=tick_minute_bounds,
+        period_end_indices=np.where(np.arange(len(close)) < train_idx, train_idx - 1, len(close) - 1).astype(np.int64),
     )
 
     summary, sig = mine_best_rule(

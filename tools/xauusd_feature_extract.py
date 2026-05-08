@@ -831,7 +831,7 @@ def add_delta_features(df: pd.DataFrame, windows: list[int], max_tf: int = 0) ->
     base_cols = [
         c for c in df.columns
         if c.startswith((
-            "dist_", "dist_vwap", "rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "vwap_d", "mfi", "kdj_"
+            "dist_", "dist_vwap", "rsi", "adx", "plus_di", "minus_di", "dx", "macd", "vol_z", "vwap_d", "mfi", "kdj_", "atr"
         ))
     ]
 
