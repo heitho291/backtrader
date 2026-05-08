@@ -631,6 +631,11 @@ def main() -> None:
         "trail_min_level": float(args.trail_min_level),
         "include_unrealized_at_test_end": bool(args.include_unrealized_at_test_end),
         "label_semantics_version": "hold_endpoint_v2",
+        "train_frac": float(args.train_frac),
+        "train_idx": int(train_idx),
+        "n_rows": int(n),
+        "full_end_idx": int(n - 1),
+        "period_end_semantics": "train_test_split_endpoints_v1",
     }
     cache_key = hashlib.sha1(json.dumps(cache_key_obj, sort_keys=True).encode("utf-8")).hexdigest()
     loaded_cache = False
@@ -1297,7 +1302,7 @@ def main() -> None:
         op = str(c.get("op", ""))
         m = meta.get(col, {}) if isinstance(meta, dict) else {}
         ftype = str(m.get("feature_type", "unknown"))
-        out = {"feature_type": ftype, "lo_bin": None, "hi_bin": None, "raw_lo": None, "raw_hi": None, "bin_range_text": ""}
+        out = {"feature_type": ftype, "lo_bin": None, "hi_bin": None, "raw_lo": None, "raw_hi": None, "raw_values": None, "bin_range_text": ""}
         if op != "==":
             return out
         try:
@@ -1312,6 +1317,24 @@ def main() -> None:
         out["lo_bin"] = int(lo)
         out["hi_bin"] = int(hi)
         out["bin_range_text"] = f"bin[{lo}]" if lo == hi else f"bin[{lo}..{hi}]"
+        bin_to_raw = m.get("bin_to_raw", {})
+        if ftype in {"binary", "discrete"} and isinstance(bin_to_raw, dict) and bin_to_raw:
+            def _raw_for_bin(b: int):
+                v = bin_to_raw.get(str(b), bin_to_raw.get(int(b)))
+                if v is None:
+                    return None
+                try:
+                    return float(v)
+                except Exception:
+                    return v
+
+            raw_values = [_raw_for_bin(b) for b in range(lo, hi + 1)]
+            raw_values = [v for v in raw_values if v is not None]
+            out["raw_values"] = raw_values if raw_values else None
+            out["raw_lo"] = _raw_for_bin(lo)
+            out["raw_hi"] = _raw_for_bin(hi)
+            return out
+
         edges = m.get("bin_edges", [])
         if isinstance(edges, list) and len(edges) >= hi:
             lo_pair = edges[lo - 1]
