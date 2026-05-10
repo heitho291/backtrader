@@ -719,6 +719,10 @@ def main() -> None:
     coarse_out = args.out_candidates_coarse_csv
     refined_out = args.out_candidates_refined_csv
     coarse_resume = _load_stage_csv_if_match(coarse_out, "coarse", coarse_ctx_sig)
+    coarse_existing_rows: dict[str, dict] = {}
+    coarse_build_min_pos = int(args.min_single_pos_hits)
+    coarse_build_max_mask = int(args.max_single_mask_count)
+    coarse_build_min_lift = float(args.min_single_lift)
     if coarse_resume is not None and len(coarse_resume) > 0:
         b_pos = int(coarse_resume.get("build_min_single_pos_hits", pd.Series([args.min_single_pos_hits])).iloc[0])
         b_mask = int(coarse_resume.get("build_max_single_mask_count", pd.Series([args.max_single_mask_count])).iloc[0])
@@ -726,6 +730,9 @@ def main() -> None:
         c_pos = int(args.min_single_pos_hits)
         c_mask = int(args.max_single_mask_count)
         c_lift = float(args.min_single_lift)
+        coarse_build_min_pos = min(b_pos, c_pos)
+        coarse_build_min_lift = min(b_lift, c_lift)
+        coarse_build_max_mask = 0 if (b_mask == 0 or c_mask == 0) else max(b_mask, c_mask)
         too_narrow_reasons = []
         if b_mask == 0:
             pass
@@ -737,11 +744,20 @@ def main() -> None:
             too_narrow_reasons.append("min_single_pos_hits")
         if c_lift < b_lift:
             too_narrow_reasons.append("min_single_lift")
+        for _, r in coarse_resume.iterrows():
+            try:
+                stable_k = str(r.get("stable_candidate_key", "")).strip() or _stable_candidate_key(str(r.get("col", "")), str(r.get("op", "")), float(r.get("value", np.nan)))
+            except Exception:
+                stable_k = str(r.get("candidate_key", "")).strip()
+            if stable_k:
+                row = {k: r.get(k) for k in r.index}
+                row["stable_candidate_key"] = stable_k
+                coarse_existing_rows[stable_k] = row
         print(f"[prefilter-resume] coarse_build_min_single_pos_hits={b_pos} current_min_single_pos_hits={c_pos}")
         print(f"[prefilter-resume] coarse_build_max_single_mask_count={b_mask} current_max_single_mask_count={c_mask}")
         print(f"[prefilter-resume] coarse_build_min_single_lift={b_lift} current_min_single_lift={c_lift}")
         if too_narrow_reasons:
-            print(f"[prefilter-resume] discard coarse CSV (too narrow): {','.join(too_narrow_reasons)}")
+            print(f"[prefilter-resume] coarse CSV will be extended for wider runtime filters: {','.join(too_narrow_reasons)}")
             coarse_resume = None
         else:
             print("[prefilter-resume] coarse CSV reused (build width is sufficient)")
@@ -752,9 +768,12 @@ def main() -> None:
     if coarse_resume is not None:
         for _, r in coarse_resume.iterrows():
             key = str(r.get("candidate_key", "")).strip()
-            if not key:
-                continue
+            stable_k = str(r.get("stable_candidate_key", "")).strip()
             col = str(r["col"]); op = str(r["op"]); val = float(r["value"])
+            if not stable_k:
+                stable_k = _stable_candidate_key(col, op, val)
+            if not key:
+                key = stable_k
             xvec = pd.to_numeric(bdf[col] if op == "==" else df[col], errors="coerce").to_numpy(copy=False)
             if op == "==":
                 m = np.isfinite(xvec) & (np.abs(xvec - val) <= 1e-6)
@@ -763,7 +782,7 @@ def main() -> None:
             else:
                 m = np.isfinite(xvec) & (xvec <= val)
             filtered_items.append({
-                "candidate_key": key, "col": col, "op": op, "value": val, "mask": m,
+                "candidate_key": key, "stable_candidate_key": stable_k, "col": col, "op": op, "value": val, "mask": m,
                 "binary": bool(int(r.get("binary", 0))), "_family": str(r.get("family", _candidate_family(col, bool(args.family_split_delta_window)))),
                 "_single_pos_hits": int(r.get("coarse_single_pos_hits", 0)),
                 "_single_neg_hits": int(r.get("coarse_single_neg_hits", 0)),
@@ -815,6 +834,7 @@ def main() -> None:
         timing["build_items_sec"] = time.perf_counter() - t0
         for i, it in enumerate(items, start=1):
             x = dict(it); x["candidate_key"] = f"cand_{i:06d}"
+            x["stable_candidate_key"] = _stable_candidate_key(str(x["col"]), str(x["op"]), float(x["value"]))
             m = np.asarray(x["mask"], dtype=bool)
             pos_hits = int(np.sum(m[:train_idx] & (y_train == 1))); neg_hits = int(np.sum(m[:train_idx] & (y_train == 0)))
             mask_count = int(np.sum(m[:train_idx]))
@@ -862,6 +882,10 @@ def main() -> None:
         before = len(filtered_items)
         filtered_items = [it for it in filtered_items if int(it.get("coarse_single_pos_hits", it.get("_single_pos_hits", 0))) >= int(args.min_single_pos_hits)]
         single_rejects["min_pos"] = max(0, before - len(filtered_items))
+    if float(args.min_single_lift) > 0:
+        before = len(filtered_items)
+        filtered_items = [it for it in filtered_items if float(it.get("coarse_lift", it.get("lift", 0.0))) >= float(args.min_single_lift)]
+        single_rejects["min_lift"] = max(single_rejects.get("min_lift", 0), max(0, before - len(filtered_items)))
     if int(args.max_single_mask_count) > 0:
         before = len(filtered_items)
         filtered_items = [it for it in filtered_items if int(it.get("coarse_single_mask_count", it.get("_single_mask_count", 0))) <= int(args.max_single_mask_count)]
@@ -1063,11 +1087,14 @@ def main() -> None:
     elif args.tick_data is not None:
         print(f"[prefilter-tick] skipped: tick_refine_scope={args.tick_refine_scope} produced empty candidate scope")
     if coarse_out is not None:
-        coarse_rows = []
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
+        existing_rows = dict(coarse_existing_rows)
         for it in full_filtered_items:
-            coarse_rows.append({
+            stable_k = str(it.get("stable_candidate_key", "")).strip() or _stable_candidate_key(str(it["col"]), str(it["op"]), float(it["value"]))
+            row = existing_rows.get(stable_k, {})
+            row.update({
                 "candidate_key": str(it["candidate_key"]),
+                "stable_candidate_key": stable_k,
                 "col": str(it["col"]),
                 "op": str(it["op"]),
                 "value": float(it["value"]),
@@ -1079,12 +1106,20 @@ def main() -> None:
                 "coarse_lift": float(it.get("coarse_lift", it.get("lift", 0.0))),
                 "binary": int(bool(it.get("binary", False))),
                 "kept_after_family_topn": int(str(it["candidate_key"]) in fam_top_keys),
-                "build_min_single_pos_hits": int(args.min_single_pos_hits),
-                "build_max_single_mask_count": int(args.max_single_mask_count),
-                "build_min_single_lift": float(args.min_single_lift),
+                "build_min_single_pos_hits": int(coarse_build_min_pos),
+                "build_max_single_mask_count": int(coarse_build_max_mask),
+                "build_min_single_lift": float(coarse_build_min_lift),
                 "__stage": "coarse",
                 "__ctx_sig": coarse_ctx_sig,
             })
+            existing_rows[stable_k] = row
+        for row in existing_rows.values():
+            row["build_min_single_pos_hits"] = int(coarse_build_min_pos)
+            row["build_max_single_mask_count"] = int(coarse_build_max_mask)
+            row["build_min_single_lift"] = float(coarse_build_min_lift)
+            row["__stage"] = "coarse"
+            row["__ctx_sig"] = coarse_ctx_sig
+        coarse_rows = list(existing_rows.values())
         _atomic_write_csv(coarse_out, pd.DataFrame(coarse_rows))
         print(f"[prefilter-candidates] wrote coarse CSV: {coarse_out} rows={len(coarse_rows)}")
 
@@ -1104,53 +1139,9 @@ def main() -> None:
 
     phase_d_pool_base: list[dict] = []
     tick_scope_keys = {str(it.get("candidate_key")) for it in tick_scope_items}
-    current_by_stable = {_stable_candidate_key(str(it["col"]), str(it["op"]), float(it["value"])): it for it in full_filtered_items}
-    for it in full_filtered_items:
+    for it in tick_scope_items:
         if _has_full_tick_metrics(it):
             phase_d_pool_base.append(it)
-    if refined_resume is not None:
-        for _, r in refined_resume.iterrows():
-            stable_k = str(r.get("stable_candidate_key", "")).strip()
-            if not stable_k:
-                try:
-                    stable_k = _stable_candidate_key(str(r.get("col", "")), str(r.get("op", "")), float(r.get("value", np.nan)))
-                except Exception:
-                    stable_k = ""
-            if not stable_k or stable_k in current_by_stable:
-                continue
-            row_dict = {k: r.get(k) for k in r.index}
-            if all(np.isfinite(float(row_dict.get(k, np.nan))) for k in req_tick_cols):
-                try:
-                    col = str(row_dict["col"]); op = str(row_dict["op"]); val = float(row_dict["value"])
-                    xvec = pd.to_numeric(bdf[col] if op == "==" else df[col], errors="coerce").to_numpy(copy=False)
-                    if op == "==":
-                        mask = np.isfinite(xvec) & (np.abs(xvec - val) <= 1e-6)
-                    elif op == ">=":
-                        mask = np.isfinite(xvec) & (xvec >= val)
-                    else:
-                        mask = np.isfinite(xvec) & (xvec <= val)
-                    phase_d_pool_base.append({
-                        "candidate_key": str(row_dict.get("candidate_key_refined", stable_k)),
-                        "col": col,
-                        "op": op,
-                        "value": val,
-                        "mask": mask,
-                        "binary": bool(int(row_dict.get("binary", 0) or 0)),
-                        "_family": str(row_dict.get("family", _candidate_family(col, bool(args.family_split_delta_window)))),
-                        "_single_pos_hits": int(float(row_dict.get("tick_single_pos_hits", 0))),
-                        "_single_neg_hits": int(float(row_dict.get("tick_single_neg_hits", 0))),
-                        "_single_mask_count": int(float(row_dict.get("tick_single_mask_count", 0))),
-                        "_single_ratio": float(row_dict.get("tick_single_ratio", 0.0)),
-                        "ratio": float(row_dict.get("tick_single_ratio", 0.0)),
-                        "lift": float(row_dict.get("tick_lift", 0.0)),
-                        "tick_single_pos_hits": int(float(row_dict.get("tick_single_pos_hits", 0))),
-                        "tick_single_neg_hits": int(float(row_dict.get("tick_single_neg_hits", 0))),
-                        "tick_single_mask_count": int(float(row_dict.get("tick_single_mask_count", 0))),
-                        "tick_single_ratio": float(row_dict.get("tick_single_ratio", 0.0)),
-                        "tick_lift": float(row_dict.get("tick_lift", 0.0)),
-                    })
-                except Exception as e:
-                    print(f"[prefilter-phase-d] skipped refined row without reconstructable mask: {stable_k} err={e}")
 
     if refined_out is not None:
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
