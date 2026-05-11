@@ -72,6 +72,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tick-sep", type=str, default=",")
     p.add_argument("--tick-refine-scope", type=str, default="fam_top", choices=["fam_top", "filtered", "all_coarse"])
     p.add_argument("--tick-chunk-size", type=str, default="auto")
+    p.add_argument("--debug-tick-cache-scope-counts", action="store_true", default=False)
+    p.add_argument("--tick-minute-load-mode", type=str, default="critical", choices=["critical", "full_window"])
 
     p.add_argument("--step-size", type=int, default=5)
     p.add_argument("--top-paths", type=int, default=24)
@@ -1123,14 +1125,47 @@ def main() -> None:
             fam_union |= np.asarray(it["mask"], dtype=bool)
         entry_indices = np.flatnonzero(fam_union).astype(np.int64, copy=False)
         entry_index_set = {int(i) for i in entry_indices.tolist()}
+        tick_period_end_indices = np.where(np.arange(n) < train_idx, train_idx - 1, n - 1).astype(np.int64)
+
+        def _scope_tick_minute_counts(scope_entries: np.ndarray) -> tuple[int, int, int]:
+            scope_entry_minutes = {int(bar_time_ns[int(i) + 1]) for i in scope_entries.tolist() if int(i) + 1 < n}
+            scope_critical_minutes = _critical_minutes_for_entries(
+                entry_indices=scope_entries,
+                high=high,
+                low=low,
+                close=close,
+                bar_time_ns=bar_time_ns,
+                hold=int(args.hold),
+                tp_mode=str(tp_mode),
+                trail=bool(args.trail),
+                trail_activate=float(args.trail_activate),
+                tps=np.asarray(tps, dtype=np.float64),
+                sl=float(args.sl),
+                slippage_bps=float(args.slippage_bps),
+                spread_bps=float(args.spread_bps),
+            )
+            return len(scope_entry_minutes), len(scope_critical_minutes), len(scope_entry_minutes | scope_critical_minutes)
+
+        def _full_window_minutes(scope_entries: np.ndarray) -> set[int]:
+            out: set[int] = set()
+            for idx_i in scope_entries.tolist():
+                i = int(idx_i)
+                if i + 1 >= n:
+                    continue
+                period_end = max(i, min(int(tick_period_end_indices[i]), n - 1))
+                end = min(period_end, i + max(1, int(args.hold)))
+                for j in range(i + 1, end + 1):
+                    out.add(int(bar_time_ns[j]))
+            return out
+
         cached_entries = _load_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig) if args.tick_entry_cache_npz is not None else {}
         cached_entries = cached_entries if cached_entries is not None else {}
         cached_valid = {int(k) for k, v in cached_entries.items() if int(k) in entry_index_set and int(v.get("y", -1)) in (0, 1)}
         missing_entry_indices = np.asarray([int(i) for i in entry_indices.tolist() if int(i) not in cached_valid], dtype=np.int64)
-        print(f"[prefilter-tick-cache] requested_entries={len(entry_indices)} cached_entries_used={len(cached_valid)} missing_entries={len(missing_entry_indices)}")
         tick_map: dict[int, dict] = {int(i): cached_entries[int(i)] for i in cached_valid if int(i) in cached_entries}
         used_real_ticks = bool(args.tick_entry_cache_npz is not None and len(missing_entry_indices) == 0 and len(entry_indices) > 0)
         if missing_entry_indices.size > 0:
+            print(f"[prefilter-tick-cache] requested_entries={len(entry_indices)} cached_entries_used={len(cached_valid)} missing_entries={len(missing_entry_indices)}")
             if args.tick_data is None:
                 print("[prefilter-tick-cache] warning: missing entries require --tick-data; current-scope missing entries remain unresolved.")
                 critical_minutes: set[int] = set()
@@ -1156,7 +1191,17 @@ def main() -> None:
                     spread_bps=float(args.spread_bps),
                 )
                 entry_minutes = {int(bar_time_ns[int(i) + 1]) for i in missing_entry_indices.tolist() if int(i) + 1 < n}
-                minutes_to_load = set(critical_minutes) | entry_minutes
+                if str(args.tick_minute_load_mode) == "full_window":
+                    window_minutes = _full_window_minutes(missing_entry_indices)
+                    minutes_to_load = set(critical_minutes) | entry_minutes | window_minutes
+                else:
+                    minutes_to_load = set(critical_minutes) | entry_minutes
+                if bool(args.debug_tick_cache_scope_counts):
+                    scope_entry_count, scope_critical_count, scope_would_load_count = _scope_tick_minute_counts(entry_indices)
+                    print(f"[prefilter-tick-cache] scope_entry_minutes_count={scope_entry_count}")
+                    print(f"[prefilter-tick-cache] scope_critical_minutes_count={scope_critical_count}")
+                    print(f"[prefilter-tick-cache] scope_minutes_would_load_count={scope_would_load_count}")
+                    print("[prefilter-tick-cache] scope_counts_source=ohlc_diagnostic_no_raw_tick_load")
                 if minutes_to_load:
                     tick_prices_all, tick_minute_bounds, tick_bids_all, tick_asks_all, matched_total_minutes_count = _load_tick_minute_map_partial(
                         path=args.tick_data,
@@ -1172,14 +1217,16 @@ def main() -> None:
                     tick_bids_all, tick_asks_all, matched_critical_minutes_count, matched_total_minutes_count = None, None, 0, 0
                 used_real_ticks_partial = bool(matched_critical_minutes_count > 0 or (len(entry_minutes) > 0 and matched_total_minutes_count >= len(entry_minutes)))
                 used_real_ticks_full = bool(len(minutes_to_load) > 0 and matched_total_minutes_count >= len(minutes_to_load) and matched_critical_minutes_count >= len(critical_minutes))
-                print(f"[prefilter-tick] critical_minutes_count={len(critical_minutes)}")
-                print(f"[prefilter-tick] entry_minutes_count={len(entry_minutes)}")
-                print(f"[prefilter-tick] minutes_to_load_count={len(minutes_to_load)}")
-                print(f"[prefilter-tick] matched_critical_minutes_count={int(matched_critical_minutes_count)}")
-                print(f"[prefilter-tick] matched_total_minutes_count={int(matched_total_minutes_count)}")
-                print(f"[prefilter-tick] used_real_ticks={bool(used_real_ticks_partial)}")
-                print(f"[prefilter-tick] used_real_ticks_partial={bool(used_real_ticks_partial)}")
-                print(f"[prefilter-tick] used_real_ticks_full={bool(used_real_ticks_full)}")
+                print(f"[prefilter-tick-raw-load] tick_minute_load_mode={args.tick_minute_load_mode}")
+                if str(args.tick_minute_load_mode) == "full_window":
+                    print("[prefilter-tick-raw-load] warning=full_window_may_be_expensive")
+                print(f"[prefilter-tick-raw-load] critical_minutes_count={len(critical_minutes)}")
+                print(f"[prefilter-tick-raw-load] entry_minutes_count={len(entry_minutes)}")
+                print(f"[prefilter-tick-raw-load] minutes_to_load_count={len(minutes_to_load)}")
+                print(f"[prefilter-tick-raw-load] matched_critical_minutes_count={int(matched_critical_minutes_count)}")
+                print(f"[prefilter-tick-raw-load] matched_total_minutes_count={int(matched_total_minutes_count)}")
+                print(f"[prefilter-tick-raw-load] raw_tick_coverage_full={bool(used_real_ticks_full)}")
+                print("[prefilter-tick-raw-load] used_real_ticks_source=raw_ticks")
                 if used_real_ticks_partial:
                     entry_tick_stats: dict[str, int] = {}
                     tick_map_new = miner.simulate_selected_entries_with_ticks(
@@ -1205,7 +1252,7 @@ def main() -> None:
                         tick_bids_all=tick_bids_all,
                         tick_asks_all=tick_asks_all,
                         use_tick_bid_ask=bool(tick_bids_all is not None and tick_asks_all is not None),
-                        period_end_indices=np.where(np.arange(n) < train_idx, train_idx - 1, n - 1).astype(np.int64),
+                        period_end_indices=tick_period_end_indices,
                         entry_tick_stats=entry_tick_stats,
                     )
                     print(f"[prefilter-tick] entry_tick_missing_count={int(entry_tick_stats.get('entry_tick_missing_count', 0))}")
@@ -1217,15 +1264,22 @@ def main() -> None:
                         _write_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig, cached_entries)
                     used_real_ticks = True
         else:
-            print("[prefilter-tick-cache] all current-scope entries satisfied by entry cache; skipping raw tick load.")
-            print("[prefilter-tick] critical_minutes_count=0")
-            print("[prefilter-tick] entry_minutes_count=0")
-            print("[prefilter-tick] minutes_to_load_count=0")
-            print("[prefilter-tick] matched_critical_minutes_count=0")
-            print("[prefilter-tick] matched_total_minutes_count=0")
-            print("[prefilter-tick] used_real_ticks=True")
-            print("[prefilter-tick] used_real_ticks_partial=True")
-            print("[prefilter-tick] used_real_ticks_full=True")
+            print("[prefilter-tick-cache] tick_data_source=entry_cache_only")
+            print("[prefilter-tick-cache] raw_tick_load_skipped=True reason=entry_cache_complete")
+            print(f"[prefilter-tick-cache] requested_entries={len(entry_indices)}")
+            print(f"[prefilter-tick-cache] cached_entries_used={len(cached_valid)}")
+            print("[prefilter-tick-cache] missing_entries=0")
+            print("[prefilter-tick-cache] used_real_ticks_source=entry_cache")
+            print("[prefilter-tick-raw-load] skipped=True reason=entry_cache_complete")
+            if bool(args.debug_tick_cache_scope_counts):
+                scope_entry_count, scope_critical_count, scope_would_load_count = _scope_tick_minute_counts(entry_indices)
+                print(f"[prefilter-tick-cache] scope_entry_minutes_count={scope_entry_count}")
+                print(f"[prefilter-tick-cache] scope_critical_minutes_count={scope_critical_count}")
+                print(f"[prefilter-tick-cache] scope_minutes_would_load_count={scope_would_load_count}")
+                print("[prefilter-tick-cache] scope_counts_source=ohlc_diagnostic_no_raw_tick_load")
+            else:
+                print("[prefilter-tick-cache] scope_critical_minutes_count=not_computed")
+                print("[prefilter-tick-cache] scope_counts_hint=use --debug-tick-cache-scope-counts")
         if tick_map:
             y_ref = np.full(n, -1, dtype=np.int8)
             for idx_i, rec in tick_map.items():
