@@ -363,7 +363,7 @@ def load_tick_minute_map(
     price_col: str = "auto",
     sep: str = ",",
     cache_parquet: Optional[Path] = None,
-) -> tuple[np.ndarray, Dict[int, tuple[int, int]]]:
+) -> tuple[np.ndarray, Dict[int, tuple[int, int]], Optional[np.ndarray], Optional[np.ndarray]]:
     src = path
     if str(path).lower().endswith(".csv") and cache_parquet is not None:
         if cache_parquet.exists():
@@ -409,7 +409,14 @@ def load_tick_minute_map(
         raise ValueError("tick data needs a price column (price/last/close/mid or bid+ask)")
 
     dt = pd.to_datetime(tdf[dt_col], errors="coerce", utc=False)
-    ticks = pd.DataFrame({"datetime": dt, "price": price_series}).dropna(subset=["datetime", "price"]).sort_values("datetime")
+    data = {"datetime": dt, "price": price_series}
+    bid_col = lower_cols.get("bid")
+    ask_col = lower_cols.get("ask")
+    if bid_col is not None:
+        data["bid"] = pd.to_numeric(tdf[bid_col], errors="coerce")
+    if ask_col is not None:
+        data["ask"] = pd.to_numeric(tdf[ask_col], errors="coerce")
+    ticks = pd.DataFrame(data).dropna(subset=["datetime", "price"]).sort_values("datetime")
     if ticks.empty:
         raise ValueError("tick data has no valid rows")
 
@@ -417,6 +424,8 @@ def load_tick_minute_map(
     ticks["minute_ns"] = minute_ns
 
     prices = ticks["price"].to_numpy(dtype=np.float64, copy=False)
+    bids = ticks["bid"].to_numpy(dtype=np.float64, copy=False) if "bid" in ticks.columns else None
+    asks = ticks["ask"].to_numpy(dtype=np.float64, copy=False) if "ask" in ticks.columns else None
     minute_arr = ticks["minute_ns"].to_numpy(dtype=np.int64, copy=False)
 
     out: Dict[int, tuple[int, int]] = {}
@@ -431,7 +440,7 @@ def load_tick_minute_map(
                 start = i
                 cur = m
         out[cur] = (start, n)
-    return prices, out
+    return prices, out, bids, asks
 
 
 def build_candidate_features(df: pd.DataFrame, allow_absolute_price: bool, max_features: int) -> List[str]:
@@ -1191,6 +1200,7 @@ def simulate_selected_entries_with_ticks(
     tick_asks_all: Optional[np.ndarray] = None,
     use_tick_bid_ask: bool = False,
     period_end_indices: Optional[np.ndarray] = None,
+    entry_tick_stats: Optional[dict[str, int]] = None,
 ) -> dict[int, dict[str, float]]:
     if tick_prices_all is None or tick_minute_bounds is None or entry_indices.size == 0:
         return {}
@@ -1205,9 +1215,20 @@ def simulate_selected_entries_with_ticks(
         if i >= len(close) - 1:
             continue
         if bool(use_tick_bid_ask and tick_asks_all is not None):
-            b0 = tick_minute_bounds.get(int(bar_time_ns[i]))
-            entry_tick = float(tick_asks_all[b0[0]]) if b0 is not None and b0[1] > b0[0] else float(close[i])
-            entry = entry_tick * (1.0 + (slippage_bps / 10000.0))
+            entry_minute_ns = int(bar_time_ns[i + 1])
+            b0 = tick_minute_bounds.get(entry_minute_ns)
+            entry_tick = float("nan")
+            if b0 is not None and b0[1] > b0[0]:
+                ask_slice = tick_asks_all[b0[0]:b0[1]]
+                finite_ask = ask_slice[np.isfinite(ask_slice)]
+                if finite_ask.size > 0:
+                    entry_tick = float(finite_ask[0])
+            if not np.isfinite(entry_tick):
+                if entry_tick_stats is not None:
+                    entry_tick_stats["entry_tick_missing_count"] = int(entry_tick_stats.get("entry_tick_missing_count", 0)) + 1
+                entry = float(close[i]) * (1.0 + ((slippage_bps + spread_bps) / 10000.0))
+            else:
+                entry = entry_tick * (1.0 + (slippage_bps / 10000.0))
         else:
             entry = float(close[i]) * (1.0 + slip)
         stop_ret = -sl
@@ -1902,6 +1923,8 @@ def mine_best_rule(
     binned_metadata: Optional[dict[str, dict[str, object]]] = None,
     tick_prices_all: Optional[np.ndarray] = None,
     tick_minute_bounds: Optional[Dict[int, tuple[int, int]]] = None,
+    tick_bids_all: Optional[np.ndarray] = None,
+    tick_asks_all: Optional[np.ndarray] = None,
 ) -> Tuple[dict, pd.DataFrame]:
     n = len(df)
     y_test = y[train_idx:]
@@ -2583,6 +2606,9 @@ def mine_best_rule(
             bar_time_ns=bar_time_ns,
             tick_prices_all=tick_prices_all,
             tick_minute_bounds=tick_minute_bounds,
+            tick_bids_all=tick_bids_all,
+            tick_asks_all=tick_asks_all,
+            use_tick_bid_ask=bool(tick_bids_all is not None and tick_asks_all is not None),
             period_end_indices=np.full(len(close), train_idx - 1, dtype=np.int64),
         )
         refined_test = simulate_selected_entries_with_ticks(
@@ -2605,6 +2631,9 @@ def mine_best_rule(
             bar_time_ns=bar_time_ns,
             tick_prices_all=tick_prices_all,
             tick_minute_bounds=tick_minute_bounds,
+            tick_bids_all=tick_bids_all,
+            tick_asks_all=tick_asks_all,
+            use_tick_bid_ask=bool(tick_bids_all is not None and tick_asks_all is not None),
             period_end_indices=np.full(len(close), len(close) - 1, dtype=np.int64),
         )
         for local_idx, abs_idx in enumerate(train_abs_idx.tolist()):
@@ -2857,6 +2886,8 @@ def run_single_config(
     binned_metadata: Optional[dict[str, dict[str, object]]] = None,
     tick_prices_all: Optional[np.ndarray] = None,
     tick_minute_bounds: Optional[Dict[int, tuple[int, int]]] = None,
+    tick_bids_all: Optional[np.ndarray] = None,
+    tick_asks_all: Optional[np.ndarray] = None,
 ) -> Tuple[dict, pd.DataFrame]:
     high = df["high"].to_numpy(dtype=np.float32, copy=False)
     low = df["low"].to_numpy(dtype=np.float32, copy=False)
@@ -2958,6 +2989,8 @@ def run_single_config(
         binned_metadata=binned_metadata,
         tick_prices_all=tick_prices_all,
         tick_minute_bounds=tick_minute_bounds,
+        tick_bids_all=tick_bids_all,
+        tick_asks_all=tick_asks_all,
     )
 
     summary["tp"] = tp_summary_value
@@ -3132,9 +3165,11 @@ def main() -> None:
 
     tick_prices_all: Optional[np.ndarray] = None
     tick_minute_bounds: Optional[Dict[int, tuple[int, int]]] = None
+    tick_bids_all: Optional[np.ndarray] = None
+    tick_asks_all: Optional[np.ndarray] = None
     if args.tick_data is not None:
         print(f"Loading tick data: {args.tick_data}")
-        tick_prices_all, tick_minute_bounds = load_tick_minute_map(
+        tick_prices_all, tick_minute_bounds, tick_bids_all, tick_asks_all = load_tick_minute_map(
             path=args.tick_data,
             datetime_col=args.tick_datetime_column,
             price_col=args.tick_price_column,
@@ -3222,6 +3257,8 @@ def main() -> None:
             binned_metadata=binned_metadata,
             tick_prices_all=tick_prices_all,
             tick_minute_bounds=tick_minute_bounds,
+            tick_bids_all=tick_bids_all,
+            tick_asks_all=tick_asks_all,
         )
 
         print(f"Best rule: {summary['rule']}")
