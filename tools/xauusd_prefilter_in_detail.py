@@ -1112,7 +1112,9 @@ def main() -> None:
             raise ValueError("candidate_key_refined input requires --out-candidates-refined-csv file to reload refined metrics")
         raise ValueError("Refined TXT header provided, but refined candidate CSV context did not match current run.")
     tick_missing_items = [it for it in tick_scope_items if not _has_full_tick_metrics(it)]
-    if args.tick_data is not None and len(tick_scope_items) > 0 and (tick_missing_items or args.tick_entry_cache_npz is not None):
+    if args.tick_entry_cache_npz is None and refined_resume is not None and not tick_missing_items and any(_has_full_tick_metrics(it) for it in tick_scope_items):
+        print("[prefilter-tick] warning: using tick_lift from refined CSV; without --tick-entry-cache-npz it cannot be exactly rebaselined to the current tick_refine_scope.")
+    if (args.tick_data is not None or args.tick_entry_cache_npz is not None) and len(tick_scope_items) > 0 and (tick_missing_items or args.tick_entry_cache_npz is not None):
         print(f"[prefilter-tick] tick_refine_scope={args.tick_refine_scope}")
         print(f"[prefilter-tick] tick_refine_candidates_count={len(tick_scope_items)}")
         print(f"[prefilter-tick] tick_refine_missing_to_compute={len(tick_missing_items)}")
@@ -1120,91 +1122,115 @@ def main() -> None:
         for it in tick_scope_items:
             fam_union |= np.asarray(it["mask"], dtype=bool)
         entry_indices = np.flatnonzero(fam_union).astype(np.int64, copy=False)
-        critical_minutes = _critical_minutes_for_entries(
-            entry_indices=entry_indices,
-            high=high,
-            low=low,
-            close=close,
-            bar_time_ns=bar_time_ns,
-            hold=int(args.hold),
-            tp_mode=str(tp_mode),
-            trail=bool(args.trail),
-            trail_activate=float(args.trail_activate),
-            tps=np.asarray(tps, dtype=np.float64),
-            sl=float(args.sl),
-            slippage_bps=float(args.slippage_bps),
-            spread_bps=float(args.spread_bps),
-        )
-        entry_minutes = {int(bar_time_ns[int(i) + 1]) for i in entry_indices.tolist() if int(i) + 1 < n}
-        minutes_to_load = set(critical_minutes) | entry_minutes
-        if minutes_to_load:
-            tick_prices_all, tick_minute_bounds, tick_bids_all, tick_asks_all, matched_total_minutes_count = _load_tick_minute_map_partial(
-                path=args.tick_data,
-                datetime_col=args.tick_datetime_column,
-                price_col=args.tick_price_column,
-                sep=args.tick_sep,
-                minute_filter=minutes_to_load,
-                tick_chunk_size=args.tick_chunk_size,
-            )
-            matched_critical_minutes_count = sum(1 for m in critical_minutes if int(m) in tick_minute_bounds)
-        else:
-            tick_prices_all, tick_minute_bounds = np.asarray([], dtype=np.float64), {}
-            tick_bids_all, tick_asks_all, matched_critical_minutes_count, matched_total_minutes_count = None, None, 0, 0
-        used_real_ticks_partial = bool(matched_critical_minutes_count > 0)
-        used_real_ticks_full = bool(len(minutes_to_load) > 0 and matched_total_minutes_count >= len(minutes_to_load) and matched_critical_minutes_count >= len(critical_minutes))
-        used_real_ticks = bool(used_real_ticks_partial)
-        print(f"[prefilter-tick] critical_minutes_count={len(critical_minutes)}")
-        print(f"[prefilter-tick] entry_minutes_count={len(entry_minutes)}")
-        print(f"[prefilter-tick] minutes_to_load_count={len(minutes_to_load)}")
-        print(f"[prefilter-tick] matched_critical_minutes_count={int(matched_critical_minutes_count)}")
-        print(f"[prefilter-tick] matched_total_minutes_count={int(matched_total_minutes_count)}")
-        print(f"[prefilter-tick] used_real_ticks={bool(used_real_ticks)}")
-        print(f"[prefilter-tick] used_real_ticks_partial={bool(used_real_ticks_partial)}")
-        print(f"[prefilter-tick] used_real_ticks_full={bool(used_real_ticks_full)}")
-        if used_real_ticks:
-            tick_cache = _load_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig)
-            cached_entries = tick_cache if tick_cache is not None else {}
-            cached_valid = {int(k) for k, v in cached_entries.items() if int(v.get("y", -1)) in (0, 1)}
-            missing_entry_indices = np.asarray([int(i) for i in entry_indices.tolist() if int(i) not in cached_valid], dtype=np.int64)
-            print(f"[prefilter-tick-cache] requested_entries={len(entry_indices)} cached_entries_used={len(cached_valid & set(int(i) for i in entry_indices.tolist()))} missing_entries={len(missing_entry_indices)}")
-            entry_tick_stats: dict[str, int] = {}
-            tick_map_new = miner.simulate_selected_entries_with_ticks(
-                entry_indices=missing_entry_indices if args.tick_entry_cache_npz is not None else entry_indices,
-                high=high,
-                low=low,
-                close=close,
-                tps=tps,
-                tp_w=tp_w,
-                tp_enabled=bool(tp_enabled),
-                sl=float(args.sl),
-                hold=int(args.hold),
-                slippage_bps=float(args.slippage_bps),
-                spread_bps=float(args.spread_bps),
-                trail=bool(args.trail),
-                trail_activate=float(args.trail_activate),
-                trail_offset=float(args.trail_offset),
-                trail_factor=float(args.trail_factor),
-                include_unrealized_at_test_end=bool(args.include_unrealized_at_test_end),
-                bar_time_ns=bar_time_ns,
-                tick_prices_all=tick_prices_all,
-                tick_minute_bounds=tick_minute_bounds,
-                tick_bids_all=tick_bids_all,
-                tick_asks_all=tick_asks_all,
-                use_tick_bid_ask=bool(tick_bids_all is not None and tick_asks_all is not None),
-                period_end_indices=np.where(np.arange(n) < train_idx, train_idx - 1, n - 1).astype(np.int64),
-                entry_tick_stats=entry_tick_stats,
-            )
-            print(f"[prefilter-tick] entry_tick_missing_count={int(entry_tick_stats.get('entry_tick_missing_count', 0))}")
-            if args.tick_entry_cache_npz is not None:
-                for idx_i, rec in tick_map_new.items():
-                    cached_entries[int(idx_i)] = dict(rec)
-                _write_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig, cached_entries)
-                tick_map = {int(i): cached_entries[int(i)] for i in entry_indices.tolist() if int(i) in cached_entries}
+        entry_index_set = {int(i) for i in entry_indices.tolist()}
+        cached_entries = _load_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig) if args.tick_entry_cache_npz is not None else {}
+        cached_entries = cached_entries if cached_entries is not None else {}
+        cached_valid = {int(k) for k, v in cached_entries.items() if int(k) in entry_index_set and int(v.get("y", -1)) in (0, 1)}
+        missing_entry_indices = np.asarray([int(i) for i in entry_indices.tolist() if int(i) not in cached_valid], dtype=np.int64)
+        print(f"[prefilter-tick-cache] requested_entries={len(entry_indices)} cached_entries_used={len(cached_valid)} missing_entries={len(missing_entry_indices)}")
+        tick_map: dict[int, dict] = {int(i): cached_entries[int(i)] for i in cached_valid if int(i) in cached_entries}
+        used_real_ticks = bool(args.tick_entry_cache_npz is not None and len(missing_entry_indices) == 0 and len(entry_indices) > 0)
+        if missing_entry_indices.size > 0:
+            if args.tick_data is None:
+                print("[prefilter-tick-cache] warning: missing entries require --tick-data; current-scope missing entries remain unresolved.")
+                critical_minutes: set[int] = set()
+                entry_minutes: set[int] = set()
+                minutes_to_load: set[int] = set()
+                matched_critical_minutes_count = 0
+                matched_total_minutes_count = 0
+                used_real_ticks = bool(len(tick_map) > 0)
             else:
-                tick_map = tick_map_new
+                critical_minutes = _critical_minutes_for_entries(
+                    entry_indices=missing_entry_indices,
+                    high=high,
+                    low=low,
+                    close=close,
+                    bar_time_ns=bar_time_ns,
+                    hold=int(args.hold),
+                    tp_mode=str(tp_mode),
+                    trail=bool(args.trail),
+                    trail_activate=float(args.trail_activate),
+                    tps=np.asarray(tps, dtype=np.float64),
+                    sl=float(args.sl),
+                    slippage_bps=float(args.slippage_bps),
+                    spread_bps=float(args.spread_bps),
+                )
+                entry_minutes = {int(bar_time_ns[int(i) + 1]) for i in missing_entry_indices.tolist() if int(i) + 1 < n}
+                minutes_to_load = set(critical_minutes) | entry_minutes
+                if minutes_to_load:
+                    tick_prices_all, tick_minute_bounds, tick_bids_all, tick_asks_all, matched_total_minutes_count = _load_tick_minute_map_partial(
+                        path=args.tick_data,
+                        datetime_col=args.tick_datetime_column,
+                        price_col=args.tick_price_column,
+                        sep=args.tick_sep,
+                        minute_filter=minutes_to_load,
+                        tick_chunk_size=args.tick_chunk_size,
+                    )
+                    matched_critical_minutes_count = sum(1 for m in critical_minutes if int(m) in tick_minute_bounds)
+                else:
+                    tick_prices_all, tick_minute_bounds = np.asarray([], dtype=np.float64), {}
+                    tick_bids_all, tick_asks_all, matched_critical_minutes_count, matched_total_minutes_count = None, None, 0, 0
+                used_real_ticks_partial = bool(matched_critical_minutes_count > 0 or (len(entry_minutes) > 0 and matched_total_minutes_count >= len(entry_minutes)))
+                used_real_ticks_full = bool(len(minutes_to_load) > 0 and matched_total_minutes_count >= len(minutes_to_load) and matched_critical_minutes_count >= len(critical_minutes))
+                print(f"[prefilter-tick] critical_minutes_count={len(critical_minutes)}")
+                print(f"[prefilter-tick] entry_minutes_count={len(entry_minutes)}")
+                print(f"[prefilter-tick] minutes_to_load_count={len(minutes_to_load)}")
+                print(f"[prefilter-tick] matched_critical_minutes_count={int(matched_critical_minutes_count)}")
+                print(f"[prefilter-tick] matched_total_minutes_count={int(matched_total_minutes_count)}")
+                print(f"[prefilter-tick] used_real_ticks={bool(used_real_ticks_partial)}")
+                print(f"[prefilter-tick] used_real_ticks_partial={bool(used_real_ticks_partial)}")
+                print(f"[prefilter-tick] used_real_ticks_full={bool(used_real_ticks_full)}")
+                if used_real_ticks_partial:
+                    entry_tick_stats: dict[str, int] = {}
+                    tick_map_new = miner.simulate_selected_entries_with_ticks(
+                        entry_indices=missing_entry_indices,
+                        high=high,
+                        low=low,
+                        close=close,
+                        tps=tps,
+                        tp_w=tp_w,
+                        tp_enabled=bool(tp_enabled),
+                        sl=float(args.sl),
+                        hold=int(args.hold),
+                        slippage_bps=float(args.slippage_bps),
+                        spread_bps=float(args.spread_bps),
+                        trail=bool(args.trail),
+                        trail_activate=float(args.trail_activate),
+                        trail_offset=float(args.trail_offset),
+                        trail_factor=float(args.trail_factor),
+                        include_unrealized_at_test_end=bool(args.include_unrealized_at_test_end),
+                        bar_time_ns=bar_time_ns,
+                        tick_prices_all=tick_prices_all,
+                        tick_minute_bounds=tick_minute_bounds,
+                        tick_bids_all=tick_bids_all,
+                        tick_asks_all=tick_asks_all,
+                        use_tick_bid_ask=bool(tick_bids_all is not None and tick_asks_all is not None),
+                        period_end_indices=np.where(np.arange(n) < train_idx, train_idx - 1, n - 1).astype(np.int64),
+                        entry_tick_stats=entry_tick_stats,
+                    )
+                    print(f"[prefilter-tick] entry_tick_missing_count={int(entry_tick_stats.get('entry_tick_missing_count', 0))}")
+                    for idx_i, rec in tick_map_new.items():
+                        tick_map[int(idx_i)] = dict(rec)
+                        if args.tick_entry_cache_npz is not None:
+                            cached_entries[int(idx_i)] = dict(rec)
+                    if args.tick_entry_cache_npz is not None:
+                        _write_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig, cached_entries)
+                    used_real_ticks = True
+        else:
+            print("[prefilter-tick-cache] all current-scope entries satisfied by entry cache; skipping raw tick load.")
+            print("[prefilter-tick] critical_minutes_count=0")
+            print("[prefilter-tick] entry_minutes_count=0")
+            print("[prefilter-tick] minutes_to_load_count=0")
+            print("[prefilter-tick] matched_critical_minutes_count=0")
+            print("[prefilter-tick] matched_total_minutes_count=0")
+            print("[prefilter-tick] used_real_ticks=True")
+            print("[prefilter-tick] used_real_ticks_partial=True")
+            print("[prefilter-tick] used_real_ticks_full=True")
+        if tick_map:
             y_ref = np.full(n, -1, dtype=np.int8)
             for idx_i, rec in tick_map.items():
-                y_ref[int(idx_i)] = np.int8(int(rec.get("y", -1)))
+                if int(idx_i) in entry_index_set:
+                    y_ref[int(idx_i)] = np.int8(int(rec.get("y", -1)))
             y_ref_train = y_ref[:train_idx]
             union_train_mask = fam_union[:train_idx] & tradable_train & ((y_ref_train == 0) | (y_ref_train == 1))
             union_pos = int(np.sum(union_train_mask & (y_ref_train == 1)))
@@ -1756,17 +1782,8 @@ def main() -> None:
                         shard_specs.append((sid, r, st, min(batch_eff, total_r - st)))
                         sid += 1
             else:
-                seeds = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
-                for p in seeds:
-                    cset = set(int(x) for x in p.get("_combo", ()))
-                    for add in idxs:
-                        if add in cset:
-                            continue
-                        combo = tuple(sorted(cset | {add}))
-                        if 2 <= len(combo) <= int(args.max_path_conds):
-                            shard_specs.append((sid, -1, 0, 0))
-                            sid += 1
-                # shuffle mutation order globally
+                # Phase B streams directly from parent_ext_iter until it is exhausted.
+                pass
             rng.shuffle(shard_specs)
             tested = 0
             valid_round = 0
@@ -1797,7 +1814,7 @@ def main() -> None:
 
             hist: list[tuple[int, float, tuple[float, int, int]]] = []
             executor_cache: dict[int, concurrent.futures.ThreadPoolExecutor] = {}
-            for spec in shard_specs:
+            for spec in (shard_specs if phase_a else itertools.repeat((-1, -1, 0, 0))):
                 est_mem_gb = (batch_eff * max(1, len(pool)) * 8.0) / (1024 ** 3)
                 target_mem_gb = max(0.5, float(args.memory_soft_limit_gb) * 0.75)
                 while est_mem_gb > target_mem_gb and batch_eff > 256:
@@ -2116,11 +2133,38 @@ def main() -> None:
                 if not had_any:
                     break
                 if not out_d:
+                    print(f"[prefilter-phase-d] level={phase_d_level} seeds={seeds_at_level_start} pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_kept=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                    cmd = _read_control_command(args.control_file)
+                    if cmd == "export_now":
+                        print("[prefilter-control] export_now (phase D)"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file)
+                    elif cmd == "stop_after_batch":
+                        print("[prefilter-control] stop_after_batch requested in phase D; stopping after beam level"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file); stop_after_batch_requested = True
+                    elif cmd == "force_phase_c":
+                        print("[prefilter-control] force_phase_c ignored (already in phase D)"); _write_control_none(args.control_file)
+                    elif cmd == "force_phase_d":
+                        print("[prefilter-control] force_phase_d ignored (already in phase D)"); _write_control_none(args.control_file)
+                    elif cmd == "disable_early_stop":
+                        print("[prefilter-control] disable_early_stop"); args.early_stop_window_combos = 10 ** 18; _write_control_none(args.control_file)
+                    elif cmd == "enable_early_stop":
+                        print("[prefilter-control] enable_early_stop"); args.early_stop_window_combos = int(original_early_stop_window_combos); _write_control_none(args.control_file)
                     break
                 existing_non_d_masks = {str(r.get("_mask_hash", "")) for r in valid_pool if str(r.get("search_source", "")) != "D"}
                 out_d = [r for r in out_d if str(r.get("_mask_hash", "")) not in existing_non_d_masks]
                 if not out_d:
-                    print(f"[prefilter-phase-d] level={phase_d_level} seeds={seeds_at_level_start} pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid=0 beam_kept=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                    print(f"[prefilter-phase-d] level={phase_d_level} seeds={seeds_at_level_start} pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_kept=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                    cmd = _read_control_command(args.control_file)
+                    if cmd == "export_now":
+                        print("[prefilter-control] export_now (phase D)"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file)
+                    elif cmd == "stop_after_batch":
+                        print("[prefilter-control] stop_after_batch requested in phase D; stopping after beam level"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file); stop_after_batch_requested = True
+                    elif cmd == "force_phase_c":
+                        print("[prefilter-control] force_phase_c ignored (already in phase D)"); _write_control_none(args.control_file)
+                    elif cmd == "force_phase_d":
+                        print("[prefilter-control] force_phase_d ignored (already in phase D)"); _write_control_none(args.control_file)
+                    elif cmd == "disable_early_stop":
+                        print("[prefilter-control] disable_early_stop"); args.early_stop_window_combos = 10 ** 18; _write_control_none(args.control_file)
+                    elif cmd == "enable_early_stop":
+                        print("[prefilter-control] enable_early_stop"); args.early_stop_window_combos = int(original_early_stop_window_combos); _write_control_none(args.control_file)
                     break
                 valid_before = len(valid_pool)
                 valid_pool.extend(out_d)

@@ -1214,15 +1214,17 @@ def simulate_selected_entries_with_ticks(
     for i in entry_indices.tolist():
         if i >= len(close) - 1:
             continue
+        entry_tick_offset = 0
         if bool(use_tick_bid_ask and tick_asks_all is not None):
             entry_minute_ns = int(bar_time_ns[i + 1])
             b0 = tick_minute_bounds.get(entry_minute_ns)
             entry_tick = float("nan")
             if b0 is not None and b0[1] > b0[0]:
                 ask_slice = tick_asks_all[b0[0]:b0[1]]
-                finite_ask = ask_slice[np.isfinite(ask_slice)]
-                if finite_ask.size > 0:
-                    entry_tick = float(finite_ask[0])
+                finite_pos = np.flatnonzero(np.isfinite(ask_slice))
+                if finite_pos.size > 0:
+                    entry_tick_offset = int(finite_pos[0])
+                    entry_tick = float(ask_slice[entry_tick_offset])
             if not np.isfinite(entry_tick):
                 if entry_tick_stats is not None:
                     entry_tick_stats["entry_tick_missing_count"] = int(entry_tick_stats.get("entry_tick_missing_count", 0)) + 1
@@ -1268,6 +1270,8 @@ def simulate_selected_entries_with_ticks(
                 )
                 if critical:
                     s_idx, e_idx = bounds
+                    if use_tick_bid_ask and j == i + 1:
+                        s_idx = min(e_idx, s_idx + int(entry_tick_offset))
                     tick_prices = tick_prices_all[s_idx:e_idx]
                     if tick_bids_all is not None:
                         tick_bids = tick_bids_all[s_idx:e_idx]
