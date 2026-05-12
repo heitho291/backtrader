@@ -1108,7 +1108,8 @@ def main() -> None:
         print(f"[prefilter-resume] refined_rows_with_tick_metrics={refined_rows_with_tick}")
         print(f"[prefilter-resume] refined_rows_missing_tick_metrics={refined_rows_missing_tick}")
         print(f"[prefilter-resume] requested_allowlist_keys={len(allow_keys) if allow_keys is not None else 0}")
-        print(f"[prefilter-resume] usable_refined_keys_for_current_run={sum(1 for it in fam_top if 'tick_single_ratio' in it)}")
+        print(f"[prefilter-resume] usable_refined_keys_for_fam_top={sum(1 for it in fam_top if 'tick_single_ratio' in it)}")
+        print(f"[prefilter-resume] usable_refined_keys_for_tick_scope={sum(1 for it in tick_scope_items if 'tick_single_ratio' in it)}")
     elif bool(allow_keys_refined):
         if refined_out is None or not refined_out.exists():
             raise ValueError("candidate_key_refined input requires --out-candidates-refined-csv file to reload refined metrics")
@@ -1799,6 +1800,19 @@ def main() -> None:
     original_early_stop_window_combos = int(args.early_stop_window_combos)
     stop_after_batch_requested = False
     force_phase_b_requested = False
+    completed_phase_b_pool_keys: set[tuple[str, ...]] = set()
+
+    def _phase_b_pool_key(pool_items: list[dict]) -> tuple[str, ...]:
+        keys: list[str] = []
+        for it in pool_items:
+            stable_k = str(it.get("stable_candidate_key", "")).strip()
+            if not stable_k:
+                try:
+                    stable_k = _stable_candidate_key(str(it.get("col", "")), str(it.get("op", "")), float(it.get("value", np.nan)))
+                except Exception:
+                    stable_k = ""
+            keys.append(stable_k or str(it.get("candidate_key", "")))
+        return tuple(keys)
     if args.control_file is not None:
         _write_control_none(args.control_file)
     try:
@@ -1820,6 +1834,11 @@ def main() -> None:
             idxs = list(range(len(pool)))
             old_pool_size = max(0, len(pool) - int(args.step_size))
             phase_a = (len(valid_pool) < int(args.max_valids)) and (not force_phase_b_requested)
+            phase_b_pool_key = _phase_b_pool_key(pool)
+            if (not phase_a) and phase_b_pool_key in completed_phase_b_pool_keys:
+                print(f"[prefilter-phase-b] skipped: already completed for unchanged pool_key pool_size={len(pool)}")
+                force_phase = "C"
+                break
             if (not phase_a) and not valid_pool:
                 print("[prefilter-phase-b] skipped: no parent seeds in valid_pool after phase A.")
                 force_phase = "C"
@@ -1867,6 +1886,7 @@ def main() -> None:
             combos_total = int(combos_total_free + combos_total_parent_extensions) if phase_a else -1
 
             hist: list[tuple[int, float, tuple[float, int, int]]] = []
+            phase_b_exhausted = False
             executor_cache: dict[int, concurrent.futures.ThreadPoolExecutor] = {}
             for spec in (shard_specs if phase_a else itertools.repeat((-1, -1, 0, 0))):
                 est_mem_gb = (batch_eff * max(1, len(pool)) * 8.0) / (1024 ** 3)
@@ -1905,6 +1925,7 @@ def main() -> None:
                     combos = [x[0] for x in combos_par]
                     parents = [x[1] for x in combos_par]
                     if not combos:
+                        phase_b_exhausted = True
                         break
                 out_batch: list[dict] = []
                 if workers_eff <= 1:
@@ -2025,9 +2046,14 @@ def main() -> None:
             for ex in executor_cache.values():
                 ex.shutdown(wait=True)
 
+            if (not phase_a) and (phase_b_exhausted or force_phase == "C"):
+                completed_phase_b_pool_keys.add(phase_b_pool_key)
             if stop_after_batch_requested:
                 print("[prefilter-progress] stopped after batch as requested.")
                 break
+            if (not phase_a) and phase_b_exhausted:
+                print("[prefilter-phase-b] completed: parent_ext_iter exhausted")
+                force_phase = "C"
             if force_phase in {"C", "D"}:
                 phase_c_was_active = phase_c_was_active or (force_phase == "C")
                 print("[prefilter-progress] force phase switch requested; continuing with implemented post A/B phases.")
@@ -2140,6 +2166,7 @@ def main() -> None:
         print("[prefilter-phase-c] done")
 
     # Phase D: full tick beam search
+    d_valid_pool: list[dict] = []
     if stop_after_batch_requested:
         print("[prefilter-phase-d] skipped: stop_after_batch requested before phase D")
     elif not tick_refined_mode:
@@ -2153,21 +2180,71 @@ def main() -> None:
         else:
             tick_pool = sorted(tick_pool, key=lambda z: (-float(z.get("tick_single_ratio", -np.inf)), -int(z.get("tick_single_pos_hits", z.get("_single_pos_hits", 0)))))
             idxs_d = list(range(len(tick_pool)))
-            beam = [tuple([i]) for i in idxs_d[: max(1, min(len(idxs_d), int(args.phase_d_beam_width)))]]
-            beam = [b for b in beam if len(b) >= int(args.phase_d_start_conds)]
-            if not beam:
-                beam = [tuple(sorted(x)) for x in itertools.combinations(idxs_d, min(int(args.phase_d_start_conds), len(idxs_d)))][: int(args.phase_d_beam_width)]
-            print(f"[prefilter-phase-d] start beam={len(beam)} tick_pool={len(tick_pool)}")
+            start_depth = max(1, min(int(args.phase_d_start_conds), int(args.phase_d_max_conds), int(args.max_path_conds), len(idxs_d)))
+            d_beam: list[tuple[int, ...]] = []
             phase_d_level = 0
-            while beam:
+
+            def _phase_d_control() -> bool:
+                nonlocal stop_after_batch_requested
+                cmd = _read_control_command(args.control_file)
+                if cmd == "export_now":
+                    print("[prefilter-control] export_now (phase D)"); _save_progress(valid_pool + d_valid_pool, progress_state); _write_control_none(args.control_file)
+                elif cmd == "stop_after_batch":
+                    print("[prefilter-control] stop_after_batch requested in phase D; stopping after beam level"); _save_progress(valid_pool + d_valid_pool, progress_state); _write_control_none(args.control_file); stop_after_batch_requested = True; return True
+                elif cmd == "force_phase_c":
+                    print("[prefilter-control] force_phase_c ignored (already in phase D)"); _write_control_none(args.control_file)
+                elif cmd == "force_phase_d":
+                    print("[prefilter-control] force_phase_d ignored (already in phase D)"); _write_control_none(args.control_file)
+                elif cmd == "disable_early_stop":
+                    print("[prefilter-control] disable_early_stop"); args.early_stop_window_combos = 10 ** 18; _write_control_none(args.control_file)
+                elif cmd == "enable_early_stop":
+                    print("[prefilter-control] enable_early_stop"); args.early_stop_window_combos = int(original_early_stop_window_combos); _write_control_none(args.control_file)
+                return False
+
+            def _d_sort_key(r: dict) -> tuple[float, int, int, int]:
+                return (-float(r["ratio"]), -int(r["pos_hits"]), int(r["neg_hits"]), len(tuple(r.get("_combo", tuple()))))
+
+            def _keep_d_pool(rows: list[dict]) -> list[dict]:
+                rows = _dedupe_mask(rows)
+                return sorted(rows, key=_d_sort_key)[: int(args.max_valids)]
+
+            # level=0: evaluate all start-depth combinations directly, streamingly.
+            level_t0 = time.perf_counter()
+            generated_extensions = 0
+            evaluated_combos = 0
+            out_d: list[dict] = []
+            for chunk in _batched(itertools.combinations(idxs_d, start_depth), max(64, int(args.batch_size))):
+                generated_extensions += len(chunk)
+                for cb in chunk:
+                    evaluated_combos += 1
+                    rr = evaluate_combo(tuple(sorted(cb)), tick_pool, None, source="D")
+                    if rr is not None:
+                        out_d.append(rr)
+            if out_d:
+                before = len(d_valid_pool)
+                d_valid_pool = _keep_d_pool(d_valid_pool + out_d)
+                _save_progress(valid_pool + d_valid_pool, progress_state)
+                beam_rules = sorted(_dedupe_mask(out_d), key=_d_sort_key)[: int(args.phase_d_beam_width)]
+                d_beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
+                best_ratio = float(d_valid_pool[0]["ratio"]) if d_valid_pool else float("nan")
+                print(f"[prefilter-phase-d] level=0 depth={start_depth} seeds=all pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_kept={len(d_beam)} d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
+            else:
+                print(f"[prefilter-phase-d] level=0 depth={start_depth} seeds=all pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_kept=0 d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+            if _phase_d_control():
+                d_beam = []
+
+            while d_beam and not stop_after_batch_requested:
                 phase_d_level += 1
                 level_t0 = time.perf_counter()
-                seeds_at_level_start = len(beam)
+                seeds_at_level_start = len(d_beam)
                 generated_extensions = 0
                 evaluated_combos = 0
-                out_d: list[dict] = []
+                out_d = []
+                min_depth = min((len(b) for b in d_beam), default=0) + max(1, int(args.phase_d_add_min))
+                max_depth = min(max((len(b) for b in d_beam), default=0) + max(1, int(args.phase_d_add_max)), int(args.phase_d_max_conds), int(args.max_path_conds))
+
                 def _iter_cands_d():
-                    for base in beam:
+                    for base in d_beam:
                         cset = set(base)
                         add_cands = [x for x in idxs_d if x not in cset]
                         for add_k in range(max(1, int(args.phase_d_add_min)), max(1, int(args.phase_d_add_max)) + 1):
@@ -2175,6 +2252,7 @@ def main() -> None:
                                 continue
                             for adds in itertools.combinations(add_cands, add_k):
                                 yield tuple(sorted(cset | set(adds)))
+
                 had_any = False
                 for chunk in _batched(_iter_cands_d(), max(64, int(args.batch_size))):
                     had_any = True
@@ -2184,67 +2262,23 @@ def main() -> None:
                         rr = evaluate_combo(cb, tick_pool, None, source="D")
                         if rr is not None:
                             out_d.append(rr)
-                if not had_any:
+                depth_txt = f"depth={min_depth}" if min_depth == max_depth else f"depth_range={min_depth}..{max_depth}"
+                if (not had_any) or (not out_d):
+                    print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_kept=0 d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                    _phase_d_control()
                     break
-                if not out_d:
-                    print(f"[prefilter-phase-d] level={phase_d_level} seeds={seeds_at_level_start} pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_kept=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
-                    cmd = _read_control_command(args.control_file)
-                    if cmd == "export_now":
-                        print("[prefilter-control] export_now (phase D)"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file)
-                    elif cmd == "stop_after_batch":
-                        print("[prefilter-control] stop_after_batch requested in phase D; stopping after beam level"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file); stop_after_batch_requested = True
-                    elif cmd == "force_phase_c":
-                        print("[prefilter-control] force_phase_c ignored (already in phase D)"); _write_control_none(args.control_file)
-                    elif cmd == "force_phase_d":
-                        print("[prefilter-control] force_phase_d ignored (already in phase D)"); _write_control_none(args.control_file)
-                    elif cmd == "disable_early_stop":
-                        print("[prefilter-control] disable_early_stop"); args.early_stop_window_combos = 10 ** 18; _write_control_none(args.control_file)
-                    elif cmd == "enable_early_stop":
-                        print("[prefilter-control] enable_early_stop"); args.early_stop_window_combos = int(original_early_stop_window_combos); _write_control_none(args.control_file)
+                before = len(d_valid_pool)
+                d_valid_pool = _keep_d_pool(d_valid_pool + out_d)
+                _save_progress(valid_pool + d_valid_pool, progress_state)
+                beam_rules = sorted(_dedupe_mask(out_d), key=_d_sort_key)[: int(args.phase_d_beam_width)]
+                d_beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
+                best_ratio = float(d_valid_pool[0]["ratio"]) if d_valid_pool else float("nan")
+                print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_kept={len(d_beam)} d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
+                if _phase_d_control():
                     break
-                existing_non_d_masks = {str(r.get("_mask_hash", "")) for r in valid_pool if str(r.get("search_source", "")) != "D"}
-                out_d = [r for r in out_d if str(r.get("_mask_hash", "")) not in existing_non_d_masks]
-                if not out_d:
-                    print(f"[prefilter-phase-d] level={phase_d_level} seeds={seeds_at_level_start} pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_kept=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
-                    cmd = _read_control_command(args.control_file)
-                    if cmd == "export_now":
-                        print("[prefilter-control] export_now (phase D)"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file)
-                    elif cmd == "stop_after_batch":
-                        print("[prefilter-control] stop_after_batch requested in phase D; stopping after beam level"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file); stop_after_batch_requested = True
-                    elif cmd == "force_phase_c":
-                        print("[prefilter-control] force_phase_c ignored (already in phase D)"); _write_control_none(args.control_file)
-                    elif cmd == "force_phase_d":
-                        print("[prefilter-control] force_phase_d ignored (already in phase D)"); _write_control_none(args.control_file)
-                    elif cmd == "disable_early_stop":
-                        print("[prefilter-control] disable_early_stop"); args.early_stop_window_combos = 10 ** 18; _write_control_none(args.control_file)
-                    elif cmd == "enable_early_stop":
-                        print("[prefilter-control] enable_early_stop"); args.early_stop_window_combos = int(original_early_stop_window_combos); _write_control_none(args.control_file)
-                    break
-                valid_before = len(valid_pool)
-                valid_pool.extend(out_d)
-                valid_pool = _dedupe_mask(valid_pool)
-                valid_pool = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
-                _save_progress(valid_pool, progress_state)
-                beam_rules = sorted(out_d, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.phase_d_beam_width)]
-                beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
-                best_ratio = float(valid_pool[0]["ratio"]) if valid_pool else float("nan")
-                print(f"[prefilter-phase-d] level={phase_d_level} seeds={seeds_at_level_start} pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(valid_pool) - valid_before)} beam_kept={len(beam)} valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
-                cmd = _read_control_command(args.control_file)
-                if cmd == "export_now":
-                    print("[prefilter-control] export_now (phase D)"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file)
-                elif cmd == "stop_after_batch":
-                    print("[prefilter-control] stop_after_batch requested in phase D; stopping after beam level"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file); stop_after_batch_requested = True; break
-                elif cmd == "force_phase_c":
-                    print("[prefilter-control] force_phase_c ignored (already in phase D)"); _write_control_none(args.control_file)
-                elif cmd == "force_phase_d":
-                    print("[prefilter-control] force_phase_d ignored (already in phase D)"); _write_control_none(args.control_file)
-                elif cmd == "disable_early_stop":
-                    print("[prefilter-control] disable_early_stop"); args.early_stop_window_combos = 10 ** 18; _write_control_none(args.control_file)
-                elif cmd == "enable_early_stop":
-                    print("[prefilter-control] enable_early_stop"); args.early_stop_window_combos = int(original_early_stop_window_combos); _write_control_none(args.control_file)
             print("[prefilter-phase-d] done")
 
-    best_paths = list(valid_pool)
+    best_paths = list(valid_pool) + list(d_valid_pool)
 
     def _is_binned_continuous_eq(c: dict) -> bool:
         col = str(c.get("col"))
@@ -2320,7 +2354,7 @@ def main() -> None:
         return merged_rule
 
     best_paths = [_attach_decode_info(_apply_neighbor_merge(r)) for r in best_paths]
-    best_paths = _dedupe_mask(best_paths)
+    best_paths = _dedupe_mask([r for r in best_paths if str(r.get("search_source", "")) != "D"]) + _dedupe_mask([r for r in best_paths if str(r.get("search_source", "")) == "D"])
     train_ranked = sorted(best_paths, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))
     train_rank_map = {id(r): i for i, r in enumerate(train_ranked)}
     shortlist_n = max(100, int(args.top_paths) * 4)
@@ -2339,7 +2373,7 @@ def main() -> None:
     fallback_export_used = False
     if not best_paths:
         print("[prefilter-warning] No rule with test hits found for final CSV export.")
-        if len(train_ranked) > 0 and len(valid_pool) > 0:
+        if len(train_ranked) > 0 and len(best_paths) > 0:
             best_paths = train_ranked[: int(args.top_paths)]
             fallback_export_used = True
             print(f"[prefilter-fallback] Exporting {len(best_paths)} train-valid rules (fallback: valid>0 but test_hits=0).")
