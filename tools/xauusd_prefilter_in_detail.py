@@ -2240,8 +2240,14 @@ def main() -> None:
                 generated_extensions = 0
                 evaluated_combos = 0
                 out_d = []
-                min_depth = min((len(b) for b in d_beam), default=0) + max(1, int(args.phase_d_add_min))
-                max_depth = min(max((len(b) for b in d_beam), default=0) + max(1, int(args.phase_d_add_max)), int(args.phase_d_max_conds), int(args.max_path_conds))
+                current_min_base_len = min((len(b) for b in d_beam), default=0)
+                current_max_base_len = max((len(b) for b in d_beam), default=0)
+                min_depth = current_min_base_len + max(1, int(args.phase_d_add_min))
+                hard_max_depth = min(int(args.phase_d_max_conds), int(args.max_path_conds))
+                max_depth = min(current_max_base_len + max(1, int(args.phase_d_add_max)), hard_max_depth)
+                if min_depth > max_depth:
+                    print("[prefilter-phase-d] done: max depth reached")
+                    break
 
                 def _iter_cands_d():
                     for base in d_beam:
@@ -2278,7 +2284,8 @@ def main() -> None:
                     break
             print("[prefilter-phase-d] done")
 
-    best_paths = list(valid_pool) + list(d_valid_pool)
+    non_d_pool = [r for r in valid_pool if str(r.get("search_source", "")) != "D"]
+    d_pool = [r for r in d_valid_pool if str(r.get("search_source", "")) == "D"] + [r for r in valid_pool if str(r.get("search_source", "")) == "D"]
 
     def _is_binned_continuous_eq(c: dict) -> bool:
         col = str(c.get("col"))
@@ -2351,32 +2358,44 @@ def main() -> None:
         merged_rule = dict(rule)
         merged_rule["conds"] = conds
         merged_rule.update(best_sc)
+        final_mask = _build_mask_from_conds(conds)
+        merged_rule["_mask_hash"] = _mask_hash(final_mask)
+        final_sc = _score_from_mask(final_mask)
+        if final_sc is not None:
+            merged_rule.update(final_sc)
         return merged_rule
 
-    best_paths = [_attach_decode_info(_apply_neighbor_merge(r)) for r in best_paths]
-    best_paths = _dedupe_mask([r for r in best_paths if str(r.get("search_source", "")) != "D"]) + _dedupe_mask([r for r in best_paths if str(r.get("search_source", "")) == "D"])
-    train_ranked = sorted(best_paths, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))
-    train_rank_map = {id(r): i for i, r in enumerate(train_ranked)}
-    shortlist_n = max(100, int(args.top_paths) * 4)
-    shortlist = train_ranked[:shortlist_n]
-    shortlist = [r for r in shortlist if (int(r["test_pos_hits"]) + int(r["test_neg_hits"])) > 0]
-    shortlist = sorted(
-        shortlist,
-        key=lambda z: (
-            -float(z["test_ratio"]),
-            -int(z["test_pos_hits"]),
-            int(z["test_neg_hits"]),
-            int(train_rank_map.get(id(z), 10 ** 9)),
-        ),
-    )
-    best_paths = shortlist[: int(args.top_paths)]
-    fallback_export_used = False
+    def _prepare_export_group(rows: list[dict], group_name: str) -> tuple[list[dict], bool]:
+        prepared = [_attach_decode_info(_apply_neighbor_merge(r)) for r in rows]
+        prepared = _dedupe_mask(prepared)
+        train_ranked_group = sorted(prepared, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))
+        train_rank_map_group = {id(r): i for i, r in enumerate(train_ranked_group)}
+        shortlist_n = max(100, int(args.top_paths) * 4)
+        shortlist_group = train_ranked_group[:shortlist_n]
+        shortlist_group = [r for r in shortlist_group if (int(r["test_pos_hits"]) + int(r["test_neg_hits"])) > 0]
+        shortlist_group = sorted(
+            shortlist_group,
+            key=lambda z: (
+                -float(z["test_ratio"]),
+                -int(z["test_pos_hits"]),
+                int(z["test_neg_hits"]),
+                int(train_rank_map_group.get(id(z), 10 ** 9)),
+            ),
+        )
+        export_group = shortlist_group[: int(args.top_paths)]
+        fallback_used = False
+        if not export_group and train_ranked_group:
+            export_group = train_ranked_group[: int(args.top_paths)]
+            fallback_used = True
+            print(f"[prefilter-fallback] Exporting {len(export_group)} {group_name} train-valid rules (fallback: valid>0 but test_hits=0).")
+        return export_group, fallback_used
+
+    non_d_export, non_d_fallback = _prepare_export_group(non_d_pool, "non_d")
+    d_export, d_fallback = _prepare_export_group(d_pool, "D")
+    best_paths = non_d_export + d_export
+    fallback_export_used = bool(non_d_fallback or d_fallback)
     if not best_paths:
         print("[prefilter-warning] No rule with test hits found for final CSV export.")
-        if len(train_ranked) > 0 and len(best_paths) > 0:
-            best_paths = train_ranked[: int(args.top_paths)]
-            fallback_export_used = True
-            print(f"[prefilter-fallback] Exporting {len(best_paths)} train-valid rules (fallback: valid>0 but test_hits=0).")
 
     out_json = {
         "version": 2,
