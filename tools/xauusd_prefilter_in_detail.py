@@ -490,44 +490,39 @@ def _load_tick_minute_map_partial(
     if not minute_filter:
         return np.asarray([], dtype=np.float64), {}, None, None, 0
     if path.suffix.lower() in {".parquet", ".pq"}:
-        cols = ["datetime_ns", "minute_ns", "price", "bid", "ask", "source_order"]
+        cols = ["DateTime", "Bid", "Ask", "Volume"]
         try:
             pq = pd.read_parquet(path, columns=cols)
         except Exception:
             pq = pd.read_parquet(path)
-        required = {"datetime_ns", "minute_ns", "price"}
-        missing = required - set(str(c) for c in pq.columns)
+        missing = set(cols) - set(str(c) for c in pq.columns)
         if missing:
-            raise ValueError(f"normalized tick parquet missing columns: {sorted(missing)}")
+            raise ValueError(f"tick parquet missing columns: {sorted(missing)}")
+        dt = pd.to_datetime(pq["DateTime"], errors="coerce", utc=True)
+        dt_ns = dt.astype("int64").to_numpy()
+        minute_ns = dt.dt.floor("min").astype("int64").to_numpy()
         minute_filter_arr = np.asarray(list(minute_filter), dtype=np.int64)
-        minute_ns = pd.to_numeric(pq["minute_ns"], errors="coerce").to_numpy(dtype=np.float64)
-        keep = np.isin(minute_ns.astype(np.int64, copy=False), minute_filter_arr)
+        keep = np.isin(minute_ns, minute_filter_arr)
         if not np.any(keep):
             return np.asarray([], dtype=np.float64), {}, None, None, 0
-        times = pd.to_numeric(pq.loc[keep, "datetime_ns"], errors="coerce").to_numpy(dtype=np.float64)
-        mins = minute_ns[keep].astype(np.int64, copy=False)
-        prices = pd.to_numeric(pq.loc[keep, "price"], errors="coerce").to_numpy(dtype=np.float64)
-        valid = np.isfinite(times) & np.isfinite(prices) & (prices > 0)
+        bids = pd.to_numeric(pq.loc[keep, "Bid"], errors="coerce").to_numpy(dtype=np.float64)
+        asks = pd.to_numeric(pq.loc[keep, "Ask"], errors="coerce").to_numpy(dtype=np.float64)
+        kept_times = dt_ns[keep].astype(np.int64, copy=False)
+        kept_minutes = minute_ns[keep].astype(np.int64, copy=False)
+        row_order = np.arange(len(kept_times), dtype=np.int64)
+        valid = (kept_times != np.iinfo(np.int64).min) & np.isfinite(bids) & np.isfinite(asks) & (bids > 0) & (asks > 0)
         if not np.any(valid):
             return np.asarray([], dtype=np.float64), {}, None, None, 0
-        mins = mins[valid]
-        times_i = times[valid].astype(np.int64, copy=False)
-        prices = prices[valid]
-        source_order = pd.to_numeric(pq.loc[keep, "source_order"], errors="coerce").to_numpy(dtype=np.float64) if "source_order" in pq.columns else np.arange(len(times), dtype=np.float64)
-        source_order = source_order[valid].astype(np.int64, copy=False)
-        bids = pd.to_numeric(pq.loc[keep, "bid"], errors="coerce").to_numpy(dtype=np.float64)[valid] if "bid" in pq.columns else None
-        asks = pd.to_numeric(pq.loc[keep, "ask"], errors="coerce").to_numpy(dtype=np.float64)[valid] if "ask" in pq.columns else None
-        if bids is not None and not np.isfinite(bids).any():
-            bids = None
-        if asks is not None and not np.isfinite(asks).any():
-            asks = None
-        order = np.lexsort((source_order, times_i, mins))
+        mins = kept_minutes[valid]
+        times = kept_times[valid]
+        bids = bids[valid]
+        asks = asks[valid]
+        row_order = row_order[valid]
+        order = np.lexsort((row_order, times, mins))
         mins = mins[order]
-        prices = prices[order]
-        if bids is not None:
-            bids = bids[order]
-        if asks is not None:
-            asks = asks[order]
+        bids = bids[order]
+        asks = asks[order]
+        prices = bids.copy()
         bounds: dict[int, tuple[int, int]] = {}
         i = 0
         while i < len(mins):
