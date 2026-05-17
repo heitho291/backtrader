@@ -1263,7 +1263,22 @@ def main() -> None:
         cached_entries = cached_entries if cached_entries is not None else {}
         cached_present = {int(k) for k in cached_entries.keys() if int(k) in entry_index_set}
         tick_map: dict[int, dict] = {int(i): cached_entries[int(i)] for i in cached_present if int(i) in cached_entries}
-        structurally_invalid = [int(i) for i in entry_indices.tolist() if int(i) not in cached_present and int(i) + 1 >= n]
+
+        def _is_structurally_invalid_entry(ii: int) -> bool:
+            if ii < 0 or ii >= n:
+                return True
+            entry_i = ii + 1
+            if entry_i >= n:
+                return True
+            if ii >= len(tick_period_end_indices) or entry_i > int(tick_period_end_indices[ii]):
+                return True
+            try:
+                _ = int(bar_time_ns[entry_i])
+            except Exception:
+                return True
+            return False
+
+        structurally_invalid = [int(i) for i in entry_indices.tolist() if int(i) not in cached_present and _is_structurally_invalid_entry(int(i))]
         if structurally_invalid:
             invalid_rec = {"y": -1, "pnl": float("nan"), "t_exit": -1, "t_qual": -1, "tp_hits": 0}
             for idx_i in structurally_invalid:
@@ -1385,7 +1400,10 @@ def main() -> None:
                         ii = int(idx_i)
                         if ii in tick_map_new:
                             continue
-                        if ii + 1 >= n or int(bar_time_ns[ii + 1]) not in tick_minute_bounds:
+                        if _is_structurally_invalid_entry(ii):
+                            unresolved_invalid.append(ii)
+                            continue
+                        if int(bar_time_ns[ii + 1]) not in tick_minute_bounds:
                             unresolved_invalid.append(ii)
                     if unresolved_invalid:
                         for idx_i in unresolved_invalid:
