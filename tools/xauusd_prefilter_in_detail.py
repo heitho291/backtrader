@@ -489,6 +489,55 @@ def _load_tick_minute_map_partial(
 ) -> tuple[np.ndarray, dict[int, tuple[int, int]], np.ndarray | None, np.ndarray | None, int]:
     if not minute_filter:
         return np.asarray([], dtype=np.float64), {}, None, None, 0
+    if path.suffix.lower() in {".parquet", ".pq"}:
+        cols = ["datetime_ns", "minute_ns", "price", "bid", "ask", "source_order"]
+        try:
+            pq = pd.read_parquet(path, columns=cols)
+        except Exception:
+            pq = pd.read_parquet(path)
+        required = {"datetime_ns", "minute_ns", "price"}
+        missing = required - set(str(c) for c in pq.columns)
+        if missing:
+            raise ValueError(f"normalized tick parquet missing columns: {sorted(missing)}")
+        minute_filter_arr = np.asarray(list(minute_filter), dtype=np.int64)
+        minute_ns = pd.to_numeric(pq["minute_ns"], errors="coerce").to_numpy(dtype=np.float64)
+        keep = np.isin(minute_ns.astype(np.int64, copy=False), minute_filter_arr)
+        if not np.any(keep):
+            return np.asarray([], dtype=np.float64), {}, None, None, 0
+        times = pd.to_numeric(pq.loc[keep, "datetime_ns"], errors="coerce").to_numpy(dtype=np.float64)
+        mins = minute_ns[keep].astype(np.int64, copy=False)
+        prices = pd.to_numeric(pq.loc[keep, "price"], errors="coerce").to_numpy(dtype=np.float64)
+        valid = np.isfinite(times) & np.isfinite(prices) & (prices > 0)
+        if not np.any(valid):
+            return np.asarray([], dtype=np.float64), {}, None, None, 0
+        mins = mins[valid]
+        times_i = times[valid].astype(np.int64, copy=False)
+        prices = prices[valid]
+        source_order = pd.to_numeric(pq.loc[keep, "source_order"], errors="coerce").to_numpy(dtype=np.float64) if "source_order" in pq.columns else np.arange(len(times), dtype=np.float64)
+        source_order = source_order[valid].astype(np.int64, copy=False)
+        bids = pd.to_numeric(pq.loc[keep, "bid"], errors="coerce").to_numpy(dtype=np.float64)[valid] if "bid" in pq.columns else None
+        asks = pd.to_numeric(pq.loc[keep, "ask"], errors="coerce").to_numpy(dtype=np.float64)[valid] if "ask" in pq.columns else None
+        if bids is not None and not np.isfinite(bids).any():
+            bids = None
+        if asks is not None and not np.isfinite(asks).any():
+            asks = None
+        order = np.lexsort((source_order, times_i, mins))
+        mins = mins[order]
+        prices = prices[order]
+        if bids is not None:
+            bids = bids[order]
+        if asks is not None:
+            asks = asks[order]
+        bounds: dict[int, tuple[int, int]] = {}
+        i = 0
+        while i < len(mins):
+            m = int(mins[i]); j = i + 1
+            while j < len(mins) and int(mins[j]) == m:
+                j += 1
+            bounds[m] = (i, j)
+            i = j
+        print(f"[prefilter-tick-parquet] source=parquet rows_loaded={len(prices)} matched_minutes={len(bounds)}")
+        return prices, bounds, bids, asks, int(len(bounds))
     use_price_col = None if str(price_col).lower() == "auto" else str(price_col)
     chunk_size_eff = 150_000 if str(tick_chunk_size).lower() == "auto" else max(10_000, int(tick_chunk_size))
     minute_filter_arr = np.asarray(list(minute_filter), dtype=np.int64)
@@ -1354,7 +1403,7 @@ def main() -> None:
                 print(f"[prefilter-tick-raw-load] matched_critical_minutes_count={int(matched_critical_minutes_count)}")
                 print(f"[prefilter-tick-raw-load] matched_total_minutes_count={int(matched_total_minutes_count)}")
                 print(f"[prefilter-tick-raw-load] raw_tick_coverage_full={bool(used_real_ticks_full)}")
-                print("[prefilter-tick-raw-load] used_real_ticks_source=raw_ticks")
+                print(f"[prefilter-tick-raw-load] used_real_ticks_source={'parquet_ticks' if args.tick_data is not None and args.tick_data.suffix.lower() in {'.parquet', '.pq'} else 'raw_ticks'}")
                 if used_real_ticks_partial:
                     entry_tick_stats: dict[str, int] = {}
                     tick_map_new = miner.simulate_selected_entries_with_ticks(
