@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trail-min-level", type=float, default=0.0)
     p.add_argument("--include-unrealized-at-test-end", action="store_true", default=True)
     p.add_argument("--no-include-unrealized-at-test-end", dest="include_unrealized_at_test_end", action="store_false")
+    p.add_argument("--cluster-gap-minutes", type=int, default=1)
+    p.add_argument("--max-entries-per-cluster", type=int, default=15)
+    p.add_argument("--max-open-trades", type=int, default=15)
+    p.add_argument("--cluster-only-lower-entry", dest="cluster_only_lower_entry", action="store_true", default=True)
+    p.add_argument("--no-cluster-only-lower-entry", dest="cluster_only_lower_entry", action="store_false")
 
     p.add_argument("--tick-data", type=Path, default=None)
     p.add_argument("--tick-cache-parquet", type=Path, default=None)
@@ -113,11 +118,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--phase-c-add-min", type=int, default=1)
     p.add_argument("--phase-c-add-max", type=int, default=2)
     p.add_argument("--phase-c-max-conds", type=int, default=9)
+    p.add_argument("--phase-c-max-generated-per-level", type=int, default=0)
     p.add_argument("--phase-d-beam-width", type=int, default=64)
     p.add_argument("--phase-d-start-conds", type=int, default=2)
     p.add_argument("--phase-d-add-min", type=int, default=1)
     p.add_argument("--phase-d-add-max", type=int, default=2)
     p.add_argument("--phase-d-max-conds", type=int, default=9)
+    p.add_argument("--phase-d-max-generated-per-level", type=int, default=0)
     return p.parse_args()
 
 
@@ -686,6 +693,16 @@ def _calc_wf(mask: np.ndarray, y_test: np.ndarray, wf_folds: int) -> tuple[float
 
 def main() -> None:
     args = parse_args()
+    if int(args.cluster_gap_minutes) < 0:
+        raise ValueError("--cluster-gap-minutes must be >= 0")
+    if int(args.max_entries_per_cluster) < 1:
+        raise ValueError("--max-entries-per-cluster must be >= 1")
+    if int(args.max_open_trades) < 1:
+        raise ValueError("--max-open-trades must be >= 1")
+    if int(args.phase_c_max_generated_per_level) < 0:
+        raise ValueError("--phase-c-max-generated-per-level must be >= 0")
+    if int(args.phase_d_max_generated_per_level) < 0:
+        raise ValueError("--phase-d-max-generated-per-level must be >= 0")
     if args.out_candidates_csv is not None:
         raise ValueError("--out-candidates-csv is deprecated. Use --out-candidates-coarse-csv and --out-candidates-refined-csv.")
     miner = _load_miner_module(args.miner_script)
@@ -816,6 +833,75 @@ def main() -> None:
     y_test = y[train_idx:]
     tradable_train = ((y_train == 0) | (y_train == 1))
     tradable_test = ((y_test == 0) | (y_test == 1))
+    period_end_indices = np.where(np.arange(n) < train_idx, train_idx - 1, n - 1).astype(np.int64)
+
+    def _exit_abs_idx(entry_idx: int, exit_rel: int) -> int:
+        i = int(entry_idx)
+        if i < 0 or i >= n:
+            return i
+        if int(exit_rel) > 0:
+            return min(n - 1, i + int(exit_rel))
+        period_end = int(period_end_indices[i]) if i < len(period_end_indices) else n - 1
+        period_end = max(i, min(period_end, n - 1))
+        return min(period_end, i + max(1, int(args.hold)))
+
+    def _select_entries_for_mask(
+        raw_mask: np.ndarray,
+        y_eval: np.ndarray,
+        t_exit_eval: np.ndarray,
+        only_lower_entry: bool | None = None,
+    ) -> tuple[np.ndarray, int, int]:
+        use_lower = bool(args.cluster_only_lower_entry) if only_lower_entry is None else bool(only_lower_entry)
+        eval_y = np.asarray(y_eval)
+        eval_exit = np.asarray(t_exit_eval)
+        raw = np.asarray(raw_mask, dtype=bool)
+        evaluable = raw & ((eval_y == 0) | (eval_y == 1))
+        raw_idxs = np.flatnonzero(evaluable)
+        selected = np.zeros(n, dtype=bool)
+        if raw_idxs.size == 0:
+            return selected, 0, 0
+
+        gap_ns = int(args.cluster_gap_minutes) * 60 * 1_000_000_000
+        open_trades: list[int] = []
+        prev_idx: int | None = None
+        entries_in_cluster = 0
+        cluster_min_close = float("nan")
+        selected_cluster_ids: set[int] = set()
+        cluster_id = -1
+
+        for idx_i in raw_idxs.tolist():
+            i = int(idx_i)
+            new_cluster = prev_idx is None
+            if prev_idx is not None:
+                if bar_time_ns is not None and len(bar_time_ns) > i and len(bar_time_ns) > prev_idx:
+                    new_cluster = (int(bar_time_ns[i]) - int(bar_time_ns[prev_idx])) > gap_ns
+                else:
+                    new_cluster = (i - int(prev_idx)) > int(args.cluster_gap_minutes)
+            if new_cluster:
+                cluster_id += 1
+                entries_in_cluster = 0
+                cluster_min_close = float("nan")
+            prev_idx = i
+
+            open_trades = [x for x in open_trades if int(x) > i]
+            if entries_in_cluster >= int(args.max_entries_per_cluster):
+                continue
+            if use_lower and entries_in_cluster > 0:
+                c = float(close[i])
+                if (not np.isfinite(c)) or (not np.isfinite(cluster_min_close)) or not (c < cluster_min_close):
+                    continue
+            if len(open_trades) >= int(args.max_open_trades):
+                continue
+
+            exit_idx = _exit_abs_idx(i, int(eval_exit[i]) if i < len(eval_exit) else -1)
+            selected[i] = True
+            entries_in_cluster += 1
+            selected_cluster_ids.add(int(cluster_id))
+            c = float(close[i])
+            if np.isfinite(c):
+                cluster_min_close = c if not np.isfinite(cluster_min_close) else min(cluster_min_close, c)
+            open_trades.append(int(exit_idx))
+        return selected, int(raw_idxs.size), int(len(selected_cluster_ids))
 
     t0 = time.perf_counter()
     allow_keys, allow_keys_refined = _load_allowlist(args.include_candidates_file)
@@ -827,6 +913,11 @@ def main() -> None:
         "train_frac": float(args.train_frac),
         "quantiles": str(args.quantiles),
         "family_split_delta_window": int(bool(args.family_split_delta_window)),
+        "entry_selection_semantics_version": "cluster_gap_lower_maxopen_v1",
+        "cluster_gap_minutes": int(args.cluster_gap_minutes),
+        "max_entries_per_cluster": int(args.max_entries_per_cluster),
+        "max_open_trades": int(args.max_open_trades),
+        "cluster_only_lower_entry": int(bool(args.cluster_only_lower_entry)),
     }
     coarse_ctx_sig = _ctx_sig(coarse_ctx)
     coarse_out = args.out_candidates_coarse_csv
@@ -894,20 +985,26 @@ def main() -> None:
                 m = np.isfinite(xvec) & (xvec >= val)
             else:
                 m = np.isfinite(xvec) & (xvec <= val)
+            m_sel, _, _ = _select_entries_for_mask(m, y, t_exit)
+            pos_hits = int(np.sum(m_sel[:train_idx] & (y_train == 1)))
+            neg_hits = int(np.sum(m_sel[:train_idx] & (y_train == 0)))
+            mask_count = int(pos_hits + neg_hits)
+            ratio = pos_hits / max(1, neg_hits)
+            lift = (pos_hits / max(1, int(np.sum(y_train == 1)))) / max(1e-12, (neg_hits / max(1, int(np.sum(y_train == 0)))))
             filtered_items.append({
                 "candidate_key": key, "stable_candidate_key": stable_k, "col": col, "op": op, "value": val, "mask": m,
                 "binary": bool(int(r.get("binary", 0))), "_family": str(r.get("family", _candidate_family(col, bool(args.family_split_delta_window)))),
-                "_single_pos_hits": int(r.get("coarse_single_pos_hits", 0)),
-                "_single_neg_hits": int(r.get("coarse_single_neg_hits", 0)),
-                "_single_mask_count": int(r.get("coarse_single_mask_count", 0)),
-                "_single_ratio": float(r.get("coarse_single_ratio", 0.0)),
-                "coarse_single_pos_hits": int(r.get("coarse_single_pos_hits", 0)),
-                "coarse_single_neg_hits": int(r.get("coarse_single_neg_hits", 0)),
-                "coarse_single_mask_count": int(r.get("coarse_single_mask_count", 0)),
-                "coarse_single_ratio": float(r.get("coarse_single_ratio", 0.0)),
-                "coarse_lift": float(r.get("coarse_lift", 0.0)),
-                "lift": float(r.get("coarse_lift", 0.0)),
-                "ratio": float(r.get("coarse_single_ratio", 0.0)),
+                "_single_pos_hits": pos_hits,
+                "_single_neg_hits": neg_hits,
+                "_single_mask_count": mask_count,
+                "_single_ratio": float(ratio),
+                "coarse_single_pos_hits": pos_hits,
+                "coarse_single_neg_hits": neg_hits,
+                "coarse_single_mask_count": mask_count,
+                "coarse_single_ratio": float(ratio),
+                "coarse_lift": float(lift),
+                "lift": float(lift),
+                "ratio": float(ratio),
             })
         print(f"[prefilter-resume] loaded coarse candidates from {coarse_out} rows={len(filtered_items)}")
     else:
@@ -922,8 +1019,9 @@ def main() -> None:
                 for _, thr in qmap.get(c, {}).items():
                     for op in (">=", "<="):
                         m = np.isfinite(x) & ((x >= thr) if op == ">=" else (x <= thr))
-                        pos = int(np.sum(m[:train_idx] & (y_train == 1)))
-                        neg = int(np.sum(m[:train_idx] & (y_train == 0)))
+                        m_sel, _, _ = _select_entries_for_mask(m, y, t_exit)
+                        pos = int(np.sum(m_sel[:train_idx] & (y_train == 1)))
+                        neg = int(np.sum(m_sel[:train_idx] & (y_train == 0)))
                         if pos <= 0:
                             continue
                         items.append({"col": c, "op": op, "value": float(thr), "mask": m, "binary": False,
@@ -937,7 +1035,8 @@ def main() -> None:
             is_binary = str(meta.get(c, {}).get("feature_type", "")) == "binary"
             for v in vals.tolist():
                 m = np.isfinite(b) & (np.abs(b - float(v)) <= 1e-6)
-                pos = int(np.sum(m[:train_idx] & (y_train == 1))); neg = int(np.sum(m[:train_idx] & (y_train == 0)))
+                m_sel, _, _ = _select_entries_for_mask(m, y, t_exit)
+                pos = int(np.sum(m_sel[:train_idx] & (y_train == 1))); neg = int(np.sum(m_sel[:train_idx] & (y_train == 0)))
                 if pos <= 0:
                     continue
                 items.append({"col": c, "op": "==", "value": float(v), "mask": m, "binary": bool(is_binary),
@@ -949,8 +1048,9 @@ def main() -> None:
             x = dict(it); x["candidate_key"] = f"cand_{i:06d}"
             x["stable_candidate_key"] = _stable_candidate_key(str(x["col"]), str(x["op"]), float(x["value"]))
             m = np.asarray(x["mask"], dtype=bool)
-            pos_hits = int(np.sum(m[:train_idx] & (y_train == 1))); neg_hits = int(np.sum(m[:train_idx] & (y_train == 0)))
-            mask_count = int(np.sum(m[:train_idx]))
+            m_sel, _, _ = _select_entries_for_mask(m, y, t_exit)
+            pos_hits = int(np.sum(m_sel[:train_idx] & (y_train == 1))); neg_hits = int(np.sum(m_sel[:train_idx] & (y_train == 0)))
+            mask_count = int(pos_hits + neg_hits)
             if float(x["lift"]) < float(args.min_single_lift):
                 single_rejects["min_lift"] += 1; continue
             x["_single_pos_hits"] = pos_hits; x["_single_neg_hits"] = neg_hits; x["_single_mask_count"] = mask_count
@@ -1161,12 +1261,24 @@ def main() -> None:
 
         cached_entries = _load_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig) if args.tick_entry_cache_npz is not None else {}
         cached_entries = cached_entries if cached_entries is not None else {}
-        cached_valid = {int(k) for k, v in cached_entries.items() if int(k) in entry_index_set and int(v.get("y", -1)) in (0, 1)}
-        missing_entry_indices = np.asarray([int(i) for i in entry_indices.tolist() if int(i) not in cached_valid], dtype=np.int64)
-        tick_map: dict[int, dict] = {int(i): cached_entries[int(i)] for i in cached_valid if int(i) in cached_entries}
+        cached_present = {int(k) for k in cached_entries.keys() if int(k) in entry_index_set}
+        tick_map: dict[int, dict] = {int(i): cached_entries[int(i)] for i in cached_present if int(i) in cached_entries}
+        structurally_invalid = [int(i) for i in entry_indices.tolist() if int(i) not in cached_present and int(i) + 1 >= n]
+        if structurally_invalid:
+            invalid_rec = {"y": -1, "pnl": float("nan"), "t_exit": -1, "t_qual": -1, "tp_hits": 0}
+            for idx_i in structurally_invalid:
+                tick_map[int(idx_i)] = dict(invalid_rec)
+                if args.tick_entry_cache_npz is not None:
+                    cached_entries[int(idx_i)] = dict(invalid_rec)
+            cached_present.update(structurally_invalid)
+            if args.tick_entry_cache_npz is not None:
+                _write_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig, cached_entries)
+            print(f"[prefilter-tick-cache] cached_structurally_invalid_entries={len(structurally_invalid)}")
+        cached_valid = {int(k) for k in cached_present if int(k) in cached_entries and int(cached_entries[int(k)].get("y", -1)) in (0, 1)}
+        missing_entry_indices = np.asarray([int(i) for i in entry_indices.tolist() if int(i) not in cached_present], dtype=np.int64)
         used_real_ticks = bool(args.tick_entry_cache_npz is not None and len(missing_entry_indices) == 0 and len(entry_indices) > 0)
         if missing_entry_indices.size > 0:
-            print(f"[prefilter-tick-cache] requested_entries={len(entry_indices)} cached_entries_used={len(cached_valid)} missing_entries={len(missing_entry_indices)}")
+            print(f"[prefilter-tick-cache] requested_entries={len(entry_indices)} cached_entries_used={len(cached_present)} missing_entries={len(missing_entry_indices)}")
             if args.tick_data is None:
                 print("[prefilter-tick-cache] warning: missing entries require --tick-data; current-scope missing entries remain unresolved.")
                 critical_minutes: set[int] = set()
@@ -1257,10 +1369,30 @@ def main() -> None:
                         entry_tick_stats=entry_tick_stats,
                     )
                     print(f"[prefilter-tick] entry_tick_missing_count={int(entry_tick_stats.get('entry_tick_missing_count', 0))}")
+                    invalid_rec = {"y": -1, "pnl": float("nan"), "t_exit": -1, "t_qual": -1, "tp_hits": 0}
                     for idx_i, rec in tick_map_new.items():
-                        tick_map[int(idx_i)] = dict(rec)
+                        rec_to_store = dict(rec)
+                        ii = int(idx_i)
+                        if bool(tick_bids_all is not None and tick_asks_all is not None) and ii + 1 < n:
+                            b_entry = tick_minute_bounds.get(int(bar_time_ns[ii + 1]))
+                            if b_entry is None or b_entry[1] <= b_entry[0] or not np.isfinite(tick_asks_all[b_entry[0]:b_entry[1]]).any():
+                                rec_to_store = dict(invalid_rec)
+                        tick_map[int(idx_i)] = rec_to_store
                         if args.tick_entry_cache_npz is not None:
-                            cached_entries[int(idx_i)] = dict(rec)
+                            cached_entries[int(idx_i)] = rec_to_store
+                    unresolved_invalid = []
+                    for idx_i in missing_entry_indices.tolist():
+                        ii = int(idx_i)
+                        if ii in tick_map_new:
+                            continue
+                        if ii + 1 >= n or int(bar_time_ns[ii + 1]) not in tick_minute_bounds:
+                            unresolved_invalid.append(ii)
+                    if unresolved_invalid:
+                        for idx_i in unresolved_invalid:
+                            tick_map[int(idx_i)] = dict(invalid_rec)
+                            if args.tick_entry_cache_npz is not None:
+                                cached_entries[int(idx_i)] = dict(invalid_rec)
+                        print(f"[prefilter-tick] entry_tick_invalid_unresolved_count={len(unresolved_invalid)}")
                     if args.tick_entry_cache_npz is not None:
                         _write_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig, cached_entries)
                     used_real_ticks = True
@@ -1268,7 +1400,7 @@ def main() -> None:
             print("[prefilter-tick-cache] tick_data_source=entry_cache_only")
             print("[prefilter-tick-cache] raw_tick_load_skipped=True reason=entry_cache_complete")
             print(f"[prefilter-tick-cache] requested_entries={len(entry_indices)}")
-            print(f"[prefilter-tick-cache] cached_entries_used={len(cached_valid)}")
+            print(f"[prefilter-tick-cache] cached_entries_used={len(cached_present)}")
             print("[prefilter-tick-cache] missing_entries=0")
             print("[prefilter-tick-cache] used_real_ticks_source=entry_cache")
             print("[prefilter-tick-raw-load] skipped=True reason=entry_cache_complete")
@@ -1283,21 +1415,26 @@ def main() -> None:
                 print("[prefilter-tick-cache] scope_counts_hint=use --debug-tick-cache-scope-counts")
         if tick_map:
             y_ref = np.full(n, -1, dtype=np.int8)
+            t_exit_ref = np.full(n, -1, dtype=np.int32)
             for idx_i, rec in tick_map.items():
                 if int(idx_i) in entry_index_set:
                     y_ref[int(idx_i)] = np.int8(int(rec.get("y", -1)))
+                    t_exit_ref[int(idx_i)] = np.int32(int(rec.get("t_exit", -1)))
             y_ref_train = y_ref[:train_idx]
-            union_train_mask = fam_union[:train_idx] & tradable_train & ((y_ref_train == 0) | (y_ref_train == 1))
+            union_sel, _, _ = _select_entries_for_mask(fam_union, y_ref, t_exit_ref)
+            union_train_mask = union_sel[:train_idx] & tradable_train & ((y_ref_train == 0) | (y_ref_train == 1))
             union_pos = int(np.sum(union_train_mask & (y_ref_train == 1)))
             union_neg = int(np.sum(union_train_mask & (y_ref_train == 0)))
             union_ratio = union_pos / max(1, union_neg)
             metrics_complete = True
             tick_missing_ids = {id(x) for x in tick_missing_items}
             for it in tick_scope_items:
-                m_train = np.asarray(it["mask"][:train_idx], dtype=bool) & tradable_train
-                valid_m = m_train & ((y_ref_train == 0) | (y_ref_train == 1))
-                expected_entries = int(np.sum(m_train))
-                if int(np.sum(valid_m)) < expected_entries:
+                raw_m = np.asarray(it["mask"], dtype=bool)
+                selected_m, raw_evaluable, _ = _select_entries_for_mask(raw_m, y_ref, t_exit_ref)
+                valid_m = selected_m[:train_idx] & tradable_train & ((y_ref_train == 0) | (y_ref_train == 1))
+                requested_entries = int(np.sum(raw_m & fam_union))
+                cached_for_item = sum(1 for idx_i in np.flatnonzero(raw_m).tolist() if int(idx_i) in tick_map)
+                if cached_for_item < requested_entries:
                     metrics_complete = False
                     if id(it) in tick_missing_ids:
                         continue
@@ -1386,20 +1523,41 @@ def main() -> None:
 
     if refined_out is not None:
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
+        status_rank = {"full": 3, "missing": 2, "out_of_scope": 1}
+
+        def _refined_row_key(row: dict) -> str:
+            stable_k = str(row.get("stable_candidate_key", "")).strip()
+            if stable_k:
+                return stable_k
+            try:
+                return _stable_candidate_key(str(row.get("col", "")), str(row.get("op", "")), float(row.get("value", np.nan)))
+            except Exception:
+                return str(row.get("candidate_key_refined", row.get("candidate_key", ""))).strip()
+
+        def _prefer_refined_row(old: dict | None, new: dict) -> dict:
+            if old is None:
+                return new
+            old_rank = int(status_rank.get(str(old.get("tick_metric_status", "out_of_scope")), 0))
+            new_rank = int(status_rank.get(str(new.get("tick_metric_status", "out_of_scope")), 0))
+            if new_rank >= old_rank:
+                return new
+            old = dict(old)
+            old["__ctx_sig"] = refined_ctx_sig
+            old["__stage"] = "refined"
+            return old
+
         existing_rows: dict[str, dict] = {}
         if refined_resume is not None:
             for _, r in refined_resume.iterrows():
-                try:
-                    stable_k = str(r.get("stable_candidate_key", "")).strip() or _stable_candidate_key(str(r.get("col", "")), str(r.get("op", "")), float(r.get("value", np.nan)))
-                except Exception:
-                    stable_k = str(r.get("candidate_key_refined", "")).strip()
+                stable_k = _refined_row_key({k: r.get(k) for k in r.index})
                 if not stable_k:
                     continue
                 row = {k: r.get(k) for k in r.index}
                 row["stable_candidate_key"] = stable_k
-                row["tick_metric_status"] = "out_of_scope"
+                row["tick_metric_status"] = str(row.get("tick_metric_status", "out_of_scope") or "out_of_scope")
                 row["__ctx_sig"] = refined_ctx_sig
-                existing_rows[stable_k] = row
+                row["__stage"] = "refined"
+                existing_rows[stable_k] = _prefer_refined_row(existing_rows.get(stable_k), row)
         for it in full_filtered_items:
             stable_k = _stable_candidate_key(str(it["col"]), str(it["op"]), float(it["value"]))
             row = existing_rows.get(stable_k, {})
@@ -1428,8 +1586,14 @@ def main() -> None:
                 row["tick_metric_status"] = "full"
             else:
                 row["tick_metric_status"] = "missing"
-            existing_rows[stable_k] = row
-        cand_rows = list(existing_rows.values())
+            existing_rows[stable_k] = _prefer_refined_row(existing_rows.get(stable_k), row)
+        deduped_rows: dict[str, dict] = {}
+        for row in existing_rows.values():
+            k = _refined_row_key(row)
+            if not k:
+                continue
+            deduped_rows[k] = _prefer_refined_row(deduped_rows.get(k), row)
+        cand_rows = list(deduped_rows.values())
         refined_cols = ["candidate_key_refined", "stable_candidate_key", "col", "op", "value", "family", "coarse_single_pos_hits", "coarse_single_neg_hits", "coarse_single_mask_count", "coarse_single_ratio", "coarse_lift", "binary", "kept_after_family_topn", "tick_single_pos_hits", "tick_single_neg_hits", "tick_single_mask_count", "tick_single_ratio", "tick_lift", "tick_metric_status", "__stage", "__ctx_sig", "build_min_single_pos_hits", "build_max_single_mask_count", "build_min_single_lift"]
         _atomic_write_csv(refined_out, _ordered_frame(cand_rows, refined_cols))
         print(f"[prefilter-candidates] wrote refined CSV: {refined_out} rows={len(cand_rows)}")
@@ -1515,27 +1679,29 @@ def main() -> None:
                 return np.zeros(n, dtype=bool)
         return mask
 
-    def _score_from_mask(mask: np.ndarray) -> dict | None:
-        mt = mask[:train_idx] & tradable_train
+    def _score_from_mask(mask: np.ndarray, only_lower_entry: bool | None = None, enforce_filters: bool = True) -> dict | None:
+        selected_mask, raw_evaluable, clusters_count = _select_entries_for_mask(mask, y, t_exit, only_lower_entry=only_lower_entry)
+        mt = selected_mask[:train_idx] & tradable_train
         pos_hits = int(np.sum(mt & (y_train == 1)))
         neg_hits = int(np.sum(mt & (y_train == 0)))
         days = max(1.0, float((df.index[train_idx - 1] - df.index[0]).total_seconds() / 86400.0))
         weeks = days / 7.0
-        if pos_hits < float(args.min_pos_per_week) * weeks:
+        if enforce_filters and pos_hits < float(args.min_pos_per_week) * weeks:
             if bool(args.debug_reject_stats):
                 reject_stats["rejected_min_pos_per_week"] += 1
             return None
         ratio = pos_hits / max(1, neg_hits)
-        if ratio < float(args.min_main_score):
+        if enforce_filters and ratio < float(args.min_main_score):
             if bool(args.debug_reject_stats):
                 reject_stats["rejected_min_main_score"] += 1
             return None
-        mt_test = mask[train_idx:] & tradable_test
+        mt_test = selected_mask[train_idx:] & tradable_test
         pos_test = int(np.sum(mt_test & (y_test == 1)))
         neg_test = int(np.sum(mt_test & (y_test == 0)))
         ratio_test = pos_test / max(1, neg_test)
         wf_mean, wf_min, wf_hits = _calc_wf(mt_test, y_test, int(args.wf_folds))
         precision = pos_hits / max(1, (pos_hits + neg_hits))
+        selected_evaluable = int(pos_hits + neg_hits + pos_test + neg_test)
         return {
             "pos_hits": pos_hits,
             "neg_hits": neg_hits,
@@ -1547,6 +1713,8 @@ def main() -> None:
             "wf_mean_ratio": wf_mean,
             "wf_min_ratio": wf_min,
             "wf_hits": wf_hits,
+            "selection_ratio": float(selected_evaluable / raw_evaluable) if raw_evaluable > 0 else 0.0,
+            "clusters_count": int(clusters_count),
         }
 
     def _train_key(r: dict) -> tuple[float, int, int]:
@@ -1614,7 +1782,9 @@ def main() -> None:
     csv_columns = [
         "path_index", "rule_human", "rule_json_id", "decode_type_info", "decode_bin_info", "pos_hits", "neg_hits",
         "remaining_hit_ratio", "precision_info", "test_pos_hits", "test_neg_hits", "test_ratio",
-        "wf_mean_ratio", "wf_min_ratio", "wf_hits", "tp", "sl", "hold", "trail",
+        "wf_mean_ratio", "wf_min_ratio", "wf_hits", "selection_ratio", "clusters_count",
+        *( ["le_off_train_ratio", "le_off_test_ratio", "le_off_total_hits"] if bool(args.cluster_only_lower_entry) else [] ),
+        "tp", "sl", "hold", "trail",
         "trail_activate", "trail_offset", "trail_factor", "search_source", "is_fallback_export",
     ]
 
@@ -1722,7 +1892,7 @@ def main() -> None:
                     bin_parts.append(json.dumps({"col": col, **dec}, ensure_ascii=False, sort_keys=True))
                 else:
                     type_parts.append(f"{col}:{ftype}")
-            rows.append({
+            row = {
                 "path_index": i,
                 "rule_human": " & ".join(decoded_parts),
                 "rule_json_id": f"rule_{i}",
@@ -1738,6 +1908,8 @@ def main() -> None:
                 "wf_mean_ratio": r["wf_mean_ratio"],
                 "wf_min_ratio": r["wf_min_ratio"],
                 "wf_hits": r["wf_hits"],
+                "selection_ratio": float(r.get("selection_ratio", 0.0)),
+                "clusters_count": int(r.get("clusters_count", 0)),
                 "tp": ",".join([f"{x:.8g}" for x in tps]),
                 "sl": float(args.sl),
                 "hold": int(args.hold),
@@ -1747,7 +1919,12 @@ def main() -> None:
                 "trail_factor": float(args.trail_factor),
                 "search_source": str(r.get("search_source", "")),
                 "is_fallback_export": int(bool(is_fallback_export)),
-            })
+            }
+            if bool(args.cluster_only_lower_entry):
+                row["le_off_train_ratio"] = float(r.get("le_off_train_ratio", np.nan))
+                row["le_off_test_ratio"] = float(r.get("le_off_test_ratio", np.nan))
+                row["le_off_total_hits"] = int(r.get("le_off_total_hits", 0))
+            rows.append(row)
         return rows
 
     def _validate_rows(rows: list[dict]) -> None:
@@ -1784,9 +1961,14 @@ def main() -> None:
         return out
 
     def _save_progress(valid_pool: list[dict], state: dict) -> None:
-        rules_only = {"version": 2, "rules": [_attach_decode_info(r) for r in valid_pool]}
+        non_d_rows = [r for r in valid_pool if str(r.get("search_source", "")) != "D"]
+        d_rows = [r for r in valid_pool if str(r.get("search_source", "")) == "D"]
+        non_d_rows = sorted(_dedupe_mask(non_d_rows), key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.top_paths)]
+        d_rows = sorted(_dedupe_mask(d_rows), key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.top_paths)]
+        export_subset = [_attach_decode_info(r) for r in (non_d_rows + d_rows)]
+        rules_only = {"version": 2, "rules": export_subset}
         _atomic_write_text(args.out_rules_json, json.dumps(rules_only, ensure_ascii=False, indent=2))
-        rows = _rules_to_rows([_attach_decode_info(r) for r in valid_pool[: int(args.top_paths)]], is_fallback_export=False)
+        rows = _rules_to_rows(export_subset, is_fallback_export=False)
         _validate_rows(rows)
         if rows:
             _atomic_write_csv(args.out_rules_csv, pd.DataFrame(rows))
@@ -1836,7 +2018,7 @@ def main() -> None:
             phase_a = (len(valid_pool) < int(args.max_valids)) and (not force_phase_b_requested)
             phase_b_pool_key = _phase_b_pool_key(pool)
             if (not phase_a) and phase_b_pool_key in completed_phase_b_pool_keys:
-                print(f"[prefilter-phase-b] skipped: already completed for unchanged pool_key pool_size={len(pool)}")
+                print(f"[prefilter-phase-b] skipped: completed pool key already processed. pool_size={len(pool)}")
                 force_phase = "C"
                 break
             if (not phase_a) and not valid_pool:
@@ -2065,7 +2247,7 @@ def main() -> None:
                 continue
             best_paths = list(valid_pool)
             cur_best = float(best_paths[0]["ratio"]) if best_paths else -np.inf
-            if phase_a and cur_best <= prev_best + 1e-12:
+            if phase_a and (not force_phase_b_requested) and cur_best <= prev_best + 1e-12:
                 break
             prev_best = cur_best
             unlocked = unlocked_next
@@ -2117,6 +2299,7 @@ def main() -> None:
             seeds_at_level_start = len(beam)
             generated_extensions = 0
             evaluated_combos = 0
+            truncated = False
             out_c: list[dict] = []
             def _iter_cands_c():
                 for base in beam:
@@ -2130,16 +2313,23 @@ def main() -> None:
             had_any = False
             for chunk in _batched(_iter_cands_c(), max(64, int(args.batch_size))):
                 had_any = True
+                cap = int(args.phase_c_max_generated_per_level)
+                if cap > 0 and generated_extensions + len(chunk) >= cap:
+                    chunk = chunk[: max(0, cap - generated_extensions)]
+                    truncated = True
                 generated_extensions += len(chunk)
                 for cb in chunk:
                     evaluated_combos += 1
                     rr = evaluate_combo(cb, pool_c, None, source="C")
                     if rr is not None:
                         out_c.append(rr)
+                if truncated:
+                    break
             if not had_any:
+                print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated=0 evaluated=0 truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules=0 new_valid=0 beam_kept=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
                 break
             if not out_c:
-                print(f"[prefilter-phase-c] level={phase_c_level} seeds={seeds_at_level_start} pool={len(pool_c)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_c))} new_valid=0 beam_kept=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_c))} new_valid=0 beam_kept=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
                 break
             valid_before = len(valid_pool)
             valid_pool.extend(out_c)
@@ -2149,7 +2339,7 @@ def main() -> None:
             beam_rules = sorted(out_c, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.phase_c_beam_width)]
             beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
             best_ratio = float(valid_pool[0]["ratio"]) if valid_pool else float("nan")
-            print(f"[prefilter-phase-c] level={phase_c_level} seeds={seeds_at_level_start} pool={len(pool_c)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_c))} new_valid={max(0, len(valid_pool) - valid_before)} beam_kept={len(beam)} valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
+            print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_c))} new_valid={max(0, len(valid_pool) - valid_before)} beam_kept={len(beam)} valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
             cmd = _read_control_command(args.control_file)
             if cmd == "export_now":
                 print("[prefilter-control] export_now (phase C)"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file)
@@ -2212,14 +2402,21 @@ def main() -> None:
             level_t0 = time.perf_counter()
             generated_extensions = 0
             evaluated_combos = 0
+            truncated = False
             out_d: list[dict] = []
             for chunk in _batched(itertools.combinations(idxs_d, start_depth), max(64, int(args.batch_size))):
+                cap = int(args.phase_d_max_generated_per_level)
+                if cap > 0 and generated_extensions + len(chunk) >= cap:
+                    chunk = chunk[: max(0, cap - generated_extensions)]
+                    truncated = True
                 generated_extensions += len(chunk)
                 for cb in chunk:
                     evaluated_combos += 1
                     rr = evaluate_combo(tuple(sorted(cb)), tick_pool, None, source="D")
                     if rr is not None:
                         out_d.append(rr)
+                if truncated:
+                    break
             if out_d:
                 before = len(d_valid_pool)
                 d_valid_pool = _keep_d_pool(d_valid_pool + out_d)
@@ -2227,9 +2424,10 @@ def main() -> None:
                 beam_rules = sorted(_dedupe_mask(out_d), key=_d_sort_key)[: int(args.phase_d_beam_width)]
                 d_beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
                 best_ratio = float(d_valid_pool[0]["ratio"]) if d_valid_pool else float("nan")
-                print(f"[prefilter-phase-d] level=0 depth={start_depth} seeds=all pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_kept={len(d_beam)} d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
+                print(f"[prefilter-phase-d] level=0 depth={start_depth} seeds=all pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_kept={len(d_beam)} d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
             else:
-                print(f"[prefilter-phase-d] level=0 depth={start_depth} seeds=all pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_kept=0 d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                print(f"[prefilter-phase-d] level=0 depth={start_depth} seeds=all pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_kept=0 d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                _save_progress(valid_pool + d_valid_pool, progress_state)
             if _phase_d_control():
                 d_beam = []
 
@@ -2239,6 +2437,7 @@ def main() -> None:
                 seeds_at_level_start = len(d_beam)
                 generated_extensions = 0
                 evaluated_combos = 0
+                truncated = False
                 out_d = []
                 current_min_base_len = min((len(b) for b in d_beam), default=0)
                 current_max_base_len = max((len(b) for b in d_beam), default=0)
@@ -2262,15 +2461,22 @@ def main() -> None:
                 had_any = False
                 for chunk in _batched(_iter_cands_d(), max(64, int(args.batch_size))):
                     had_any = True
+                    cap = int(args.phase_d_max_generated_per_level)
+                    if cap > 0 and generated_extensions + len(chunk) >= cap:
+                        chunk = chunk[: max(0, cap - generated_extensions)]
+                        truncated = True
                     generated_extensions += len(chunk)
                     for cb in chunk:
                         evaluated_combos += 1
                         rr = evaluate_combo(cb, tick_pool, None, source="D")
                         if rr is not None:
                             out_d.append(rr)
+                    if truncated:
+                        break
                 depth_txt = f"depth={min_depth}" if min_depth == max_depth else f"depth_range={min_depth}..{max_depth}"
                 if (not had_any) or (not out_d):
-                    print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_kept=0 d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                    print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_kept=0 d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                    _save_progress(valid_pool + d_valid_pool, progress_state)
                     _phase_d_control()
                     break
                 before = len(d_valid_pool)
@@ -2279,7 +2485,7 @@ def main() -> None:
                 beam_rules = sorted(_dedupe_mask(out_d), key=_d_sort_key)[: int(args.phase_d_beam_width)]
                 d_beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
                 best_ratio = float(d_valid_pool[0]["ratio"]) if d_valid_pool else float("nan")
-                print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} generated={generated_extensions} evaluated={evaluated_combos} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_kept={len(d_beam)} d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
+                print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_kept={len(d_beam)} d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
                 if _phase_d_control():
                     break
             print("[prefilter-phase-d] done")
@@ -2394,6 +2600,18 @@ def main() -> None:
     d_export, d_fallback = _prepare_export_group(d_pool, "D")
     best_paths = non_d_export + d_export
     fallback_export_used = bool(non_d_fallback or d_fallback)
+    if bool(args.cluster_only_lower_entry):
+        for r in best_paths:
+            le_mask = _build_mask_from_conds(r.get("conds", []))
+            le_sc = _score_from_mask(le_mask, only_lower_entry=False, enforce_filters=False)
+            if le_sc is None:
+                r["le_off_train_ratio"] = float("nan")
+                r["le_off_test_ratio"] = float("nan")
+                r["le_off_total_hits"] = 0
+            else:
+                r["le_off_train_ratio"] = float(le_sc.get("ratio", np.nan))
+                r["le_off_test_ratio"] = float(le_sc.get("test_ratio", np.nan))
+                r["le_off_total_hits"] = int(le_sc.get("pos_hits", 0)) + int(le_sc.get("neg_hits", 0)) + int(le_sc.get("test_pos_hits", 0)) + int(le_sc.get("test_neg_hits", 0))
     if not best_paths:
         print("[prefilter-warning] No rule with test hits found for final CSV export.")
 
