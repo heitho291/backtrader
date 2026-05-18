@@ -490,34 +490,93 @@ def _load_tick_minute_map_partial(
     if not minute_filter:
         return np.asarray([], dtype=np.float64), {}, None, None, 0
     if path.suffix.lower() in {".parquet", ".pq"}:
-        cols = ["DateTime", "Bid", "Ask", "Volume"]
         try:
-            pq = pd.read_parquet(path, columns=cols)
-        except Exception:
-            pq = pd.read_parquet(path)
-        missing = set(cols) - set(str(c) for c in pq.columns)
+            import pyarrow.parquet as pa_parquet  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("pyarrow is required for memory-safe tick parquet loading") from exc
+
+        cols = ["DateTime", "Bid", "Ask", "Volume"]
+        pf = pa_parquet.ParquetFile(path)
+        schema_cols = set(str(c) for c in pf.schema_arrow.names)
+        missing = set(cols) - schema_cols
         if missing:
             raise ValueError(f"tick parquet missing columns: {sorted(missing)}")
-        dt = pd.to_datetime(pq["DateTime"], errors="coerce", utc=True)
-        dt_ns = dt.astype("int64").to_numpy()
-        minute_ns = dt.dt.floor("min").astype("int64").to_numpy()
+
+        chunk_size_eff = 150_000 if str(tick_chunk_size).lower() == "auto" else max(10_000, int(tick_chunk_size))
         minute_filter_arr = np.asarray(list(minute_filter), dtype=np.int64)
-        keep = np.isin(minute_ns, minute_filter_arr)
-        if not np.any(keep):
+        filter_min = int(minute_filter_arr.min())
+        filter_max = int(minute_filter_arr.max())
+        nat_ns = np.iinfo(np.int64).min
+        minute_parts: list[np.ndarray] = []
+        time_parts: list[np.ndarray] = []
+        bid_parts: list[np.ndarray] = []
+        ask_parts: list[np.ndarray] = []
+        row_order_parts: list[np.ndarray] = []
+        row_groups_total = int(pf.num_row_groups)
+        row_groups_read = 0
+        row_groups_skipped = 0
+        rows_matched = 0
+        source_row_offset = 0
+
+        def _row_group_overlaps_filter(row_group_index: int) -> bool:
+            rg = pf.metadata.row_group(row_group_index)
+            dt_col_idx = pf.schema_arrow.names.index("DateTime")
+            stats = rg.column(dt_col_idx).statistics
+            if stats is None or stats.min is None or stats.max is None:
+                return True
+            try:
+                rg_min = int(pd.Timestamp(stats.min).tz_convert(None).value) if getattr(stats.min, "tzinfo", None) is not None else int(pd.Timestamp(stats.min).value)
+                rg_max = int(pd.Timestamp(stats.max).tz_convert(None).value) if getattr(stats.max, "tzinfo", None) is not None else int(pd.Timestamp(stats.max).value)
+            except Exception:
+                return True
+            rg_minute_min = (rg_min // NS_PER_MINUTE) * NS_PER_MINUTE
+            rg_minute_max = (rg_max // NS_PER_MINUTE) * NS_PER_MINUTE
+            return not (rg_minute_max < filter_min or rg_minute_min > filter_max)
+
+        for row_group_index in range(row_groups_total):
+            row_group_rows = int(pf.metadata.row_group(row_group_index).num_rows)
+            if not _row_group_overlaps_filter(row_group_index):
+                row_groups_skipped += 1
+                source_row_offset += row_group_rows
+                continue
+            row_groups_read += 1
+            batch_offset = 0
+            for batch in pf.iter_batches(row_groups=[row_group_index], columns=cols, batch_size=chunk_size_eff):
+                batch_rows = int(batch.num_rows)
+                ch = batch.to_pandas()
+                dt_full = pd.to_datetime(ch["DateTime"], errors="coerce", utc=True)
+                bid = pd.to_numeric(ch["Bid"], errors="coerce").to_numpy(dtype=np.float64)
+                ask = pd.to_numeric(ch["Ask"], errors="coerce").to_numpy(dtype=np.float64)
+                dt_valid = dt_full.notna().to_numpy()
+                dt_ns = dt_full.astype("int64").to_numpy(dtype=np.int64)
+                minute_ns = ((dt_ns // NS_PER_MINUTE) * NS_PER_MINUTE).astype(np.int64, copy=False)
+                valid = dt_valid & (dt_ns != nat_ns) & np.isfinite(bid) & np.isfinite(ask) & (bid > 0) & (ask > 0)
+                if np.any(valid):
+                    keep = valid & np.isin(minute_ns, minute_filter_arr)
+                    if np.any(keep):
+                        keep_indices = np.flatnonzero(keep)
+                        minute_parts.append(minute_ns[keep_indices].astype(np.int64, copy=False))
+                        time_parts.append(dt_ns[keep_indices].astype(np.int64, copy=False))
+                        bid_parts.append(bid[keep_indices].astype(np.float64, copy=False))
+                        ask_parts.append(ask[keep_indices].astype(np.float64, copy=False))
+                        row_order_parts.append((source_row_offset + batch_offset + keep_indices).astype(np.int64, copy=False))
+                        rows_matched += int(len(keep_indices))
+                batch_offset += batch_rows
+            source_row_offset += row_group_rows
+
+        if not minute_parts:
+            print(
+                f"[prefilter-tick-parquet-load] row_groups_total={row_groups_total} row_groups_read={row_groups_read} "
+                f"row_groups_skipped={row_groups_skipped} rows_matched=0 matched_minutes=0",
+                flush=True,
+            )
             return np.asarray([], dtype=np.float64), {}, None, None, 0
-        bids = pd.to_numeric(pq.loc[keep, "Bid"], errors="coerce").to_numpy(dtype=np.float64)
-        asks = pd.to_numeric(pq.loc[keep, "Ask"], errors="coerce").to_numpy(dtype=np.float64)
-        kept_times = dt_ns[keep].astype(np.int64, copy=False)
-        kept_minutes = minute_ns[keep].astype(np.int64, copy=False)
-        row_order = np.arange(len(kept_times), dtype=np.int64)
-        valid = (kept_times != np.iinfo(np.int64).min) & np.isfinite(bids) & np.isfinite(asks) & (bids > 0) & (asks > 0)
-        if not np.any(valid):
-            return np.asarray([], dtype=np.float64), {}, None, None, 0
-        mins = kept_minutes[valid]
-        times = kept_times[valid]
-        bids = bids[valid]
-        asks = asks[valid]
-        row_order = row_order[valid]
+
+        mins = np.concatenate(minute_parts).astype(np.int64, copy=False)
+        times = np.concatenate(time_parts).astype(np.int64, copy=False)
+        bids = np.concatenate(bid_parts).astype(np.float64, copy=False)
+        asks = np.concatenate(ask_parts).astype(np.float64, copy=False)
+        row_order = np.concatenate(row_order_parts).astype(np.int64, copy=False)
         order = np.lexsort((row_order, times, mins))
         mins = mins[order]
         bids = bids[order]
@@ -531,7 +590,11 @@ def _load_tick_minute_map_partial(
                 j += 1
             bounds[m] = (i, j)
             i = j
-        print(f"[prefilter-tick-parquet] source=parquet rows_loaded={len(prices)} matched_minutes={len(bounds)}")
+        print(
+            f"[prefilter-tick-parquet-load] row_groups_total={row_groups_total} row_groups_read={row_groups_read} "
+            f"row_groups_skipped={row_groups_skipped} rows_matched={rows_matched} matched_minutes={len(bounds)}",
+            flush=True,
+        )
         return prices, bounds, bids, asks, int(len(bounds))
     use_price_col = None if str(price_col).lower() == "auto" else str(price_col)
     chunk_size_eff = 150_000 if str(tick_chunk_size).lower() == "auto" else max(10_000, int(tick_chunk_size))
