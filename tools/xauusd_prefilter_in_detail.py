@@ -506,8 +506,6 @@ def _load_tick_minute_map_partial(
 
         chunk_size_eff = 150_000 if str(tick_chunk_size).lower() == "auto" else max(10_000, int(tick_chunk_size))
         minute_filter_arr = np.asarray(list(minute_filter), dtype=np.int64)
-        filter_min = int(minute_filter_arr.min())
-        filter_max = int(minute_filter_arr.max())
         nat_ns = np.iinfo(np.int64).min
         minute_parts: list[np.ndarray] = []
         time_parts: list[np.ndarray] = []
@@ -520,27 +518,8 @@ def _load_tick_minute_map_partial(
         rows_matched = 0
         source_row_offset = 0
 
-        def _row_group_overlaps_filter(row_group_index: int) -> bool:
-            rg = pf.metadata.row_group(row_group_index)
-            dt_col_idx = pf.schema_arrow.names.index("DateTime")
-            stats = rg.column(dt_col_idx).statistics
-            if stats is None or stats.min is None or stats.max is None:
-                return True
-            try:
-                rg_min = int(pd.Timestamp(stats.min).tz_convert(None).value) if getattr(stats.min, "tzinfo", None) is not None else int(pd.Timestamp(stats.min).value)
-                rg_max = int(pd.Timestamp(stats.max).tz_convert(None).value) if getattr(stats.max, "tzinfo", None) is not None else int(pd.Timestamp(stats.max).value)
-            except Exception:
-                return True
-            rg_minute_min = (rg_min // NS_PER_MINUTE) * NS_PER_MINUTE
-            rg_minute_max = (rg_max // NS_PER_MINUTE) * NS_PER_MINUTE
-            return not (rg_minute_max < filter_min or rg_minute_min > filter_max)
-
         for row_group_index in range(row_groups_total):
             row_group_rows = int(pf.metadata.row_group(row_group_index).num_rows)
-            if not _row_group_overlaps_filter(row_group_index):
-                row_groups_skipped += 1
-                source_row_offset += row_group_rows
-                continue
             row_groups_read += 1
             batch_offset = 0
             for batch in pf.iter_batches(row_groups=[row_group_index], columns=cols, batch_size=chunk_size_eff):
