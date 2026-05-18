@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import shutil
@@ -167,7 +168,9 @@ def _normalize_chunk(df, args: argparse.Namespace, source_offset: int = 0):
 def _estimate_boundaries(inputs: list[Path], args: argparse.Namespace) -> list[int]:
     np, _pd = _import_deps()
     buckets = max(1, int(args.merge_buckets))
+    sample_count = 0
     if buckets == 1:
+        print("[tick-parquet] boundary pass done samples=0 boundaries=0", flush=True)
         return []
     samples: list[np.ndarray] = []
     max_per_chunk = max(100, int(args.boundary_sample_per_chunk))
@@ -179,8 +182,10 @@ def _estimate_boundaries(inputs: list[Path], args: argparse.Namespace) -> list[i
             if vals.size > max_per_chunk:
                 take = np.linspace(0, vals.size - 1, max_per_chunk, dtype=np.int64)
                 vals = np.sort(vals)[take]
+            sample_count += int(vals.size)
             samples.append(vals.astype(np.int64, copy=False))
     if not samples:
+        print("[tick-parquet] boundary pass done samples=0 boundaries=0", flush=True)
         return []
     all_samples = np.sort(np.concatenate(samples).astype(np.int64, copy=False))
     boundaries: list[int] = []
@@ -194,6 +199,7 @@ def _estimate_boundaries(inputs: list[Path], args: argparse.Namespace) -> list[i
         if last is None or b > last:
             out.append(b)
             last = b
+    print(f"[tick-parquet] boundary pass done samples={sample_count} boundaries={len(out)}", flush=True)
     return out
 
 
@@ -204,17 +210,28 @@ def _write_temp_part(df, path: Path) -> None:
 
 def _bucketize_inputs(inputs: list[Path], args: argparse.Namespace, temp_dir: Path, boundaries: list[int]):
     np, _pd = _import_deps()
+    print("[tick-parquet] bucketize start", flush=True)
     bucket_count = max(1, int(args.merge_buckets))
     bucket_parts: list[list[Path]] = [[] for _ in range(bucket_count)]
     stats = {"rows_total_in": 0, "rows_dropped_invalid": 0}
     row_order = 0
     part_id = 0
+    chunk_no = 0
     for path in inputs:
         for chunk in _iter_input_chunks(path, args):
+            chunk_no += 1
             norm, st = _normalize_chunk(chunk, args, source_offset=row_order)
             row_order += len(norm)
-            stats["rows_total_in"] += int(st["rows_total_in"])
-            stats["rows_dropped_invalid"] += int(st["rows_dropped_invalid"])
+            rows_in = int(st["rows_total_in"])
+            rows_dropped = int(st["rows_dropped_invalid"])
+            rows_valid = int(len(norm))
+            stats["rows_total_in"] += rows_in
+            stats["rows_dropped_invalid"] += rows_dropped
+            print(
+                f"[tick-parquet] bucketize chunk input={path} chunk_no={chunk_no} "
+                f"rows_in={rows_in} rows_valid={rows_valid} rows_dropped={rows_dropped}",
+                flush=True,
+            )
             if norm.empty:
                 continue
             bucket_ids = np.searchsorted(np.asarray(boundaries, dtype=np.int64), norm["_datetime_ns"].to_numpy(dtype=np.int64), side="right")
@@ -227,6 +244,12 @@ def _bucketize_inputs(inputs: list[Path], args: argparse.Namespace, temp_dir: Pa
                 part_id += 1
                 _write_temp_part(part, part_path)
                 bucket_parts[bid].append(part_path)
+    parts_total = sum(len(x) for x in bucket_parts)
+    print(
+        f"[tick-parquet] bucketize done parts={parts_total} rows_total_in={stats['rows_total_in']} "
+        f"rows_dropped_invalid={stats['rows_dropped_invalid']}",
+        flush=True,
+    )
     return bucket_parts, stats
 
 
@@ -234,18 +257,30 @@ def _sort_dedupe_and_conflicts(df):
     _, pd = _import_deps()
     if df.empty:
         return df[OUTPUT_COLUMNS + HELPER_COLUMNS].copy(), 0, {"overlap_conflict_count": 0, "overlap_conflict_first": "", "overlap_conflict_last": ""}
-    conflict_dts = []
-    for dt, grp in df.groupby("DateTime", sort=False):
-        if len(grp[DEDUP_COLUMNS].drop_duplicates()) > 1:
-            conflict_dts.append(dt)
     before = int(len(df))
     out = df.sort_values(["_datetime_ns", "_row_order"], kind="mergesort").drop_duplicates(subset=DEDUP_COLUMNS, keep="first").copy()
+
+    conflict_count = 0
+    conflict_first = ""
+    conflict_last = ""
+    duplicated_dt_mask = out["DateTime"].duplicated(keep=False)
+    if bool(duplicated_dt_mask.any()):
+        duplicated = out.loc[duplicated_dt_mask, DEDUP_COLUMNS]
+        combo_counts = duplicated.groupby("DateTime", sort=False)[["Bid", "Ask", "Volume"]].nunique(dropna=False)
+        conflict_mask = (combo_counts > 1).any(axis=1)
+        if bool(conflict_mask.any()):
+            conflict_index = combo_counts.index[conflict_mask]
+            conflict_count = int(len(conflict_index))
+            conflict_first = pd.Timestamp(conflict_index.min()).isoformat()
+            conflict_last = pd.Timestamp(conflict_index.max()).isoformat()
+
     out = out.sort_values(["_datetime_ns", "_row_order"], kind="mergesort").reset_index(drop=True)
     out["_row_order"] = range(len(out))
-    conflicts = {"overlap_conflict_count": int(len(conflict_dts)), "overlap_conflict_first": "", "overlap_conflict_last": ""}
-    if conflict_dts:
-        conflicts["overlap_conflict_first"] = pd.Timestamp(min(conflict_dts)).isoformat()
-        conflicts["overlap_conflict_last"] = pd.Timestamp(max(conflict_dts)).isoformat()
+    conflicts = {
+        "overlap_conflict_count": int(conflict_count),
+        "overlap_conflict_first": conflict_first,
+        "overlap_conflict_last": conflict_last,
+    }
     return out, before - int(len(out)), conflicts
 
 
@@ -306,8 +341,7 @@ class GapAggregator:
 
     def update(self, minutes) -> None:
         np, _pd = _import_deps()
-        if bool(self.args.no_gap_check) or len(minutes) == 0:
-            self.unique_minutes += int(len(minutes))
+        if len(minutes) == 0:
             return
         arr = np.asarray(sorted(set(int(x) for x in minutes)), dtype=np.int64)
         if self._prev_minute is not None:
@@ -315,6 +349,9 @@ class GapAggregator:
         if arr.size == 0:
             return
         self.unique_minutes += int(arr.size)
+        if bool(self.args.no_gap_check):
+            self._prev_minute = int(arr[-1])
+            return
         if self._prev_minute is not None:
             self._record_gap_if_any(int(self._prev_minute), int(arr[0]))
         for pos in np.flatnonzero(np.diff(arr) > NS_PER_MINUTE).tolist():
@@ -369,49 +406,123 @@ def _open_writer(path: Path, schema, compression: str = "snappy"):
         return pq.ParquetWriter(path, schema=schema, compression=None)
 
 
-def _process_buckets_to_output(bucket_parts: list[list[Path]], args: argparse.Namespace, out_path: Path, stats: dict[str, int]) -> dict[str, Any]:
+def _write_table_with_row_groups(writer, table, row_group_size: int) -> None:
+    if row_group_size > 0:
+        for start in range(0, table.num_rows, row_group_size):
+            writer.write_table(table.slice(start, row_group_size))
+    else:
+        writer.write_table(table)
+
+
+def _process_one_bucket(bucket_index: int, bucket_count: int, parts: list[Path], args: argparse.Namespace, processed_dir: Path) -> dict[str, Any]:
     np, pd = _import_deps()
+    out_path = processed_dir / f"processed_bucket_{bucket_index:03d}.parquet"
+    print(f"[tick-parquet] bucket {bucket_index + 1}/{bucket_count} start parts={len(parts)}", flush=True)
+    if parts:
+        bucket_df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
+    else:
+        bucket_df = pd.DataFrame(columns=OUTPUT_COLUMNS + HELPER_COLUMNS)
+    rows_before = int(len(bucket_df))
+    print(f"[tick-parquet] bucket {bucket_index + 1}/{bucket_count} loaded rows={rows_before}", flush=True)
+    bucket_df, dups, conflicts = _sort_dedupe_and_conflicts(bucket_df)
+    c_count = int(conflicts.get("overlap_conflict_count", 0))
+    print(
+        f"[tick-parquet] bucket {bucket_index + 1}/{bucket_count} dedupe "
+        f"duplicate_rows_removed={int(dups)} conflicts={c_count}",
+        flush=True,
+    )
+    minutes = bucket_df["_minute_ns"].drop_duplicates().to_numpy(dtype=np.int64) if len(bucket_df) else np.asarray([], dtype=np.int64)
+    first_dt = bucket_df["DateTime"].min().isoformat() if len(bucket_df) else ""
+    last_dt = bucket_df["DateTime"].max().isoformat() if len(bucket_df) else ""
+    rows_after = int(len(bucket_df))
+    if rows_after:
+        _pa, pq = _require_pyarrow()
+        pq.write_table(_frame_to_table(bucket_df), out_path, compression="snappy")
+    print(f"[tick-parquet] bucket {bucket_index + 1}/{bucket_count} written rows={rows_after}", flush=True)
+    return {
+        "bucket_index": int(bucket_index),
+        "processed_path": str(out_path) if rows_after else "",
+        "rows_before": rows_before,
+        "rows_after": rows_after,
+        "duplicate_rows_removed": int(dups),
+        "overlap_conflict_count": c_count,
+        "overlap_conflict_first": str(conflicts.get("overlap_conflict_first", "")),
+        "overlap_conflict_last": str(conflicts.get("overlap_conflict_last", "")),
+        "first_datetime": first_dt,
+        "last_datetime": last_dt,
+        "minutes": minutes.tolist(),
+    }
+
+
+def _merge_bucket_result(summary_state: dict[str, Any], result: dict[str, Any], gapper: GapAggregator) -> None:
+    summary_state["rows_out"] += int(result.get("rows_after", 0))
+    summary_state["dup_removed"] += int(result.get("duplicate_rows_removed", 0))
+    c_count = int(result.get("overlap_conflict_count", 0))
+    if c_count:
+        summary_state["conflict_count"] += c_count
+        c_first = str(result.get("overlap_conflict_first", ""))
+        c_last = str(result.get("overlap_conflict_last", ""))
+        if c_first:
+            summary_state["conflict_first"] = c_first if not summary_state["conflict_first"] else min(summary_state["conflict_first"], c_first)
+        if c_last:
+            summary_state["conflict_last"] = c_last if not summary_state["conflict_last"] else max(summary_state["conflict_last"], c_last)
+    first_dt = str(result.get("first_datetime", ""))
+    last_dt = str(result.get("last_datetime", ""))
+    if first_dt and not summary_state["first_dt"]:
+        summary_state["first_dt"] = first_dt
+    if last_dt:
+        summary_state["last_dt"] = last_dt
+    gapper.update(result.get("minutes", []))
+
+
+def _process_buckets_to_output(bucket_parts: list[list[Path]], args: argparse.Namespace, out_path: Path, stats: dict[str, int], temp_dir: Path) -> dict[str, Any]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(out_path.parent), suffix=".parquet") as tf:
         tmp_out = Path(tf.name)
     writer = None
-    rows_out = 0
-    dup_removed = 0
-    conflict_count = 0
-    conflict_first = ""
-    conflict_last = ""
-    first_dt = ""
-    last_dt = ""
     gapper = GapAggregator(args)
+    state: dict[str, Any] = {
+        "rows_out": 0,
+        "dup_removed": 0,
+        "conflict_count": 0,
+        "conflict_first": "",
+        "conflict_last": "",
+        "first_dt": "",
+        "last_dt": "",
+    }
+    bucket_count = len(bucket_parts)
+    processed_dir = temp_dir / "processed_buckets"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    workers = max(1, int(args.workers))
+    print(f"[tick-parquet] process buckets start buckets={bucket_count}", flush=True)
     try:
         schema = _make_output_schema()
         writer = _open_writer(tmp_out, schema=schema, compression="snappy")
-        for parts in bucket_parts:
-            if not parts:
-                continue
-            bucket_df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
-            bucket_df, dups, conflicts = _sort_dedupe_and_conflicts(bucket_df)
-            dup_removed += int(dups)
-            c_count = int(conflicts.get("overlap_conflict_count", 0))
-            if c_count:
-                conflict_count += c_count
-                c_first = str(conflicts.get("overlap_conflict_first", ""))
-                c_last = str(conflicts.get("overlap_conflict_last", ""))
-                conflict_first = c_first if not conflict_first else min(conflict_first, c_first)
-                conflict_last = c_last if not conflict_last else max(conflict_last, c_last)
-            if bucket_df.empty:
-                continue
-            rows_out += int(len(bucket_df))
-            first_dt = bucket_df["DateTime"].min().isoformat() if not first_dt else first_dt
-            last_dt = bucket_df["DateTime"].max().isoformat()
-            gapper.update(bucket_df["_minute_ns"].drop_duplicates().to_numpy(dtype=np.int64))
-            table = _frame_to_table(bucket_df)
-            row_group_size = int(args.row_group_size)
-            if row_group_size > 0:
-                for start in range(0, table.num_rows, row_group_size):
-                    writer.write_table(table.slice(start, row_group_size))
-            else:
-                writer.write_table(table)
+        if workers == 1:
+            for bucket_index, parts in enumerate(bucket_parts):
+                result = _process_one_bucket(bucket_index, bucket_count, parts, args, processed_dir)
+                _merge_bucket_result(state, result, gapper)
+                processed_path = str(result.get("processed_path", ""))
+                if processed_path:
+                    table = _require_pyarrow()[1].read_table(processed_path)
+                    _write_table_with_row_groups(writer, table, int(args.row_group_size))
+        else:
+            results: dict[int, dict[str, Any]] = {}
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+                future_map = {
+                    executor.submit(_process_one_bucket, bucket_index, bucket_count, parts, args, processed_dir): bucket_index
+                    for bucket_index, parts in enumerate(bucket_parts)
+                }
+                for future in concurrent.futures.as_completed(future_map):
+                    result = future.result()
+                    results[int(result["bucket_index"])] = result
+            for bucket_index in range(bucket_count):
+                result = results[bucket_index]
+                _merge_bucket_result(state, result, gapper)
+                processed_path = str(result.get("processed_path", ""))
+                if processed_path:
+                    table = _require_pyarrow()[1].read_table(processed_path)
+                    _write_table_with_row_groups(writer, table, int(args.row_group_size))
         if writer is not None:
             writer.close()
             writer = None
@@ -424,15 +535,16 @@ def _process_buckets_to_output(bucket_parts: list[list[Path]], args: argparse.Na
                 tmp_out.unlink()
             except Exception:
                 pass
+    print(f"[tick-parquet] process buckets done rows_out={state['rows_out']}", flush=True)
     summary = {
         **stats,
-        "rows_total_out": int(rows_out),
-        "duplicate_rows_removed": int(dup_removed),
-        "overlap_conflict_count": int(conflict_count),
-        "overlap_conflict_first": conflict_first,
-        "overlap_conflict_last": conflict_last,
-        "first_datetime": first_dt,
-        "last_datetime": last_dt,
+        "rows_total_out": int(state["rows_out"]),
+        "duplicate_rows_removed": int(state["dup_removed"]),
+        "overlap_conflict_count": int(state["conflict_count"]),
+        "overlap_conflict_first": state["conflict_first"],
+        "overlap_conflict_last": state["conflict_last"],
+        "first_datetime": state["first_dt"],
+        "last_datetime": state["last_dt"],
     }
     summary.update(gapper.summary())
     return summary
@@ -492,6 +604,7 @@ def _common_parser(p: argparse.ArgumentParser) -> None:
     p.add_argument("--chunk-size", type=int, default=500_000)
     p.add_argument("--merge-buckets", type=int, default=20)
     p.add_argument("--boundary-sample-per-chunk", type=int, default=10_000)
+    p.add_argument("--workers", type=int, default=1)
 
 
 def parse_args() -> argparse.Namespace:
@@ -515,12 +628,15 @@ def parse_args() -> argparse.Namespace:
 def _run_bucketed(inputs: list[Path], out: Path, args: argparse.Namespace) -> dict[str, Any]:
     if int(args.merge_buckets) < 1:
         raise ValueError("--merge-buckets must be >= 1")
+    if int(args.workers) < 1:
+        raise ValueError("--workers must be >= 1")
     _require_pyarrow()
     temp_dir = Path(tempfile.mkdtemp(prefix="tick_parquet_tool_"))
     try:
+        print("[tick-parquet] boundary pass start", flush=True)
         boundaries = _estimate_boundaries(inputs, args)
         bucket_parts, stats = _bucketize_inputs(inputs, args, temp_dir, boundaries)
-        return _process_buckets_to_output(bucket_parts, args, out, stats)
+        return _process_buckets_to_output(bucket_parts, args, out, stats, temp_dir)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
