@@ -25,6 +25,8 @@ from typing import Dict, Iterable, List, Tuple
 import numpy as np
 import pandas as pd
 
+NS_PER_MINUTE = 60_000_000_000
+
 
 def _load_miner_module(path: Path):
     spec = importlib.util.spec_from_file_location("xau_miner_module_for_prefilter", str(path))
