@@ -172,6 +172,50 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+
+
+def _parse_datetime_series_robust(values: pd.Series) -> pd.Series:
+    base = values
+    direct = pd.to_datetime(base, errors="coerce")
+
+    as_num = pd.to_numeric(base, errors="coerce")
+    numeric_mask = as_num.notna()
+    if not bool(numeric_mask.any()):
+        return direct
+
+    candidates: list[pd.Series] = [direct]
+    for unit in ("ns", "us", "ms", "s"):
+        cand = pd.to_datetime(as_num, errors="coerce", unit=unit)
+        candidates.append(cand)
+
+    def _score(dt: pd.Series) -> tuple[int, int]:
+        valid = dt.notna()
+        valid_count = int(valid.sum())
+        if valid_count == 0:
+            return (0, 0)
+        years = dt.loc[valid].dt.year
+        plausible = int(((years >= 2000) & (years <= 2100)).sum())
+        return (plausible, valid_count)
+
+    best = max(candidates, key=_score)
+    return best
+
+
+def _ensure_plausible_datetime_index(df: pd.DataFrame, context: str) -> pd.DataFrame:
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError(f"{context}: expected DatetimeIndex after parsing")
+    valid = df.index.dropna()
+    if len(valid) == 0:
+        raise ValueError(f"{context}: datetime index is empty/NaT after parsing")
+    min_year = int(valid.min().year)
+    max_year = int(valid.max().year)
+    if min_year < 2000 or max_year > 2100:
+        raise ValueError(
+            f"{context}: implausible datetime range min={valid.min().isoformat()} max={valid.max().isoformat()} "
+            "(expected roughly years 2000..2100); check timestamp unit (ns/us/ms/s)."
+        )
+    return df
+
 def load_features(path: Path, tail_rows: int = 0) -> pd.DataFrame:
     if str(path).lower().endswith(".parquet"):
         if tail_rows > 0:
@@ -212,15 +256,15 @@ def load_features(path: Path, tail_rows: int = 0) -> pd.DataFrame:
     if isinstance(df.index, pd.DatetimeIndex):
         pass
     elif "datetime" in df.columns:
-        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df["datetime"] = _parse_datetime_series_robust(df["datetime"])
         df = df.set_index("datetime")
     elif len(df.columns) and str(df.columns[0]).lower().startswith("unnamed"):
-        df[df.columns[0]] = pd.to_datetime(df[df.columns[0]], errors="coerce")
+        df[df.columns[0]] = _parse_datetime_series_robust(df[df.columns[0]])
         df = df.set_index(df.columns[0])
     else:
         raise ValueError("Features must provide datetime index/column (e.g. extractor output).")
 
-    df = df.sort_index()
+    df = _ensure_plausible_datetime_index(df.sort_index(), "load_features")
     miss = {"open", "high", "low", "close"} - set(df.columns)
     if miss:
         raise ValueError(f"Missing OHLC columns: {sorted(miss)}")
@@ -246,14 +290,14 @@ def load_tabular_with_datetime(path: Path, tail_rows: int = 0) -> pd.DataFrame:
     if isinstance(df.index, pd.DatetimeIndex):
         pass
     elif "datetime" in df.columns:
-        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df["datetime"] = _parse_datetime_series_robust(df["datetime"])
         df = df.set_index("datetime")
     elif len(df.columns) and str(df.columns[0]).lower().startswith("unnamed"):
-        df[df.columns[0]] = pd.to_datetime(df[df.columns[0]], errors="coerce")
+        df[df.columns[0]] = _parse_datetime_series_robust(df[df.columns[0]])
         df = df.set_index(df.columns[0])
     else:
         raise ValueError("Table must provide datetime index/column.")
-    return df.sort_index()
+    return _ensure_plausible_datetime_index(df.sort_index(), "load_tabular_with_datetime")
 
 
 def load_binned_features(path: Path, tail_rows: int = 0) -> pd.DataFrame:
