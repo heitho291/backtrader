@@ -435,6 +435,12 @@ def _candidate_family(col: str, split_delta_window: bool) -> str:
     return c.split("_")[0]
 
 
+def _datetime_index_to_minute_ns(index_like) -> np.ndarray:
+    idx = pd.DatetimeIndex(index_like)
+    idx_ns = idx.astype("datetime64[ns]")
+    return np.asarray(idx_ns.floor("min").view("int64"), dtype=np.int64)
+
+
 def _critical_minutes_for_entries(
     entry_indices: np.ndarray,
     high: np.ndarray,
@@ -812,7 +818,7 @@ def main() -> None:
     high = df["high"].to_numpy(dtype=np.float32, copy=False)
     low = df["low"].to_numpy(dtype=np.float32, copy=False)
     close = df["close"].to_numpy(dtype=np.float32, copy=False)
-    bar_time_ns = np.asarray(pd.DatetimeIndex(df.index).floor("min").view("int64"), dtype=np.int64)
+    bar_time_ns = _datetime_index_to_minute_ns(df.index)
 
     tick_prices_all = None
     tick_minute_bounds = None
