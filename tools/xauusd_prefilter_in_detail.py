@@ -303,8 +303,30 @@ def _is_atr_candidate_col(col: str) -> bool:
     return bool(c.startswith("atr") or "_atr" in c)
 
 
+def _canonicalize_candidate_value(col: str, op: str, value: float) -> float:
+    try:
+        v = float(value)
+    except Exception:
+        return float("nan")
+    if not np.isfinite(v):
+        return v
+    col_s = str(col).lower()
+    if str(op) == "==":
+        if abs(v - round(v)) <= 1e-9:
+            return float(int(round(v)))
+        return float(round(v, 6))
+    if col_s.startswith("dist_") or col_s.startswith("delta_"):
+        return float(round(v, 6))
+    return float(round(v, 6))
+
+
 def _stable_candidate_key(col: str, op: str, value: float) -> str:
-    return f"{str(col)}|{str(op)}|{float(value):.17g}"
+    v = _canonicalize_candidate_value(col, op, value)
+    if np.isfinite(v) and abs(v - round(v)) <= 1e-9:
+        v_str = str(int(round(v)))
+    else:
+        v_str = f"{v:.6f}" if np.isfinite(v) else "nan"
+    return f"{str(col)}|{str(op)}|{v_str}"
 
 def _file_sig(path: Path | None) -> str:
     if path is None:
@@ -1044,7 +1066,7 @@ def main() -> None:
             too_narrow_reasons.append("min_single_lift")
         for _, r in coarse_resume.iterrows():
             try:
-                stable_k = str(r.get("stable_candidate_key", "")).strip() or _stable_candidate_key(str(r.get("col", "")), str(r.get("op", "")), float(r.get("value", np.nan)))
+                stable_k = str(r.get("stable_candidate_key", "")).strip() or _stable_candidate_key(str(r.get("col", "")), str(r.get("op", "")), _canonicalize_candidate_value(str(r.get("col", "")), str(r.get("op", "")), float(r.get("value", np.nan))))
             except Exception:
                 stable_k = str(r.get("candidate_key", "")).strip()
             if stable_k:
@@ -1067,11 +1089,22 @@ def main() -> None:
         for _, r in coarse_resume.iterrows():
             key = str(r.get("candidate_key", "")).strip()
             stable_k = str(r.get("stable_candidate_key", "")).strip()
-            col = str(r["col"]); op = str(r["op"]); val = float(r["value"])
+            col = str(r["col"]); op = str(r["op"]); val = _canonicalize_candidate_value(col, op, float(r["value"]))
             if not stable_k:
                 stable_k = _stable_candidate_key(col, op, val)
             if not key:
                 key = stable_k
+            pos0 = int(r.get("coarse_single_pos_hits", 0))
+            lift0 = float(r.get("coarse_lift", 0.0))
+            mask0 = int(r.get("coarse_single_mask_count", 0))
+            if int(args.min_single_pos_hits) > 0 and pos0 < int(args.min_single_pos_hits):
+                single_rejects["min_pos"] += 1; continue
+            if float(args.min_single_lift) > 0 and lift0 < float(args.min_single_lift):
+                single_rejects["min_lift"] += 1; continue
+            if int(args.max_single_mask_count) > 0 and mask0 > int(args.max_single_mask_count):
+                single_rejects["mask_count"] += 1; continue
+            if allow_keys is not None and str(key) not in allow_keys:
+                single_rejects["allowlist"] += 1; continue
             xvec = pd.to_numeric(bdf[col] if op == "==" else df[col], errors="coerce").to_numpy(copy=False)
             if op == "==":
                 m = np.isfinite(xvec) & (np.abs(xvec - val) <= 1e-6)
@@ -1140,7 +1173,7 @@ def main() -> None:
         timing["build_items_sec"] = time.perf_counter() - t0
         for i, it in enumerate(items, start=1):
             x = dict(it); x["candidate_key"] = f"cand_{i:06d}"
-            x["stable_candidate_key"] = _stable_candidate_key(str(x["col"]), str(x["op"]), float(x["value"]))
+            x["stable_candidate_key"] = _stable_candidate_key(str(x["col"]), str(x["op"]), _canonicalize_candidate_value(str(x["col"]), str(x["op"]), float(x["value"])))
             m = np.asarray(x["mask"], dtype=bool)
             m_sel, _, _ = _select_entries_for_mask(m, y, t_exit)
             pos_hits = int(np.sum(m_sel[:train_idx] & (y_train == 1))); neg_hits = int(np.sum(m_sel[:train_idx] & (y_train == 0)))
@@ -1273,10 +1306,10 @@ def main() -> None:
             op_r = str(r.get("op", ""))
             val_r = float(r.get("value", np.nan)) if pd.notna(r.get("value", np.nan)) else np.nan
             if not stable_k and col_r and op_r and np.isfinite(val_r):
-                stable_k = _stable_candidate_key(col_r, op_r, val_r)
+                stable_k = _stable_candidate_key(col_r, op_r, _canonicalize_candidate_value(col_r, op_r, val_r))
             it = all_by_key.get(k)
             if it is None and stable_k:
-                it = next((x for x in full_filtered_items if _stable_candidate_key(str(x["col"]), str(x["op"]), float(x["value"])) == stable_k), None)
+                it = next((x for x in full_filtered_items if _stable_candidate_key(str(x["col"]), str(x["op"]), _canonicalize_candidate_value(str(x["col"]), str(x["op"]), float(x["value"]))) == stable_k), None)
             if it is None:
                 continue
             req_vals = [r.get(c, np.nan) for c in req_tick_cols]
@@ -1579,14 +1612,14 @@ def main() -> None:
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
         existing_rows = dict(coarse_existing_rows)
         for it in full_filtered_items:
-            stable_k = str(it.get("stable_candidate_key", "")).strip() or _stable_candidate_key(str(it["col"]), str(it["op"]), float(it["value"]))
+            stable_k = str(it.get("stable_candidate_key", "")).strip() or _stable_candidate_key(str(it["col"]), str(it["op"]), _canonicalize_candidate_value(str(it["col"]), str(it["op"]), float(it["value"])))
             row = existing_rows.get(stable_k, {})
             row.update({
                 "candidate_key": str(it["candidate_key"]),
                 "stable_candidate_key": stable_k,
                 "col": str(it["col"]),
                 "op": str(it["op"]),
-                "value": float(it["value"]),
+                "value": _canonicalize_candidate_value(str(it["col"]), str(it["op"]), float(it["value"])),
                 "family": str(it["_family"]),
                 "coarse_single_pos_hits": int(it.get("coarse_single_pos_hits", it.get("_single_pos_hits", 0))),
                 "coarse_single_neg_hits": int(it.get("coarse_single_neg_hits", it.get("_single_neg_hits", 0))),
@@ -1671,14 +1704,14 @@ def main() -> None:
                 row["__stage"] = "refined"
                 existing_rows[stable_k] = _prefer_refined_row(existing_rows.get(stable_k), row)
         for it in full_filtered_items:
-            stable_k = _stable_candidate_key(str(it["col"]), str(it["op"]), float(it["value"]))
+            stable_k = _stable_candidate_key(str(it["col"]), str(it["op"]), _canonicalize_candidate_value(str(it["col"]), str(it["op"]), float(it["value"])))
             row = existing_rows.get(stable_k, {})
             row.update({
                 "candidate_key_refined": str(it["candidate_key"]),
                 "stable_candidate_key": stable_k,
                 "col": str(it["col"]),
                 "op": str(it["op"]),
-                "value": float(it["value"]),
+                "value": _canonicalize_candidate_value(str(it["col"]), str(it["op"]), float(it["value"])),
                 "family": str(it["_family"]),
                 "coarse_single_pos_hits": int(it.get("coarse_single_pos_hits", it.get("_single_pos_hits", 0))),
                 "coarse_single_neg_hits": int(it.get("coarse_single_neg_hits", it.get("_single_neg_hits", 0))),
