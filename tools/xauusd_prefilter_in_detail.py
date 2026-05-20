@@ -1066,7 +1066,10 @@ def main() -> None:
             too_narrow_reasons.append("min_single_lift")
         for _, r in coarse_resume.iterrows():
             try:
-                stable_k = str(r.get("stable_candidate_key", "")).strip() or _stable_candidate_key(str(r.get("col", "")), str(r.get("op", "")), _canonicalize_candidate_value(str(r.get("col", "")), str(r.get("op", "")), float(r.get("value", np.nan))))
+                c_col = str(r.get("col", ""))
+                c_op = str(r.get("op", ""))
+                c_val = _canonicalize_candidate_value(c_col, c_op, float(r.get("value", np.nan)))
+                stable_k = _stable_candidate_key(c_col, c_op, c_val)
             except Exception:
                 stable_k = str(r.get("candidate_key", "")).strip()
             if stable_k:
@@ -1088,10 +1091,8 @@ def main() -> None:
     if coarse_resume is not None:
         for _, r in coarse_resume.iterrows():
             key = str(r.get("candidate_key", "")).strip()
-            stable_k = str(r.get("stable_candidate_key", "")).strip()
             col = str(r["col"]); op = str(r["op"]); val = _canonicalize_candidate_value(col, op, float(r["value"]))
-            if not stable_k:
-                stable_k = _stable_candidate_key(col, op, val)
+            stable_k = _stable_candidate_key(col, op, val)
             if not key:
                 key = stable_k
             pos0 = int(r.get("coarse_single_pos_hits", 0))
@@ -1301,11 +1302,11 @@ def main() -> None:
         refined_rows_missing_tick = 0
         for _, r in refined_resume.iterrows():
             k = str(r.get("candidate_key_refined", "")).strip()
-            stable_k = str(r.get("stable_candidate_key", "")).strip()
             col_r = str(r.get("col", ""))
             op_r = str(r.get("op", ""))
             val_r = float(r.get("value", np.nan)) if pd.notna(r.get("value", np.nan)) else np.nan
-            if not stable_k and col_r and op_r and np.isfinite(val_r):
+            stable_k = ""
+            if col_r and op_r and np.isfinite(val_r):
                 stable_k = _stable_candidate_key(col_r, op_r, _canonicalize_candidate_value(col_r, op_r, val_r))
             it = all_by_key.get(k)
             if it is None and stable_k:
@@ -1671,13 +1672,18 @@ def main() -> None:
         status_rank = {"full": 3, "missing": 2, "out_of_scope": 1}
 
         def _refined_row_key(row: dict) -> str:
+            try:
+                col_r = str(row.get("col", ""))
+                op_r = str(row.get("op", ""))
+                val_r = _canonicalize_candidate_value(col_r, op_r, float(row.get("value", np.nan)))
+                if col_r and op_r and np.isfinite(val_r):
+                    return _stable_candidate_key(col_r, op_r, val_r)
+            except Exception:
+                pass
             stable_k = str(row.get("stable_candidate_key", "")).strip()
             if stable_k:
                 return stable_k
-            try:
-                return _stable_candidate_key(str(row.get("col", "")), str(row.get("op", "")), float(row.get("value", np.nan)))
-            except Exception:
-                return str(row.get("candidate_key_refined", row.get("candidate_key", ""))).strip()
+            return str(row.get("candidate_key_refined", row.get("candidate_key", ""))).strip()
 
         def _prefer_refined_row(old: dict | None, new: dict) -> dict:
             if old is None:
@@ -2135,7 +2141,7 @@ def main() -> None:
             stable_k = str(it.get("stable_candidate_key", "")).strip()
             if not stable_k:
                 try:
-                    stable_k = _stable_candidate_key(str(it.get("col", "")), str(it.get("op", "")), float(it.get("value", np.nan)))
+                    stable_k = _stable_candidate_key(str(it.get("col", "")), str(it.get("op", "")), _canonicalize_candidate_value(str(it.get("col", "")), str(it.get("op", "")), float(it.get("value", np.nan))))
                 except Exception:
                     stable_k = ""
             keys.append(stable_k or str(it.get("candidate_key", "")))
