@@ -166,20 +166,32 @@ def _atomic_write_csv(path: Path, frame: pd.DataFrame) -> None:
 
 
 def _write_csv_if_changed(path: Path, frame: pd.DataFrame, key_cols: list[str] | None = None) -> tuple[bool, str]:
+    def _canonicalize_frame_for_compare(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        if {"col", "op", "value"}.issubset(set(out.columns)):
+            vals = []
+            for _, r in out.iterrows():
+                vals.append(_canonicalize_candidate_value(str(r.get("col", "")), str(r.get("op", "")), float(r.get("value", np.nan))))
+            out["value"] = vals
+        if "stable_candidate_key" in out.columns:
+            out["stable_candidate_key"] = out["stable_candidate_key"].astype(str).str.strip()
+        return out
     if path.exists():
         try:
             old = pd.read_csv(path)
+            new_cmp = _canonicalize_frame_for_compare(frame)
+            old_cmp = _canonicalize_frame_for_compare(old)
             if key_cols:
-                use_cols = [c for c in key_cols if c in frame.columns and c in old.columns]
+                use_cols = [c for c in key_cols if c in new_cmp.columns and c in old_cmp.columns]
                 if use_cols:
-                    new_cmp = frame.sort_values(use_cols, kind="mergesort").reset_index(drop=True)
-                    old_cmp = old.sort_values(use_cols, kind="mergesort").reset_index(drop=True)
+                    new_cmp = new_cmp.sort_values(use_cols, kind="mergesort").reset_index(drop=True)
+                    old_cmp = old_cmp.sort_values(use_cols, kind="mergesort").reset_index(drop=True)
                 else:
-                    new_cmp = frame.reset_index(drop=True)
-                    old_cmp = old.reset_index(drop=True)
+                    new_cmp = new_cmp.reset_index(drop=True)
+                    old_cmp = old_cmp.reset_index(drop=True)
             else:
-                new_cmp = frame.reset_index(drop=True)
-                old_cmp = old.reset_index(drop=True)
+                new_cmp = new_cmp.reset_index(drop=True)
+                old_cmp = old_cmp.reset_index(drop=True)
             if new_cmp.equals(old_cmp):
                 return False, "rows_unchanged"
         except Exception:
@@ -660,32 +672,42 @@ def _load_tick_minute_map_partial(
             if pcol is None:
                 raise ValueError("tick-data price column not found")
         dt_raw = ch[dt_col]
-        dt_full = pd.to_datetime(dt_raw, errors="coerce", utc=True)
-        if bool(dt_full.notna().any()):
-            non_na = dt_full.dropna()
-            years = non_na.dt.year if len(non_na) else pd.Series([], dtype=np.int64)
-            looks_time_only = bool(len(non_na) > 0 and int((years == 1970).sum()) >= int(0.9 * len(non_na)))
+        date_src = None
+        for dname in ("date", "<dtyyyymmdd>", "dtyyyymmdd"):
+            if dname in cols_lower and cols_lower[dname] != dt_col:
+                cand = ch[cols_lower[dname]].astype(str).str.strip()
+                if bool((cand.str.fullmatch(r"\d{8}", na=False)).any()):
+                    date_src = cand
+                    break
+        if date_src is None and isinstance(ch.index, pd.Index):
+            idx_s = ch.index.to_series(index=ch.index).astype(str).str.strip()
+            if bool((idx_s.str.fullmatch(r"\d{8}", na=False)).any()):
+                date_src = idx_s
+        if date_src is None and len(ch.columns) > 0:
+            first_col = str(ch.columns[0])
+            if first_col != dt_col:
+                cand = ch[first_col].astype(str).str.strip()
+                if bool((cand.str.fullmatch(r"\d{8}", na=False)).any()):
+                    date_src = cand
+        time_s = dt_raw.astype(str).str.strip()
+        looks_time_like = bool((time_s.str.fullmatch(r"\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?", na=False)).any())
+        if date_src is not None and looks_time_like:
+            dt_join = date_src.astype(str).str.strip() + " " + time_s
+            dt_full = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S.%f", errors="coerce", utc=True)
+            if not bool(dt_full.notna().any()):
+                dt_full = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S", errors="coerce", utc=True)
+            if not bool(dt_full.notna().any()):
+                dt_full = pd.to_datetime(dt_join, errors="coerce", utc=True)
         else:
-            looks_time_only = False
-        if looks_time_only:
-            date_src = None
-            if isinstance(ch.index, pd.Index):
-                idx_s = ch.index.to_series(index=ch.index).astype(str).str.strip()
-                if bool((idx_s.str.fullmatch(r"\d{8}", na=False)).any()):
-                    date_src = idx_s
-            if date_src is None and len(ch.columns) > 0:
-                first_col = str(ch.columns[0])
-                if first_col != dt_col:
-                    cand = ch[first_col].astype(str).str.strip()
-                    if bool((cand.str.fullmatch(r"\d{8}", na=False)).any()):
-                        date_src = cand
-            if date_src is not None:
-                dt_join = date_src.astype(str).str.strip() + " " + dt_raw.astype(str).str.strip()
-                dt_alt = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S.%f", errors="coerce", utc=True)
-                if not bool(dt_alt.notna().any()):
-                    dt_alt = pd.to_datetime(dt_join, errors="coerce", utc=True)
-                if bool(dt_alt.notna().any()):
-                    dt_full = dt_alt
+            dt_full = pd.to_datetime(dt_raw, errors="coerce", utc=True)
+        if bool(dt_full.notna().any()):
+            y_min = int(dt_full.dropna().dt.year.min())
+            y_max = int(dt_full.dropna().dt.year.max())
+            if y_max <= 1971:
+                raise ValueError(
+                    f"tick-data datetime parse is implausible (range {y_min}-{y_max}); "
+                    "expected full timestamps (e.g. YYYYMMDD + HH:MM:SS.mmm) or valid epoch datetimes."
+                )
         dt_ns = dt_full.astype("int64").to_numpy()
         minute_ns = dt_full.dt.floor("min").astype("int64").to_numpy()
         keep = np.isin(minute_ns, minute_filter_arr)
@@ -1711,11 +1733,10 @@ def main() -> None:
         coarse_frame = _ordered_frame(coarse_rows, coarse_cols)
         wrote_coarse, coarse_reason = _write_csv_if_changed(coarse_out, coarse_frame, key_cols=["stable_candidate_key"])
         coarse_rows_prev = int(len(coarse_existing_rows))
-        coarse_rows_new = int(max(0, len(coarse_rows) - coarse_rows_prev))
-        coarse_rows_updated = int(max(0, min(coarse_rows_prev, len(coarse_rows))))
-        coarse_rows_unchanged = int(len(coarse_rows) - coarse_rows_new - coarse_rows_updated) if len(coarse_rows) >= (coarse_rows_new + coarse_rows_updated) else 0
+        coarse_rows_after = int(len(coarse_rows))
+        coarse_rows_delta = int(coarse_rows_after - coarse_rows_prev)
         print(f"[prefilter-candidates] coarse_write={'done' if wrote_coarse else 'skipped'} reason_for_write={coarse_reason}")
-        print(f"[prefilter-candidates] rows_added={coarse_rows_new} rows_updated={coarse_rows_updated} rows_unchanged={coarse_rows_unchanged}")
+        print(f"[prefilter-candidates] rows_existing_before={coarse_rows_prev} rows_existing_after={coarse_rows_after} rows_delta={coarse_rows_delta}")
         if wrote_coarse:
             print(f"[prefilter-candidates] wrote coarse CSV: {coarse_out} rows={len(coarse_rows)}")
 
@@ -1821,11 +1842,10 @@ def main() -> None:
         refined_frame = _ordered_frame(cand_rows, refined_cols)
         prev_refined_rows = int(len(refined_resume)) if refined_resume is not None else 0
         wrote_refined, refined_reason = _write_csv_if_changed(refined_out, refined_frame, key_cols=["stable_candidate_key"])
-        refined_rows_new = int(max(0, len(cand_rows) - prev_refined_rows))
-        refined_rows_updated = int(max(0, min(prev_refined_rows, len(cand_rows))))
-        refined_rows_unchanged = int(len(cand_rows) - refined_rows_new - refined_rows_updated) if len(cand_rows) >= (refined_rows_new + refined_rows_updated) else 0
+        refined_rows_after = int(len(cand_rows))
+        refined_rows_delta = int(refined_rows_after - prev_refined_rows)
         print(f"[prefilter-candidates] refined_write={'done' if wrote_refined else 'skipped'} reason_for_write={refined_reason}")
-        print(f"[prefilter-candidates] rows_added={refined_rows_new} rows_updated={refined_rows_updated} rows_unchanged={refined_rows_unchanged}")
+        print(f"[prefilter-candidates] rows_existing_before={prev_refined_rows} rows_existing_after={refined_rows_after} rows_delta={refined_rows_delta}")
         if wrote_refined:
             print(f"[prefilter-candidates] wrote refined CSV: {refined_out} rows={len(cand_rows)}")
 
