@@ -165,6 +165,29 @@ def _atomic_write_csv(path: Path, frame: pd.DataFrame) -> None:
     os.replace(tmp, path)
 
 
+def _write_csv_if_changed(path: Path, frame: pd.DataFrame, key_cols: list[str] | None = None) -> tuple[bool, str]:
+    if path.exists():
+        try:
+            old = pd.read_csv(path)
+            if key_cols:
+                use_cols = [c for c in key_cols if c in frame.columns and c in old.columns]
+                if use_cols:
+                    new_cmp = frame.sort_values(use_cols, kind="mergesort").reset_index(drop=True)
+                    old_cmp = old.sort_values(use_cols, kind="mergesort").reset_index(drop=True)
+                else:
+                    new_cmp = frame.reset_index(drop=True)
+                    old_cmp = old.reset_index(drop=True)
+            else:
+                new_cmp = frame.reset_index(drop=True)
+                old_cmp = old.reset_index(drop=True)
+            if new_cmp.equals(old_cmp):
+                return False, "rows_unchanged"
+        except Exception:
+            pass
+    _atomic_write_csv(path, frame)
+    return True, "rows_changed"
+
+
 
 
 def _ordered_frame(rows: list[dict], preferred_cols: list[str]) -> pd.DataFrame:
@@ -636,7 +659,33 @@ def _load_tick_minute_map_partial(
                     break
             if pcol is None:
                 raise ValueError("tick-data price column not found")
-        dt_full = pd.to_datetime(ch[dt_col], errors="coerce", utc=True)
+        dt_raw = ch[dt_col]
+        dt_full = pd.to_datetime(dt_raw, errors="coerce", utc=True)
+        if bool(dt_full.notna().any()):
+            non_na = dt_full.dropna()
+            years = non_na.dt.year if len(non_na) else pd.Series([], dtype=np.int64)
+            looks_time_only = bool(len(non_na) > 0 and int((years == 1970).sum()) >= int(0.9 * len(non_na)))
+        else:
+            looks_time_only = False
+        if looks_time_only:
+            date_src = None
+            if isinstance(ch.index, pd.Index):
+                idx_s = ch.index.to_series(index=ch.index).astype(str).str.strip()
+                if bool((idx_s.str.fullmatch(r"\d{8}", na=False)).any()):
+                    date_src = idx_s
+            if date_src is None and len(ch.columns) > 0:
+                first_col = str(ch.columns[0])
+                if first_col != dt_col:
+                    cand = ch[first_col].astype(str).str.strip()
+                    if bool((cand.str.fullmatch(r"\d{8}", na=False)).any()):
+                        date_src = cand
+            if date_src is not None:
+                dt_join = date_src.astype(str).str.strip() + " " + dt_raw.astype(str).str.strip()
+                dt_alt = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S.%f", errors="coerce", utc=True)
+                if not bool(dt_alt.notna().any()):
+                    dt_alt = pd.to_datetime(dt_join, errors="coerce", utc=True)
+                if bool(dt_alt.notna().any()):
+                    dt_full = dt_alt
         dt_ns = dt_full.astype("int64").to_numpy()
         minute_ns = dt_full.dt.floor("min").astype("int64").to_numpy()
         keep = np.isin(minute_ns, minute_filter_arr)
@@ -1089,6 +1138,8 @@ def main() -> None:
     filtered_items: list[dict] = []
     single_rejects = {"min_pos": 0, "min_lift": 0, "mask_count": 0, "allowlist": 0}
     if coarse_resume is not None:
+        rows_loaded_coarse = int(len(coarse_resume))
+        rows_reconstructed = 0
         for _, r in coarse_resume.iterrows():
             key = str(r.get("candidate_key", "")).strip()
             col = str(r["col"]); op = str(r["op"]); val = _canonicalize_candidate_value(col, op, float(r["value"]))
@@ -1114,6 +1165,7 @@ def main() -> None:
             else:
                 m = np.isfinite(xvec) & (xvec <= val)
             m_sel, _, _ = _select_entries_for_mask(m, y, t_exit)
+            rows_reconstructed += 1
             pos_hits = int(np.sum(m_sel[:train_idx] & (y_train == 1)))
             neg_hits = int(np.sum(m_sel[:train_idx] & (y_train == 0)))
             mask_count = int(pos_hits + neg_hits)
@@ -1134,6 +1186,9 @@ def main() -> None:
                 "lift": float(lift),
                 "ratio": float(ratio),
             })
+        print(f"[prefilter-resume] rows_loaded_coarse={rows_loaded_coarse}")
+        print(f"[prefilter-resume] rows_after_hard_filters={len(filtered_items)}")
+        print(f"[prefilter-resume] rows_reconstructed={rows_reconstructed}")
         print(f"[prefilter-resume] loaded coarse candidates from {coarse_out} rows={len(filtered_items)}")
     else:
         qs = [float(x) for x in str(args.quantiles).split(",") if x.strip()]
@@ -1235,6 +1290,7 @@ def main() -> None:
         before = len(filtered_items)
         filtered_items = [it for it in filtered_items if str(it.get("candidate_key")) in allow_keys]
         single_rejects["allowlist"] = max(0, before - len(filtered_items))
+    print(f"[prefilter-resume] rows_after_allowlist={len(filtered_items)}")
     fam_top: list[dict] = []
     fam_groups: dict[str, list[dict]] = {}
     for it in filtered_items:
@@ -1287,6 +1343,7 @@ def main() -> None:
         tick_scope_items = filtered_items
     else:
         tick_scope_items = full_filtered_items
+    print(f"[prefilter-resume] rows_runtime_scope={len(tick_scope_items)} scope={args.tick_refine_scope}")
     all_by_key = {str(it["candidate_key"]): it for it in full_filtered_items}
     req_tick_cols = ["tick_single_pos_hits", "tick_single_neg_hits", "tick_single_mask_count", "tick_single_ratio", "tick_lift"]
     def _has_full_tick_metrics(obj: dict) -> bool:
@@ -1296,6 +1353,7 @@ def main() -> None:
             return False
 
     if refined_resume is not None:
+        print(f"[prefilter-resume] rows_loaded_refined={int(len(refined_resume))}")
         by_key = {str(it["candidate_key"]): it for it in tick_scope_items}
         refined_rows_total = int(len(refined_resume))
         refined_rows_with_tick = 0
@@ -1458,6 +1516,7 @@ def main() -> None:
                     print(f"[prefilter-tick-cache] scope_critical_minutes_count={scope_critical_count}")
                     print(f"[prefilter-tick-cache] scope_minutes_would_load_count={scope_would_load_count}")
                     print("[prefilter-tick-cache] scope_counts_source=ohlc_diagnostic_no_raw_tick_load")
+                raw_tick_load_attempted = bool(len(minutes_to_load) > 0)
                 if minutes_to_load:
                     tick_prices_all, tick_minute_bounds, tick_bids_all, tick_asks_all, matched_total_minutes_count = _load_tick_minute_map_partial(
                         path=args.tick_data,
@@ -1483,6 +1542,11 @@ def main() -> None:
                 print(f"[prefilter-tick-raw-load] matched_total_minutes_count={int(matched_total_minutes_count)}")
                 print(f"[prefilter-tick-raw-load] raw_tick_coverage_full={bool(used_real_ticks_full)}")
                 print(f"[prefilter-tick-raw-load] used_real_ticks_source={'parquet_ticks' if args.tick_data is not None and args.tick_data.suffix.lower() in {'.parquet', '.pq'} else 'raw_ticks'}")
+                if raw_tick_load_attempted and len(tick_scope_items) > 0 and int(matched_total_minutes_count) <= 0:
+                    raise ValueError(
+                        "tick-data was requested and raw tick load ran, but matched_total_minutes_count=0. "
+                        "CSV/DateTime parsing is likely broken for the provided tick file."
+                    )
                 if used_real_ticks_partial:
                     entry_tick_stats: dict[str, int] = {}
                     tick_map_new = miner.simulate_selected_entries_with_ticks(
@@ -1644,8 +1708,16 @@ def main() -> None:
             row["__ctx_sig"] = coarse_ctx_sig
         coarse_rows = list(existing_rows.values())
         coarse_cols = ["candidate_key", "stable_candidate_key", "col", "op", "value", "family", "coarse_single_pos_hits", "coarse_single_neg_hits", "coarse_single_mask_count", "coarse_single_ratio", "coarse_lift", "binary", "kept_after_family_topn", "build_min_single_pos_hits", "build_max_single_mask_count", "build_min_single_lift", "__stage", "__ctx_sig"]
-        _atomic_write_csv(coarse_out, _ordered_frame(coarse_rows, coarse_cols))
-        print(f"[prefilter-candidates] wrote coarse CSV: {coarse_out} rows={len(coarse_rows)}")
+        coarse_frame = _ordered_frame(coarse_rows, coarse_cols)
+        wrote_coarse, coarse_reason = _write_csv_if_changed(coarse_out, coarse_frame, key_cols=["stable_candidate_key"])
+        coarse_rows_prev = int(len(coarse_existing_rows))
+        coarse_rows_new = int(max(0, len(coarse_rows) - coarse_rows_prev))
+        coarse_rows_updated = int(max(0, min(coarse_rows_prev, len(coarse_rows))))
+        coarse_rows_unchanged = int(len(coarse_rows) - coarse_rows_new - coarse_rows_updated) if len(coarse_rows) >= (coarse_rows_new + coarse_rows_updated) else 0
+        print(f"[prefilter-candidates] coarse_write={'done' if wrote_coarse else 'skipped'} reason_for_write={coarse_reason}")
+        print(f"[prefilter-candidates] rows_added={coarse_rows_new} rows_updated={coarse_rows_updated} rows_unchanged={coarse_rows_unchanged}")
+        if wrote_coarse:
+            print(f"[prefilter-candidates] wrote coarse CSV: {coarse_out} rows={len(coarse_rows)}")
 
     if bool(args.debug_atr_candidates):
         atr_candidates_written_to_csv = sum(1 for it in full_filtered_items if _is_atr_candidate_col(str(it.get("col", ""))))
@@ -1746,8 +1818,16 @@ def main() -> None:
             deduped_rows[k] = _prefer_refined_row(deduped_rows.get(k), row)
         cand_rows = list(deduped_rows.values())
         refined_cols = ["candidate_key_refined", "stable_candidate_key", "col", "op", "value", "family", "coarse_single_pos_hits", "coarse_single_neg_hits", "coarse_single_mask_count", "coarse_single_ratio", "coarse_lift", "binary", "kept_after_family_topn", "tick_single_pos_hits", "tick_single_neg_hits", "tick_single_mask_count", "tick_single_ratio", "tick_lift", "tick_metric_status", "__stage", "__ctx_sig", "build_min_single_pos_hits", "build_max_single_mask_count", "build_min_single_lift"]
-        _atomic_write_csv(refined_out, _ordered_frame(cand_rows, refined_cols))
-        print(f"[prefilter-candidates] wrote refined CSV: {refined_out} rows={len(cand_rows)}")
+        refined_frame = _ordered_frame(cand_rows, refined_cols)
+        prev_refined_rows = int(len(refined_resume)) if refined_resume is not None else 0
+        wrote_refined, refined_reason = _write_csv_if_changed(refined_out, refined_frame, key_cols=["stable_candidate_key"])
+        refined_rows_new = int(max(0, len(cand_rows) - prev_refined_rows))
+        refined_rows_updated = int(max(0, min(prev_refined_rows, len(cand_rows))))
+        refined_rows_unchanged = int(len(cand_rows) - refined_rows_new - refined_rows_updated) if len(cand_rows) >= (refined_rows_new + refined_rows_updated) else 0
+        print(f"[prefilter-candidates] refined_write={'done' if wrote_refined else 'skipped'} reason_for_write={refined_reason}")
+        print(f"[prefilter-candidates] rows_added={refined_rows_new} rows_updated={refined_rows_updated} rows_unchanged={refined_rows_unchanged}")
+        if wrote_refined:
+            print(f"[prefilter-candidates] wrote refined CSV: {refined_out} rows={len(cand_rows)}")
 
     tick_candidates_requested = len(tick_scope_items)
     tick_candidates_with_metrics = sum(1 for it in tick_scope_items if _has_full_tick_metrics(it))
@@ -1757,6 +1837,11 @@ def main() -> None:
     print(f"[prefilter-tick] tick_candidates_with_metrics={tick_candidates_with_metrics}")
     print(f"[prefilter-tick] tick_candidates_missing_metrics={tick_candidates_missing_metrics}")
     print(f"[prefilter-tick] tick_candidates_used_for_phase_d={len(phase_d_pool_base)}")
+    if args.tick_data is not None and len(tick_scope_items) > 0 and int(tick_candidates_with_metrics) <= 0:
+        raise ValueError(
+            "tick-data is configured and tick_refine_scope is non-empty, but tick_candidates_with_metrics=0. "
+            "Run aborted to avoid silently continuing with coarse/OHLC-only behavior."
+        )
     if tick_refine_t0 is not None:
         timing["tick_refine_sec"] = time.perf_counter() - tick_refine_t0
 
