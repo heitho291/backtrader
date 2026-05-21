@@ -708,7 +708,12 @@ def _load_tick_minute_map_partial(
                     f"tick-data datetime parse is implausible (range {y_min}-{y_max}); "
                     "expected full timestamps (e.g. YYYYMMDD + HH:MM:SS.mmm) or valid epoch datetimes."
                 )
-        dt_ns = dt_full.dt.tz_convert("UTC").dt.tz_localize(None).astype("datetime64[ns]").view("int64").to_numpy(dtype=np.int64)
+        dt_ns = (
+            dt_full.dt.tz_convert("UTC")
+            .dt.tz_localize(None)
+            .to_numpy(dtype="datetime64[ns]")
+            .astype("int64")
+        )
         minute_ns = ((dt_ns // NS_PER_MINUTE) * NS_PER_MINUTE).astype(np.int64, copy=False)
         keep = np.isin(minute_ns, minute_filter_arr)
         if not np.any(keep):
