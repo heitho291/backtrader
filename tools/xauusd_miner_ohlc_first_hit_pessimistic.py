@@ -1107,11 +1107,13 @@ def simulate_multitp_trailing_pessimistic(
                 minute_ns = int(bar_time_ns[j])
                 bounds = tick_minute_bounds.get(minute_ns)
                 if bounds is not None:
-                    critical = (
-                        (l <= stop_level)
-                        or (tp_enabled and hits < k_max and h >= tp_levels[hits])
-                        or (trail and (not trailing_active) and ((h / entry) - 1.0) >= trail_activate)
-                    )
+                    stop_possible = l <= stop_level
+                    tp_possible = bool(tp_enabled and hits < k_max and h >= tp_levels[hits])
+                    trail_possible = bool(trail and (not trailing_active) and ((h / entry) - 1.0) >= trail_activate)
+                    if (not trail) and tp_enabled:
+                        critical = bool(stop_possible and tp_possible)
+                    else:
+                        critical = bool(stop_possible or tp_possible or trail_possible)
                     if critical:
                         s_idx, e_idx = bounds
                         tick_prices = tick_prices_all[s_idx:e_idx]
@@ -1307,11 +1309,13 @@ def simulate_selected_entries_with_ticks(
             tick_asks = None
             bounds = tick_minute_bounds.get(minute_ns)
             if bounds is not None:
-                critical = (
-                    (l <= stop_level)
-                    or (tp_enabled and hits < k_max and h >= tp_levels[hits])
-                    or (trail and (not trailing_active) and ((h / entry) - 1.0) >= trail_activate)
-                )
+                stop_possible = l <= stop_level
+                tp_possible = bool(tp_enabled and hits < k_max and h >= tp_levels[hits])
+                trail_possible = bool(trail and (not trailing_active) and ((h / entry) - 1.0) >= trail_activate)
+                if (not trail) and tp_enabled:
+                    critical = bool(stop_possible and tp_possible)
+                else:
+                    critical = bool(stop_possible or tp_possible or trail_possible)
                 if critical:
                     s_idx, e_idx = bounds
                     if use_tick_bid_ask and j == i + 1:
