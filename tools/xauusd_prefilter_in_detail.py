@@ -225,6 +225,9 @@ def _atomic_write_npz(path: Path, **arrays) -> None:
                 pass
 
 
+TICK_ENTRY_CACHE_SEMANTICS_VERSION = "tick_entry_cache_v2_and_critical_no_ohlc_fallback"
+
+
 def _load_tick_entry_cache(path: Path | None, cache_key: str) -> dict[int, dict] | None:
     if path is None:
         return None
@@ -235,6 +238,10 @@ def _load_tick_entry_cache(path: Path | None, cache_key: str) -> dict[int, dict]
             stored = str(np.asarray(z["cache_key"]).item()) if "cache_key" in z.files else ""
             if stored != str(cache_key):
                 print("[prefilter-tick-cache] cache context mismatch; ignoring old cache.")
+                return {}
+            stored_version = str(np.asarray(z["cache_semantics_version"]).item()) if "cache_semantics_version" in z.files else ""
+            if stored_version != TICK_ENTRY_CACHE_SEMANTICS_VERSION:
+                print("[prefilter-tick-cache] cache semantics version mismatch; ignoring old cache.")
                 return {}
             entries = np.asarray(z["entry_idx"], dtype=np.int64)
             tick_y = np.asarray(z["tick_y"])
@@ -267,6 +274,7 @@ def _write_tick_entry_cache(path: Path | None, cache_key: str, cache: dict[int, 
     _atomic_write_npz(
         path,
         cache_key=np.asarray(str(cache_key)),
+        cache_semantics_version=np.asarray(TICK_ENTRY_CACHE_SEMANTICS_VERSION),
         entry_idx=idxs,
         tick_y=arr("y", np.int8, -1),
         tick_pnl=arr("pnl", np.float32, np.nan),
@@ -1360,6 +1368,7 @@ def main() -> None:
         "entry_semantics_version": "next_bar_first_ask_v1",
         "bid_ask_semantics_version": "long_entry_ask_exit_bid_v1",
         "label_outcome_semantics_version": "hold_or_period_end_endpoint_pnl_v1",
+        "tick_entry_cache_semantics_version": TICK_ENTRY_CACHE_SEMANTICS_VERSION,
     }
     tick_entry_cache_sig = _ctx_sig(tick_entry_cache_ctx)
     tick_refine_t0 = time.perf_counter() if (args.tick_data is not None or (refined_out is not None and refined_out.exists())) else None
