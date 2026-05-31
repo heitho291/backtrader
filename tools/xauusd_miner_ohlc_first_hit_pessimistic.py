@@ -1366,6 +1366,7 @@ def simulate_selected_entries_with_ticks(
                 if y_i != -1:
                     out[i] = {"pnl": pnl_i, "y": y_i, "t_exit": exit_k, "t_qual": qual_k, "tp_hits": hits}
                     break
+                continue
 
             curr_profit_ret = (h / entry) - 1.0
             if curr_profit_ret > max_profit_ret:
