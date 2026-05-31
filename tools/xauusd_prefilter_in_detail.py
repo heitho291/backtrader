@@ -284,6 +284,96 @@ def _write_tick_entry_cache(path: Path | None, cache_key: str, cache: dict[int, 
     )
     print(f"[prefilter-tick-cache] wrote entries={len(idxs)} to {path}")
 
+
+
+def _print_tick_cache_diagnostics(
+    cache_entries: dict[int, dict] | None,
+    tick_results: dict[int, dict] | None,
+    expected_entries: np.ndarray | None,
+    label_y: np.ndarray,
+    label_t_exit: np.ndarray,
+    hold: int,
+) -> None:
+    cache_entries = cache_entries or {}
+    tick_results = tick_results or {}
+    if not cache_entries and not tick_results:
+        return
+    expected_set = set(int(i) for i in np.asarray(expected_entries if expected_entries is not None else [], dtype=np.int64).tolist())
+    diagnostic_entries = cache_entries if cache_entries else tick_results
+    expected_present = {int(i): tick_results[int(i)] for i in expected_set if int(i) in tick_results}
+    compare_entries = expected_present if expected_set else tick_results
+
+    def _vals(entries: dict[int, dict], name: str, default) -> np.ndarray:
+        return np.asarray([rec.get(name, default) for rec in entries.values()])
+
+    y_vals = _vals(diagnostic_entries, "y", -1).astype(np.int64, copy=False)
+    t_exit_vals = _vals(diagnostic_entries, "t_exit", -1).astype(np.int64, copy=False)
+    pnl_vals = _vals(diagnostic_entries, "pnl", np.nan).astype(np.float64, copy=False)
+    y01 = (y_vals == 0) | (y_vals == 1)
+    hold_count = int(np.sum(t_exit_vals == int(hold)))
+    hold_share = hold_count / max(1, int(np.sum(y01)))
+    invalid_t_exit = int(np.sum(y01 & ((t_exit_vals < 1) | (t_exit_vals > int(hold)))))
+    pnl_bad = int(np.sum(~np.isfinite(pnl_vals)))
+    missing_expected = int(len(expected_set - set(int(k) for k in tick_results.keys()))) if expected_set else 0
+    print(
+        "[prefilter-tick-cache-diagnostics] "
+        f"cache_entries_total={len(cache_entries)} current_tick_entries={len(tick_results)} "
+        f"expected_entries={len(expected_set)} tick_missing={missing_expected}"
+    )
+    print(
+        "[prefilter-tick-cache-diagnostics] "
+        f"tick_y_1={int(np.sum(y_vals == 1))} tick_y_0={int(np.sum(y_vals == 0))} "
+        f"tick_y_minus1={int(np.sum(y_vals == -1))} tick_t_exit_hold={hold_count} "
+        f"tick_t_exit_hold_share_y01={hold_share:.6f} tick_t_exit_invalid_y01={invalid_t_exit} "
+        f"tick_pnl_nan_or_inf={pnl_bad}"
+    )
+
+    def _print_percentiles(y_value: int) -> None:
+        arr = t_exit_vals[(y_vals == y_value) & np.isfinite(t_exit_vals)]
+        arr = arr[arr >= 0]
+        if arr.size <= 0:
+            print(f"[prefilter-tick-cache-diagnostics] tick_t_exit_y{y_value}_count=0")
+            return
+        qs = np.percentile(arr.astype(np.float64, copy=False), [50, 90, 95, 99])
+        print(
+            "[prefilter-tick-cache-diagnostics] "
+            f"tick_t_exit_y{y_value}_count={int(arr.size)} median={qs[0]:.3f} "
+            f"p90={qs[1]:.3f} p95={qs[2]:.3f} p99={qs[3]:.3f}"
+        )
+
+    _print_percentiles(1)
+    _print_percentiles(0)
+
+    y_equal = y_different = t_equal = t_different = same_y_diff_t = hold_vs_label_exit = 0
+    for idx_i, rec in compare_entries.items():
+        ii = int(idx_i)
+        if ii < 0 or ii >= len(label_y) or ii >= len(label_t_exit):
+            continue
+        ty = int(rec.get("y", -1))
+        tt = int(rec.get("t_exit", -1))
+        ly = int(label_y[ii])
+        lt = int(label_t_exit[ii])
+        if ty == ly:
+            y_equal += 1
+        else:
+            y_different += 1
+        if tt == lt:
+            t_equal += 1
+        else:
+            t_different += 1
+        if ty == ly and tt >= 0 and lt >= 0 and abs(tt - lt) > 1:
+            same_y_diff_t += 1
+        if tt == int(hold) and 0 <= lt < int(hold):
+            hold_vs_label_exit += 1
+    print(
+        "[prefilter-tick-cache-diagnostics] "
+        f"label_compare_entries={len(compare_entries)} label_y_equal={y_equal} "
+        f"label_y_different={y_different} label_y_tick_missing={missing_expected} "
+        f"label_t_exit_equal={t_equal} label_t_exit_different={t_different} "
+        f"label_t_exit_tick_missing={missing_expected} same_y_t_exit_diff_gt1={same_y_diff_t} "
+        f"tick_hold_label_exit_before_hold={hold_vs_label_exit}"
+    )
+
 def _write_control_none(control_file: Path | None) -> None:
     if control_file is None:
         return
@@ -1659,6 +1749,8 @@ def main() -> None:
             else:
                 print("[prefilter-tick-cache] scope_critical_minutes_count=not_computed")
                 print("[prefilter-tick-cache] scope_counts_hint=use --debug-tick-cache-scope-counts")
+        if tick_map or cached_entries:
+            _print_tick_cache_diagnostics(cached_entries, tick_map, entry_indices, y, t_exit, int(args.hold))
         if tick_map:
             y_ref = np.full(n, -1, dtype=np.int8)
             t_exit_ref = np.full(n, -1, dtype=np.int32)
