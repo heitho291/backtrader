@@ -997,6 +997,29 @@ def main() -> None:
         raise ValueError("--out-candidates-csv is deprecated. Use --out-candidates-coarse-csv and --out-candidates-refined-csv.")
     miner = _load_miner_module(args.miner_script)
     timing: dict[str, float] = {}
+    timing_detail: dict[str, float] = {
+        "tick_cache_load_sec": 0.0,
+        "tick_scope_build_sec": 0.0,
+        "tick_raw_load_sec": 0.0,
+        "tick_simulate_selected_entries_sec": 0.0,
+        "tick_cache_write_sec": 0.0,
+        "tick_cache_diagnostics_sec": 0.0,
+        "tick_candidate_metrics_sec": 0.0,
+        "candidate_csv_write_sec": 0.0,
+        "phase_d_pool_build_sec": 0.0,
+        "ranking_sort_sec": 0.0,
+        "ranking_context_build_sec": 0.0,
+    }
+    timing_counts: dict[str, int] = {
+        "tick_cache_loaded_entries_count": 0,
+        "tick_cache_diagnostics_entries_count": 0,
+    }
+    timing_flags: dict[str, bool] = {
+        "tick_raw_load_skipped": True,
+        "tick_simulation_skipped": True,
+        "tick_cache_write_skipped": True,
+        "tick_cache_diagnostics_skipped": True,
+    }
 
     t0 = time.perf_counter()
     df = miner.load_features(args.features)
@@ -1194,6 +1217,8 @@ def main() -> None:
         return selected, int(raw_idxs.size), int(len(selected_cluster_ids))
 
     t0 = time.perf_counter()
+    ranking_total_t0 = t0
+    ranking_context_t0 = time.perf_counter()
     allow_keys, allow_keys_refined = _load_allowlist(args.include_candidates_file)
     coarse_ctx = {
         "features_sig": _file_sig(args.features),
@@ -1423,6 +1448,7 @@ def main() -> None:
     for _, arr in fam_groups.items():
         arr = sorted(arr, key=lambda z: (-float(z["lift"]), -int(z["_single_pos_hits"]), int(z["_single_mask_count"])))
         fam_top.extend(arr[: int(args.family_top_n)])
+    timing_detail["ranking_context_build_sec"] += time.perf_counter() - ranking_context_t0
 
     tick_refined_mode = False
     refined_ctx = {
@@ -1461,7 +1487,8 @@ def main() -> None:
         "tick_entry_cache_semantics_version": TICK_ENTRY_CACHE_SEMANTICS_VERSION,
     }
     tick_entry_cache_sig = _ctx_sig(tick_entry_cache_ctx)
-    tick_refine_t0 = time.perf_counter() if (args.tick_data is not None or (refined_out is not None and refined_out.exists())) else None
+    tick_refine_t0 = time.perf_counter() if (args.tick_data is not None or args.tick_entry_cache_npz is not None or (refined_out is not None and refined_out.exists())) else None
+    tick_refine_total_t0 = tick_refine_t0
     refined_resume = _load_stage_csv_if_match(refined_out, "refined", refined_ctx_sig)
     if str(args.tick_refine_scope) == "fam_top":
         tick_scope_items = fam_top
@@ -1533,12 +1560,14 @@ def main() -> None:
         print(f"[prefilter-tick] tick_refine_scope={args.tick_refine_scope}")
         print(f"[prefilter-tick] tick_refine_candidates_count={len(tick_scope_items)}")
         print(f"[prefilter-tick] tick_refine_missing_to_compute={len(tick_missing_items)}")
+        tick_scope_t0 = time.perf_counter()
         fam_union = np.zeros(n, dtype=bool)
         for it in tick_scope_items:
             fam_union |= np.asarray(it["mask"], dtype=bool)
         entry_indices = np.flatnonzero(fam_union).astype(np.int64, copy=False)
         entry_index_set = {int(i) for i in entry_indices.tolist()}
         tick_period_end_indices = np.where(np.arange(n) < train_idx, train_idx - 1, n - 1).astype(np.int64)
+        timing_detail["tick_scope_build_sec"] += time.perf_counter() - tick_scope_t0
 
         def _scope_tick_minute_counts(scope_entries: np.ndarray) -> tuple[int, int, int]:
             scope_entry_minutes = {int(bar_time_ns[int(i) + 1]) for i in scope_entries.tolist() if int(i) + 1 < n}
@@ -1571,8 +1600,11 @@ def main() -> None:
                     out.add(int(bar_time_ns[j]))
             return out
 
+        cache_load_t0 = time.perf_counter()
         cached_entries = _load_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig) if args.tick_entry_cache_npz is not None else {}
+        timing_detail["tick_cache_load_sec"] += time.perf_counter() - cache_load_t0
         cached_entries = cached_entries if cached_entries is not None else {}
+        timing_counts["tick_cache_loaded_entries_count"] = int(len(cached_entries))
         cached_present = {int(k) for k in cached_entries.keys() if int(k) in entry_index_set}
         tick_map: dict[int, dict] = {int(i): cached_entries[int(i)] for i in cached_present if int(i) in cached_entries}
 
@@ -1599,7 +1631,10 @@ def main() -> None:
                     cached_entries[int(idx_i)] = dict(invalid_rec)
             cached_present.update(structurally_invalid)
             if args.tick_entry_cache_npz is not None:
+                cache_write_t0 = time.perf_counter()
                 _write_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig, cached_entries)
+                timing_detail["tick_cache_write_sec"] += time.perf_counter() - cache_write_t0
+                timing_flags["tick_cache_write_skipped"] = False
             print(f"[prefilter-tick-cache] cached_structurally_invalid_entries={len(structurally_invalid)}")
         cached_valid = {int(k) for k in cached_present if int(k) in cached_entries and int(cached_entries[int(k)].get("y", -1)) in (0, 1)}
         missing_entry_indices = np.asarray([int(i) for i in entry_indices.tolist() if int(i) not in cached_present], dtype=np.int64)
@@ -1615,6 +1650,7 @@ def main() -> None:
                 matched_total_minutes_count = 0
                 used_real_ticks = bool(len(tick_map) > 0)
             else:
+                tick_scope_t0 = time.perf_counter()
                 critical_minutes = _critical_minutes_for_entries(
                     entry_indices=missing_entry_indices,
                     high=high,
@@ -1636,6 +1672,7 @@ def main() -> None:
                     minutes_to_load = set(critical_minutes) | entry_minutes | window_minutes
                 else:
                     minutes_to_load = set(critical_minutes) | entry_minutes
+                timing_detail["tick_scope_build_sec"] += time.perf_counter() - tick_scope_t0
                 if bool(args.debug_tick_cache_scope_counts):
                     scope_entry_count, scope_critical_count, scope_would_load_count = _scope_tick_minute_counts(entry_indices)
                     print(f"[prefilter-tick-cache] scope_entry_minutes_count={scope_entry_count}")
@@ -1644,6 +1681,7 @@ def main() -> None:
                     print("[prefilter-tick-cache] scope_counts_source=ohlc_diagnostic_no_raw_tick_load")
                 raw_tick_load_attempted = bool(len(minutes_to_load) > 0)
                 if minutes_to_load:
+                    raw_load_t0 = time.perf_counter()
                     tick_prices_all, tick_minute_bounds, tick_bids_all, tick_asks_all, matched_total_minutes_count = _load_tick_minute_map_partial(
                         path=args.tick_data,
                         datetime_col=args.tick_datetime_column,
@@ -1652,6 +1690,8 @@ def main() -> None:
                         minute_filter=minutes_to_load,
                         tick_chunk_size=args.tick_chunk_size,
                     )
+                    timing_detail["tick_raw_load_sec"] += time.perf_counter() - raw_load_t0
+                    timing_flags["tick_raw_load_skipped"] = False
                     matched_critical_minutes_count = sum(1 for m in critical_minutes if int(m) in tick_minute_bounds)
                 else:
                     tick_prices_all, tick_minute_bounds = np.asarray([], dtype=np.float64), {}
@@ -1675,6 +1715,7 @@ def main() -> None:
                     )
                 if used_real_ticks_partial:
                     entry_tick_stats: dict[str, int] = {}
+                    tick_sim_t0 = time.perf_counter()
                     tick_map_new = miner.simulate_selected_entries_with_ticks(
                         entry_indices=missing_entry_indices,
                         high=high,
@@ -1701,6 +1742,8 @@ def main() -> None:
                         period_end_indices=tick_period_end_indices,
                         entry_tick_stats=entry_tick_stats,
                     )
+                    timing_detail["tick_simulate_selected_entries_sec"] += time.perf_counter() - tick_sim_t0
+                    timing_flags["tick_simulation_skipped"] = False
                     print(f"[prefilter-tick] entry_tick_missing_count={int(entry_tick_stats.get('entry_tick_missing_count', 0))}")
                     invalid_rec = {"y": -1, "pnl": float("nan"), "t_exit": -1, "t_qual": -1, "tp_hits": 0}
                     for idx_i, rec in tick_map_new.items():
@@ -1730,7 +1773,10 @@ def main() -> None:
                                 cached_entries[int(idx_i)] = dict(invalid_rec)
                         print(f"[prefilter-tick] entry_tick_invalid_unresolved_count={len(unresolved_invalid)}")
                     if args.tick_entry_cache_npz is not None:
+                        cache_write_t0 = time.perf_counter()
                         _write_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig, cached_entries)
+                        timing_detail["tick_cache_write_sec"] += time.perf_counter() - cache_write_t0
+                        timing_flags["tick_cache_write_skipped"] = False
                     used_real_ticks = True
         else:
             print("[prefilter-tick-cache] tick_data_source=entry_cache_only")
@@ -1750,8 +1796,13 @@ def main() -> None:
                 print("[prefilter-tick-cache] scope_critical_minutes_count=not_computed")
                 print("[prefilter-tick-cache] scope_counts_hint=use --debug-tick-cache-scope-counts")
         if tick_map or cached_entries:
+            diag_t0 = time.perf_counter()
             _print_tick_cache_diagnostics(cached_entries, tick_map, entry_indices, y, t_exit, int(args.hold))
+            timing_detail["tick_cache_diagnostics_sec"] += time.perf_counter() - diag_t0
+            timing_counts["tick_cache_diagnostics_entries_count"] = int(len(tick_map) if tick_map else len(cached_entries))
+            timing_flags["tick_cache_diagnostics_skipped"] = False
         if tick_map:
+            candidate_metrics_t0 = time.perf_counter()
             y_ref = np.full(n, -1, dtype=np.int8)
             t_exit_ref = np.full(n, -1, dtype=np.int32)
             for idx_i, rec in tick_map.items():
@@ -1794,6 +1845,7 @@ def main() -> None:
             tick_refined_mode = any(_has_full_tick_metrics(it) for it in tick_scope_items)
             if not metrics_complete:
                 print("[prefilter-tick-cache] warning: some current-scope entries are missing tick cache results; affected candidates remain missing.")
+            timing_detail["tick_candidate_metrics_sec"] += time.perf_counter() - candidate_metrics_t0
             print(f"[prefilter] tick-refined {args.tick_refine_scope} scope on {len(entry_indices)} union entry rows.")
     elif args.tick_data is not None and len(tick_scope_items) > 0:
         print(f"[prefilter-tick] tick_refine_scope={args.tick_refine_scope}")
@@ -1801,7 +1853,12 @@ def main() -> None:
         print("[prefilter-tick] all requested candidates already have full tick metrics")
     elif args.tick_data is not None:
         print(f"[prefilter-tick] skipped: tick_refine_scope={args.tick_refine_scope} produced empty candidate scope")
+    wrote_coarse = False
+    wrote_refined = False
+    coarse_reason = "not_requested"
+    refined_reason = "not_requested"
     if coarse_out is not None:
+        coarse_csv_t0 = time.perf_counter()
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
         existing_rows = dict(coarse_existing_rows)
         for it in full_filtered_items:
@@ -1845,6 +1902,7 @@ def main() -> None:
         print(f"[prefilter-candidates] rows_existing_before={coarse_rows_prev} rows_existing_after={coarse_rows_after} rows_delta={coarse_rows_delta}")
         if wrote_coarse:
             print(f"[prefilter-candidates] wrote coarse CSV: {coarse_out} rows={len(coarse_rows)}")
+        timing_detail["candidate_csv_write_sec"] += time.perf_counter() - coarse_csv_t0
 
     if bool(args.debug_atr_candidates):
         atr_candidates_written_to_csv = sum(1 for it in full_filtered_items if _is_atr_candidate_col(str(it.get("col", ""))))
@@ -1860,13 +1918,16 @@ def main() -> None:
         if atr_cols_sample:
             print("[prefilter-atr-debug] atr_cols_sample=" + ",".join(atr_cols_sample))
 
+    phase_d_pool_t0 = time.perf_counter()
     phase_d_pool_base: list[dict] = []
     tick_scope_keys = {str(it.get("candidate_key")) for it in tick_scope_items}
     for it in tick_scope_items:
         if _has_full_tick_metrics(it):
             phase_d_pool_base.append(it)
+    timing_detail["phase_d_pool_build_sec"] += time.perf_counter() - phase_d_pool_t0
 
     if refined_out is not None:
+        refined_csv_t0 = time.perf_counter()
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
         status_rank = {"full": 3, "missing": 2, "out_of_scope": 1}
 
@@ -1954,6 +2015,7 @@ def main() -> None:
         print(f"[prefilter-candidates] rows_existing_before={prev_refined_rows} rows_existing_after={refined_rows_after} rows_delta={refined_rows_delta}")
         if wrote_refined:
             print(f"[prefilter-candidates] wrote refined CSV: {refined_out} rows={len(cand_rows)}")
+        timing_detail["candidate_csv_write_sec"] += time.perf_counter() - refined_csv_t0
 
     tick_candidates_requested = len(tick_scope_items)
     tick_candidates_with_metrics = sum(1 for it in tick_scope_items if _has_full_tick_metrics(it))
@@ -1970,18 +2032,75 @@ def main() -> None:
         )
     if tick_refine_t0 is not None:
         timing["tick_refine_sec"] = time.perf_counter() - tick_refine_t0
+        timing_detail["tick_refine_total_sec"] = time.perf_counter() - tick_refine_total_t0
+    else:
+        timing_detail["tick_refine_total_sec"] = 0.0
 
 
+    rank_sort_t0 = time.perf_counter()
     if tick_refined_mode:
         rank_lift = _with_rank_context(sorted(fam_top, key=lambda z: (-float(z.get("ratio", 0.0)), -int(z.get("_single_pos_hits", 0)), int(z.get("_single_mask_count", 0)))), "ratio")
     else:
         rank_lift = _with_rank_context(sorted(fam_top, key=lambda z: z["lift"], reverse=True), "lift")
     rank_freq: list[dict] = []
     rank_ratio: list[dict] = []
+    timing_detail["ranking_sort_sec"] += time.perf_counter() - rank_sort_t0
     timing["ranking_prep_sec"] = time.perf_counter() - t0
+    ranking_total_sec = time.perf_counter() - ranking_total_t0
+    tick_refine_total_sec = timing_detail.get("tick_refine_total_sec", 0.0)
+    timing_detail["ranking_total_sec"] = ranking_total_sec
+    tick_refine_subtimer_sum = (
+        sum(timing_detail.get(k, 0.0) for k in (
+            "tick_cache_load_sec",
+            "tick_scope_build_sec",
+            "tick_raw_load_sec",
+            "tick_simulate_selected_entries_sec",
+            "tick_cache_write_sec",
+            "tick_cache_diagnostics_sec",
+            "tick_candidate_metrics_sec",
+            "candidate_csv_write_sec",
+            "phase_d_pool_build_sec",
+        ))
+        if tick_refine_total_t0 is not None
+        else 0.0
+    )
+    ranking_subtimer_sum = timing_detail.get("ranking_sort_sec", 0.0) + timing_detail.get("ranking_context_build_sec", 0.0)
+    timing_detail["tick_refine_unaccounted_sec"] = tick_refine_total_sec - tick_refine_subtimer_sum
+    timing_detail["ranking_unaccounted_sec"] = ranking_total_sec - ranking_subtimer_sum
 
     if bool(args.debug_timing_breakdown):
         print("[prefilter-timing] " + " | ".join([f"{k}={v:.3f}s" for k, v in timing.items()]))
+        print(
+            "[prefilter-timing-detail] "
+            f"tick_cache_load_sec={timing_detail['tick_cache_load_sec']:.3f} "
+            f"tick_cache_loaded_entries_count={timing_counts['tick_cache_loaded_entries_count']} "
+            f"tick_scope_build_sec={timing_detail['tick_scope_build_sec']:.3f} "
+            f"tick_raw_load_sec={timing_detail['tick_raw_load_sec']:.3f} "
+            f"tick_raw_load_skipped={bool(timing_flags['tick_raw_load_skipped'])} "
+            f"tick_simulate_selected_entries_sec={timing_detail['tick_simulate_selected_entries_sec']:.3f} "
+            f"tick_simulation_skipped={bool(timing_flags['tick_simulation_skipped'])} "
+            f"tick_missing_entries={int(len(missing_entry_indices)) if 'missing_entry_indices' in locals() else 0} "
+            f"tick_cache_write_sec={timing_detail['tick_cache_write_sec']:.3f} "
+            f"tick_cache_write_skipped={bool(timing_flags['tick_cache_write_skipped'])} "
+            f"tick_cache_diagnostics_sec={timing_detail['tick_cache_diagnostics_sec']:.3f} "
+            f"tick_cache_diagnostics_skipped={bool(timing_flags['tick_cache_diagnostics_skipped'])} "
+            f"tick_cache_diagnostics_entries_count={timing_counts['tick_cache_diagnostics_entries_count']} "
+            f"tick_candidate_metrics_sec={timing_detail['tick_candidate_metrics_sec']:.3f} "
+            f"tick_candidates_requested={tick_candidates_requested} "
+            f"tick_candidates_with_metrics={tick_candidates_with_metrics} "
+            f"tick_candidates_missing_metrics={tick_candidates_missing_metrics} "
+            f"tick_candidates_used_for_phase_d={len(phase_d_pool_base)} "
+            f"candidate_csv_write_sec={timing_detail['candidate_csv_write_sec']:.3f} "
+            f"coarse_csv_written={bool(wrote_coarse)} coarse_csv_reason={coarse_reason} "
+            f"refined_csv_written={bool(wrote_refined)} refined_csv_reason={refined_reason} "
+            f"phase_d_pool_build_sec={timing_detail['phase_d_pool_build_sec']:.3f} "
+            f"tick_refine_total_sec={timing_detail['tick_refine_total_sec']:.3f} "
+            f"tick_refine_unaccounted_sec={timing_detail['tick_refine_unaccounted_sec']:.3f} "
+            f"ranking_sort_sec={timing_detail['ranking_sort_sec']:.3f} "
+            f"ranking_context_build_sec={timing_detail['ranking_context_build_sec']:.3f} "
+            f"ranking_total_sec={timing_detail['ranking_total_sec']:.3f} "
+            f"ranking_unaccounted_sec={timing_detail['ranking_unaccounted_sec']:.3f}"
+        )
     if bool(args.debug_timing_breakdown) or bool(args.debug_reject_stats):
         dist_items = sum(1 for x in items if str(x["col"]).startswith("dist_"))
         non_dist_items = len(items) - dist_items
@@ -2379,14 +2498,20 @@ def main() -> None:
             old_pool_size = max(0, len(pool) - int(args.step_size))
             phase_a = (len(valid_pool) < int(args.max_valids)) and (not force_phase_b_requested)
             phase_b_pool_key = _phase_b_pool_key(pool)
+            if phase_a:
+                print("[prefilter-phase-b] started=False reason=phase_a_active")
             if (not phase_a) and phase_b_pool_key in completed_phase_b_pool_keys:
+                print(f"[prefilter-phase-b] started=False reason=completed_pool_key pool_size={len(pool)}")
                 print(f"[prefilter-phase-b] skipped: completed pool key already processed. pool_size={len(pool)}")
                 force_phase = "C"
                 break
             if (not phase_a) and not valid_pool:
+                print("[prefilter-phase-b] started=False reason=no_parent_seeds")
                 print("[prefilter-phase-b] skipped: no parent seeds in valid_pool after phase A.")
                 force_phase = "C"
                 break
+            if not phase_a:
+                print(f"[prefilter-phase-b] started=True pool_size={len(pool)} parent_seeds={len(valid_pool)}")
             shard_specs: list[tuple[int, int, int, int]] = []
             batch_eff = max(256, int(args.batch_size))
             sid = 0
@@ -2428,6 +2553,14 @@ def main() -> None:
                 combos_total_free = -1
             combos_total_parent_extensions = int(len(mut_combos)) if phase_a else -1
             combos_total = int(combos_total_free + combos_total_parent_extensions) if phase_a else -1
+            if phase_a:
+                print(
+                    f"[prefilter-phase-ab-detail] round={unlocked_next} phase=A "
+                    f"pool_size={len(pool)} combos_total_free={combos_total_free} "
+                    f"combos_total_parent_extensions={combos_total_parent_extensions} "
+                    f"combos_total={combos_total} phase_a_parent_extensions_enabled={bool(parent_ext_iter is not None)} "
+                    f"parent_extensions_sampled_this_round={len(mut_combos)}"
+                )
 
             hist: list[tuple[int, float, tuple[float, int, int]]] = []
             phase_b_exhausted = False
