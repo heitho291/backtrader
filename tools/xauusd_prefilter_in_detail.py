@@ -982,6 +982,7 @@ def _calc_wf(mask: np.ndarray, y_test: np.ndarray, wf_folds: int) -> tuple[float
 
 
 def main() -> None:
+    main_t0 = time.perf_counter()
     args = parse_args()
     if int(args.cluster_gap_minutes) < 0:
         raise ValueError("--cluster-gap-minutes must be >= 0")
@@ -1010,6 +1011,38 @@ def main() -> None:
         "ranking_sort_sec": 0.0,
         "ranking_context_build_sec": 0.0,
     }
+    timing_detail2: dict[str, float] = {
+        "coarse_resume_total_sec": 0.0,
+        "coarse_csv_load_sec": 0.0,
+        "coarse_rows_filter_sec": 0.0,
+        "coarse_reconstruct_candidates_sec": 0.0,
+        "refined_resume_total_sec": 0.0,
+        "refined_csv_load_sec": 0.0,
+        "refined_key_match_sec": 0.0,
+        "refined_tick_metric_restore_sec": 0.0,
+        "quantile_thresholds_sec": 0.0,
+        "build_items_total_sec": 0.0,
+        "build_items_candidate_loop_sec": 0.0,
+        "build_items_mask_sec": 0.0,
+        "build_items_metadata_sec": 0.0,
+        "filtered_items_build_sec": 0.0,
+        "fam_top_build_sec": 0.0,
+        "rank_context_total_sec": 0.0,
+        "same_reference_groups_sec": 0.0,
+        "search_setup_sec": 0.0,
+        "phase_a_total_sec": 0.0,
+        "phase_b_total_sec": 0.0,
+        "phase_c_total_sec": 0.0,
+        "phase_d_total_sec": 0.0,
+        "rules_export_sec": 0.0,
+    }
+    phase_timing_counts: dict[str, int] = {
+        "phase_a_parent_extensions_total": 0,
+        "phase_a_parent_extensions_rounds": 0,
+        "phase_b_parent_extensions_total": 0,
+    }
+    phase_b_started = False
+    phase_b_skip_reason = "not_reached"
     timing_counts: dict[str, int] = {
         "tick_cache_loaded_entries_count": 0,
         "tick_cache_diagnostics_entries_count": 0,
@@ -1237,7 +1270,10 @@ def main() -> None:
     coarse_ctx_sig = _ctx_sig(coarse_ctx)
     coarse_out = args.out_candidates_coarse_csv
     refined_out = args.out_candidates_refined_csv
+    coarse_resume_total_t0 = time.perf_counter()
+    coarse_csv_load_t0 = time.perf_counter()
     coarse_resume = _load_stage_csv_if_match(coarse_out, "coarse", coarse_ctx_sig)
+    timing_detail2["coarse_csv_load_sec"] += time.perf_counter() - coarse_csv_load_t0
     coarse_existing_rows: dict[str, dict] = {}
     coarse_build_min_pos = int(args.min_single_pos_hits)
     coarse_build_max_mask = int(args.max_single_mask_count)
@@ -1291,6 +1327,7 @@ def main() -> None:
         rows_loaded_coarse = int(len(coarse_resume))
         rows_reconstructed = 0
         for _, r in coarse_resume.iterrows():
+            coarse_filter_t0 = time.perf_counter()
             key = str(r.get("candidate_key", "")).strip()
             col = str(r["col"]); op = str(r["op"]); val = _canonicalize_candidate_value(col, op, float(r["value"]))
             stable_k = _stable_candidate_key(col, op, val)
@@ -1300,13 +1337,19 @@ def main() -> None:
             lift0 = float(r.get("coarse_lift", 0.0))
             mask0 = int(r.get("coarse_single_mask_count", 0))
             if int(args.min_single_pos_hits) > 0 and pos0 < int(args.min_single_pos_hits):
+                timing_detail2["coarse_rows_filter_sec"] += time.perf_counter() - coarse_filter_t0
                 single_rejects["min_pos"] += 1; continue
             if float(args.min_single_lift) > 0 and lift0 < float(args.min_single_lift):
+                timing_detail2["coarse_rows_filter_sec"] += time.perf_counter() - coarse_filter_t0
                 single_rejects["min_lift"] += 1; continue
             if int(args.max_single_mask_count) > 0 and mask0 > int(args.max_single_mask_count):
+                timing_detail2["coarse_rows_filter_sec"] += time.perf_counter() - coarse_filter_t0
                 single_rejects["mask_count"] += 1; continue
             if allow_keys is not None and str(key) not in allow_keys:
+                timing_detail2["coarse_rows_filter_sec"] += time.perf_counter() - coarse_filter_t0
                 single_rejects["allowlist"] += 1; continue
+            timing_detail2["coarse_rows_filter_sec"] += time.perf_counter() - coarse_filter_t0
+            coarse_reconstruct_t0 = time.perf_counter()
             xvec = pd.to_numeric(bdf[col] if op == "==" else df[col], errors="coerce").to_numpy(copy=False)
             if op == "==":
                 m = np.isfinite(xvec) & (np.abs(xvec - val) <= 1e-6)
@@ -1321,6 +1364,7 @@ def main() -> None:
             mask_count = int(pos_hits + neg_hits)
             ratio = pos_hits / max(1, neg_hits)
             lift = (pos_hits / max(1, int(np.sum(y_train == 1)))) / max(1e-12, (neg_hits / max(1, int(np.sum(y_train == 0)))))
+            timing_detail2["coarse_reconstruct_candidates_sec"] += time.perf_counter() - coarse_reconstruct_t0
             filtered_items.append({
                 "candidate_key": key, "stable_candidate_key": stable_k, "col": col, "op": op, "value": val, "mask": m,
                 "binary": bool(int(r.get("binary", 0))), "_family": str(r.get("family", _candidate_family(col, bool(args.family_split_delta_window)))),
@@ -1340,11 +1384,15 @@ def main() -> None:
         print(f"[prefilter-resume] rows_after_hard_filters={len(filtered_items)}")
         print(f"[prefilter-resume] rows_reconstructed={rows_reconstructed}")
         print(f"[prefilter-resume] loaded coarse candidates from {coarse_out} rows={len(filtered_items)}")
+        timing_detail2["coarse_resume_total_sec"] += time.perf_counter() - coarse_resume_total_t0
     else:
+        timing_detail2["coarse_resume_total_sec"] += time.perf_counter() - coarse_resume_total_t0
         qs = [float(x) for x in str(args.quantiles).split(",") if x.strip()]
         t0 = time.perf_counter()
         qmap = miner.quantile_thresholds(df.iloc[:train_idx], cols, qs)
         timing["quantile_thresholds_sec"] = time.perf_counter() - t0
+        timing_detail2["quantile_thresholds_sec"] = timing["quantile_thresholds_sec"]
+        build_items_total_t0 = time.perf_counter()
         t0 = time.perf_counter()
         for c in cols:
             if c.startswith("dist_"):
@@ -1377,11 +1425,15 @@ def main() -> None:
                               "lift": (pos / max(1, int(np.sum(y_train == 1)))) / max(1e-12, (neg / max(1, int(np.sum(y_train == 0))))),
                               "ratio": pos / max(1, neg)})
         timing["build_items_sec"] = time.perf_counter() - t0
+        timing_detail2["build_items_candidate_loop_sec"] += timing["build_items_sec"]
+        build_items_metadata_t0 = time.perf_counter()
         for i, it in enumerate(items, start=1):
             x = dict(it); x["candidate_key"] = f"cand_{i:06d}"
             x["stable_candidate_key"] = _stable_candidate_key(str(x["col"]), str(x["op"]), _canonicalize_candidate_value(str(x["col"]), str(x["op"]), float(x["value"])))
+            build_items_mask_t0 = time.perf_counter()
             m = np.asarray(x["mask"], dtype=bool)
             m_sel, _, _ = _select_entries_for_mask(m, y, t_exit)
+            timing_detail2["build_items_mask_sec"] += time.perf_counter() - build_items_mask_t0
             pos_hits = int(np.sum(m_sel[:train_idx] & (y_train == 1))); neg_hits = int(np.sum(m_sel[:train_idx] & (y_train == 0)))
             mask_count = int(pos_hits + neg_hits)
             if float(x["lift"]) < float(args.min_single_lift):
@@ -1392,6 +1444,8 @@ def main() -> None:
             x["coarse_single_mask_count"] = int(mask_count); x["coarse_single_ratio"] = float(x["_single_ratio"]); x["coarse_lift"] = float(x["lift"])
             x["_family"] = _candidate_family(str(x["col"]), bool(args.family_split_delta_window))
             filtered_items.append(x)
+        timing_detail2["build_items_metadata_sec"] += time.perf_counter() - build_items_metadata_t0
+        filtered_items_build_t0 = time.perf_counter()
         by_mask: dict[str, dict] = {}
         for it in filtered_items:
             mh = _mask_hash_arr(np.asarray(it["mask"][:train_idx], dtype=bool))
@@ -1403,6 +1457,8 @@ def main() -> None:
             if tf_new < tf_cur:
                 by_mask[mh] = it
         filtered_items = list(by_mask.values())
+        timing_detail2["filtered_items_build_sec"] += time.perf_counter() - filtered_items_build_t0
+        timing_detail2["build_items_total_sec"] += time.perf_counter() - build_items_total_t0
     atr_debug_source = list(items) if items else list(filtered_items)
     def _atr_debug_pass_counts(source_items: list[dict]) -> tuple[int, int, int, int]:
         atr_items = [it for it in source_items if _is_atr_candidate_col(str(it.get("col", "")))]
@@ -1422,6 +1478,7 @@ def main() -> None:
                         after_mask.append(it)
         return len(atr_items), len(after_pos), len(after_lift), len(after_mask)
     atr_candidates_built, atr_candidates_after_min_pos, atr_candidates_after_min_lift, atr_candidates_after_mask_count = _atr_debug_pass_counts(atr_debug_source)
+    filtered_items_build_t0 = time.perf_counter()
     full_filtered_items = list(filtered_items)
     filtered_items = list(full_filtered_items)
     if int(args.min_single_pos_hits) > 0:
@@ -1441,6 +1498,8 @@ def main() -> None:
         filtered_items = [it for it in filtered_items if str(it.get("candidate_key")) in allow_keys]
         single_rejects["allowlist"] = max(0, before - len(filtered_items))
     print(f"[prefilter-resume] rows_after_allowlist={len(filtered_items)}")
+    timing_detail2["filtered_items_build_sec"] += time.perf_counter() - filtered_items_build_t0
+    fam_top_build_t0 = time.perf_counter()
     fam_top: list[dict] = []
     fam_groups: dict[str, list[dict]] = {}
     for it in filtered_items:
@@ -1448,7 +1507,9 @@ def main() -> None:
     for _, arr in fam_groups.items():
         arr = sorted(arr, key=lambda z: (-float(z["lift"]), -int(z["_single_pos_hits"]), int(z["_single_mask_count"])))
         fam_top.extend(arr[: int(args.family_top_n)])
+    timing_detail2["fam_top_build_sec"] += time.perf_counter() - fam_top_build_t0
     timing_detail["ranking_context_build_sec"] += time.perf_counter() - ranking_context_t0
+    timing_detail2["rank_context_total_sec"] += timing_detail["ranking_context_build_sec"]
 
     tick_refined_mode = False
     refined_ctx = {
@@ -1489,7 +1550,10 @@ def main() -> None:
     tick_entry_cache_sig = _ctx_sig(tick_entry_cache_ctx)
     tick_refine_t0 = time.perf_counter() if (args.tick_data is not None or args.tick_entry_cache_npz is not None or (refined_out is not None and refined_out.exists())) else None
     tick_refine_total_t0 = tick_refine_t0
+    refined_resume_total_t0 = time.perf_counter()
+    refined_csv_load_t0 = time.perf_counter()
     refined_resume = _load_stage_csv_if_match(refined_out, "refined", refined_ctx_sig)
+    timing_detail2["refined_csv_load_sec"] += time.perf_counter() - refined_csv_load_t0
     if str(args.tick_refine_scope) == "fam_top":
         tick_scope_items = fam_top
     elif str(args.tick_refine_scope) == "filtered":
@@ -1512,6 +1576,7 @@ def main() -> None:
         refined_rows_with_tick = 0
         refined_rows_missing_tick = 0
         for _, r in refined_resume.iterrows():
+            refined_key_t0 = time.perf_counter()
             k = str(r.get("candidate_key_refined", "")).strip()
             col_r = str(r.get("col", ""))
             op_r = str(r.get("op", ""))
@@ -1522,10 +1587,13 @@ def main() -> None:
             it = all_by_key.get(k)
             if it is None and stable_k:
                 it = next((x for x in full_filtered_items if _stable_candidate_key(str(x["col"]), str(x["op"]), _canonicalize_candidate_value(str(x["col"]), str(x["op"]), float(x["value"]))) == stable_k), None)
+            timing_detail2["refined_key_match_sec"] += time.perf_counter() - refined_key_t0
             if it is None:
                 continue
+            refined_restore_t0 = time.perf_counter()
             req_vals = [r.get(c, np.nan) for c in req_tick_cols]
             if any(pd.isna(v) for v in req_vals):
+                timing_detail2["refined_tick_metric_restore_sec"] += time.perf_counter() - refined_restore_t0
                 refined_rows_missing_tick += 1
                 continue
             refined_rows_with_tick += 1
@@ -1541,6 +1609,7 @@ def main() -> None:
                 it["_single_ratio"] = float(it["tick_single_ratio"])
                 it["ratio"] = float(it["tick_single_ratio"])
                 it["lift"] = float(it["tick_lift"])
+            timing_detail2["refined_tick_metric_restore_sec"] += time.perf_counter() - refined_restore_t0
         tick_refined_mode = any(_has_full_tick_metrics(x) for x in by_key.values())
         print(f"[prefilter-resume] loaded refined candidates from {refined_out}")
         print(f"[prefilter-resume] refined_rows_total={refined_rows_total}")
@@ -2115,12 +2184,17 @@ def main() -> None:
         if bool(args.debug_reject_stats):
             print("[prefilter-single-rejects] " + " ".join([f"{k}={v}" for k, v in single_rejects.items()]))
 
+    search_setup_t0 = time.perf_counter()
     workers = max(1, int(os.cpu_count() or 1)) if str(args.workers).lower() == "auto" else max(1, int(args.workers))
 
     best_paths: list[dict] = []
     unlocked = 0
     prev_best = -np.inf
+    timing_detail2["search_setup_sec"] += time.perf_counter() - search_setup_t0
+    same_ref_t0 = time.perf_counter()
     same_ref = miner._build_same_reference_groups(df.iloc[:train_idx], [(str(c), ">=", 0.0) for c in cols])
+    timing_detail2["same_reference_groups_sec"] += time.perf_counter() - same_ref_t0
+    search_setup_t0 = time.perf_counter()
     reject_stats: dict[str, int] = {
         "rejected_min_pos_per_week": 0,
         "rejected_min_main_score": 0,
@@ -2131,6 +2205,7 @@ def main() -> None:
         "rejected_binary_cap": 0,
         "rejected_duplicate_mask": 0,
     }
+    timing_detail2["search_setup_sec"] += time.perf_counter() - search_setup_t0
 
     def _build_mask_from_conds(conds: list[dict]) -> np.ndarray:
         mask = np.ones(n, dtype=bool)
@@ -2478,6 +2553,8 @@ def main() -> None:
         return tuple(keys)
     if args.control_file is not None:
         _write_control_none(args.control_file)
+    phase_ab_t0 = time.perf_counter()
+    phase_b_t0 = None
     try:
         while True:
             force_phase = "A"
@@ -2501,16 +2578,23 @@ def main() -> None:
             if phase_a:
                 print("[prefilter-phase-b] started=False reason=phase_a_active")
             if (not phase_a) and phase_b_pool_key in completed_phase_b_pool_keys:
+                phase_b_skip_reason = "completed_pool_key"
                 print(f"[prefilter-phase-b] started=False reason=completed_pool_key pool_size={len(pool)}")
                 print(f"[prefilter-phase-b] skipped: completed pool key already processed. pool_size={len(pool)}")
                 force_phase = "C"
                 break
             if (not phase_a) and not valid_pool:
+                phase_b_skip_reason = "no_parent_seeds"
                 print("[prefilter-phase-b] started=False reason=no_parent_seeds")
                 print("[prefilter-phase-b] skipped: no parent seeds in valid_pool after phase A.")
                 force_phase = "C"
                 break
             if not phase_a:
+                if not phase_b_started:
+                    timing_detail2["phase_a_total_sec"] += time.perf_counter() - phase_ab_t0
+                    phase_b_t0 = time.perf_counter()
+                phase_b_started = True
+                phase_b_skip_reason = "started"
                 print(f"[prefilter-phase-b] started=True pool_size={len(pool)} parent_seeds={len(valid_pool)}")
             shard_specs: list[tuple[int, int, int, int]] = []
             batch_eff = max(256, int(args.batch_size))
@@ -2554,6 +2638,9 @@ def main() -> None:
             combos_total_parent_extensions = int(len(mut_combos)) if phase_a else -1
             combos_total = int(combos_total_free + combos_total_parent_extensions) if phase_a else -1
             if phase_a:
+                phase_timing_counts["phase_a_parent_extensions_total"] += int(len(mut_combos))
+                if mut_combos:
+                    phase_timing_counts["phase_a_parent_extensions_rounds"] += 1
                 print(
                     f"[prefilter-phase-ab-detail] round={unlocked_next} phase=A "
                     f"pool_size={len(pool)} combos_total_free={combos_total_free} "
@@ -2599,6 +2686,7 @@ def main() -> None:
                             mut_combos.extend(refill)
                 else:
                     combos_par = list(itertools.islice(parent_ext_iter, batch_eff)) if parent_ext_iter is not None else []
+                    phase_timing_counts["phase_b_parent_extensions_total"] += int(len(combos_par))
                     combos = [x[0] for x in combos_par]
                     parents = [x[1] for x in combos_par]
                     if not combos:
@@ -2749,8 +2837,15 @@ def main() -> None:
     except KeyboardInterrupt:
         print("[prefilter] interrupted; checkpoint saved.")
         _save_progress(valid_pool, progress_state)
+    if phase_b_started and phase_b_t0 is not None:
+        timing_detail2["phase_b_total_sec"] += time.perf_counter() - phase_b_t0
+    else:
+        timing_detail2["phase_a_total_sec"] += time.perf_counter() - phase_ab_t0
+        if phase_b_skip_reason == "not_reached":
+            phase_b_skip_reason = "phase_a_or_direct_to_c"
 
     # Phase C: family-top-pool beam search
+    phase_c_t0 = time.perf_counter()
     pool_c = _build_unlocked_pool(
         miner_mod=miner,
         rank_lists=[rank_lift],
@@ -2849,8 +2944,10 @@ def main() -> None:
             elif cmd == "enable_early_stop":
                 print("[prefilter-control] enable_early_stop"); args.early_stop_window_combos = int(original_early_stop_window_combos); _write_control_none(args.control_file)
         print("[prefilter-phase-c] done")
+    timing_detail2["phase_c_total_sec"] += time.perf_counter() - phase_c_t0
 
     # Phase D: full tick beam search
+    phase_d_t0 = time.perf_counter()
     d_valid_pool: list[dict] = []
     if stop_after_batch_requested:
         print("[prefilter-phase-d] skipped: stop_after_batch requested before phase D")
@@ -2984,7 +3081,9 @@ def main() -> None:
                 if _phase_d_control():
                     break
             print("[prefilter-phase-d] done")
+    timing_detail2["phase_d_total_sec"] += time.perf_counter() - phase_d_t0
 
+    rules_export_t0 = time.perf_counter()
     non_d_pool = [r for r in valid_pool if str(r.get("search_source", "")) != "D"]
     d_pool = [r for r in d_valid_pool if str(r.get("search_source", "")) == "D"] + [r for r in valid_pool if str(r.get("search_source", "")) == "D"]
 
@@ -3136,6 +3235,59 @@ def main() -> None:
         _atomic_write_csv(args.out_rules_csv, pd.DataFrame(rows))
     else:
         _atomic_write_csv(args.out_rules_csv, pd.DataFrame(columns=csv_columns))
+    timing_detail2["rules_export_sec"] += time.perf_counter() - rules_export_t0
+    timing_grand_total_sec = time.perf_counter() - main_t0
+    timing_known_sum_sec = (
+        float(timing.get("load_features_sec", 0.0))
+        + float(timing.get("load_binned_features_sec", 0.0))
+        + float(timing.get("load_binned_metadata_sec", 0.0))
+        + float(timing.get("simulate_labels_sec", 0.0))
+        + float(timing.get("build_candidate_features_sec", 0.0))
+        + float(timing_detail.get("ranking_total_sec", 0.0))
+        + float(timing_detail2.get("same_reference_groups_sec", 0.0))
+        + float(timing_detail2.get("search_setup_sec", 0.0))
+        + float(timing_detail2.get("phase_a_total_sec", 0.0))
+        + float(timing_detail2.get("phase_b_total_sec", 0.0))
+        + float(timing_detail2.get("phase_c_total_sec", 0.0))
+        + float(timing_detail2.get("phase_d_total_sec", 0.0))
+        + float(timing_detail2.get("rules_export_sec", 0.0))
+    )
+    timing_global_unaccounted_sec = timing_grand_total_sec - timing_known_sum_sec
+    if bool(args.debug_timing_breakdown):
+        print(
+            "[prefilter-timing-detail-2] "
+            f"coarse_resume_total_sec={timing_detail2['coarse_resume_total_sec']:.3f} "
+            f"coarse_csv_load_sec={timing_detail2['coarse_csv_load_sec']:.3f} "
+            f"coarse_rows_filter_sec={timing_detail2['coarse_rows_filter_sec']:.3f} "
+            f"coarse_reconstruct_candidates_sec={timing_detail2['coarse_reconstruct_candidates_sec']:.3f} "
+            f"refined_resume_total_sec={timing_detail2['refined_resume_total_sec']:.3f} "
+            f"refined_csv_load_sec={timing_detail2['refined_csv_load_sec']:.3f} "
+            f"refined_key_match_sec={timing_detail2['refined_key_match_sec']:.3f} "
+            f"refined_tick_metric_restore_sec={timing_detail2['refined_tick_metric_restore_sec']:.3f} "
+            f"quantile_thresholds_sec={timing_detail2['quantile_thresholds_sec']:.3f} "
+            f"build_items_total_sec={timing_detail2['build_items_total_sec']:.3f} "
+            f"build_items_candidate_loop_sec={timing_detail2['build_items_candidate_loop_sec']:.3f} "
+            f"build_items_mask_sec={timing_detail2['build_items_mask_sec']:.3f} "
+            f"build_items_metadata_sec={timing_detail2['build_items_metadata_sec']:.3f} "
+            f"filtered_items_build_sec={timing_detail2['filtered_items_build_sec']:.3f} "
+            f"fam_top_build_sec={timing_detail2['fam_top_build_sec']:.3f} "
+            f"rank_context_total_sec={timing_detail2['rank_context_total_sec']:.3f} "
+            f"same_reference_groups_sec={timing_detail2['same_reference_groups_sec']:.3f} "
+            f"search_setup_sec={timing_detail2['search_setup_sec']:.3f} "
+            f"phase_a_total_sec={timing_detail2['phase_a_total_sec']:.3f} "
+            f"phase_b_total_sec={timing_detail2['phase_b_total_sec']:.3f} "
+            f"phase_b_started={bool(phase_b_started)} "
+            f"phase_b_skip_reason={phase_b_skip_reason} "
+            f"phase_a_parent_extensions_total={phase_timing_counts['phase_a_parent_extensions_total']} "
+            f"phase_a_parent_extensions_rounds={phase_timing_counts['phase_a_parent_extensions_rounds']} "
+            f"phase_b_parent_extensions_total={phase_timing_counts['phase_b_parent_extensions_total']} "
+            f"phase_c_total_sec={timing_detail2['phase_c_total_sec']:.3f} "
+            f"phase_d_total_sec={timing_detail2['phase_d_total_sec']:.3f} "
+            f"rules_export_sec={timing_detail2['rules_export_sec']:.3f} "
+            f"timing_grand_total_sec={timing_grand_total_sec:.3f} "
+            f"timing_known_sum_sec={timing_known_sum_sec:.3f} "
+            f"timing_global_unaccounted_sec={timing_global_unaccounted_sec:.3f}"
+        )
     if bool(args.debug_reject_stats):
         print("[prefilter-reject-stats-total] " + " ".join([f"{k}={v}" for k, v in reject_stats.items()]))
     print(f"Saved {len(rows)} rules -> {args.out_rules_json} and {args.out_rules_csv}")
