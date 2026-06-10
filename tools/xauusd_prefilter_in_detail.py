@@ -2162,6 +2162,7 @@ def main() -> None:
     timing_detail2["same_reference_groups_sec"] += time.perf_counter() - same_ref_t0
     search_setup_t0 = time.perf_counter()
     reject_stats: dict[str, int] = {
+        "rejected_pre_min_pos_per_week": 0,
         "rejected_min_pos_per_week": 0,
         "rejected_min_main_score": 0,
         "rejected_same_parent_mask": 0,
@@ -2202,12 +2203,20 @@ def main() -> None:
         return mask
 
     def _score_from_mask(mask: np.ndarray, only_lower_entry: bool | None = None, enforce_filters: bool = True) -> dict | None:
+        days = max(1.0, float((df.index[train_idx - 1] - df.index[0]).total_seconds() / 86400.0))
+        weeks = days / 7.0
+        if enforce_filters:
+            raw = np.asarray(mask, dtype=bool)
+            raw_train = raw[:train_idx] & tradable_train
+            raw_pos_hits = int(np.sum(raw_train & (y_train == 1)))
+            if raw_pos_hits < float(args.min_pos_per_week) * weeks:
+                if bool(args.debug_reject_stats):
+                    reject_stats["rejected_pre_min_pos_per_week"] += 1
+                return None
         selected_mask, raw_evaluable, clusters_count = _select_entries_for_mask(mask, y, t_exit, only_lower_entry=only_lower_entry)
         mt = selected_mask[:train_idx] & tradable_train
         pos_hits = int(np.sum(mt & (y_train == 1)))
         neg_hits = int(np.sum(mt & (y_train == 0)))
-        days = max(1.0, float((df.index[train_idx - 1] - df.index[0]).total_seconds() / 86400.0))
-        weeks = days / 7.0
         if enforce_filters and pos_hits < float(args.min_pos_per_week) * weeks:
             if bool(args.debug_reject_stats):
                 reject_stats["rejected_min_pos_per_week"] += 1
