@@ -1198,6 +1198,12 @@ def main() -> None:
     y_test = y[train_idx:]
     tradable_train = ((y_train == 0) | (y_train == 1))
     tradable_test = ((y_test == 0) | (y_test == 1))
+    score_y = np.asarray(y).copy()
+    score_t_exit = np.asarray(t_exit).copy()
+    score_pnl = np.asarray(pnl).copy()
+    score_tp_hits = np.asarray(tp_hits).copy()
+    score_t_qual = np.asarray(t_qual).copy()
+    score_tick_source_map: dict[int, dict] = {}
     period_end_indices = np.where(np.arange(n) < train_idx, train_idx - 1, n - 1).astype(np.int64)
 
     def _exit_abs_idx(entry_idx: int, exit_rel: int) -> int:
@@ -1707,6 +1713,7 @@ def main() -> None:
         timing_counts["tick_cache_loaded_entries_count"] = int(len(cached_entries))
         cached_present = {int(k) for k in cached_entries.keys() if int(k) in entry_index_set}
         tick_map: dict[int, dict] = {int(i): cached_entries[int(i)] for i in cached_present if int(i) in cached_entries}
+        score_tick_source_map = tick_map
 
         def _is_structurally_invalid_entry(ii: int) -> bool:
             if ii < 0 or ii >= n:
@@ -2142,6 +2149,53 @@ def main() -> None:
             "tick-data is configured and tick_refine_scope is non-empty, but tick_candidates_with_metrics=0. "
             "Run aborted to avoid silently continuing with coarse/OHLC-only behavior."
         )
+
+    score_tick_overrides = 0
+    score_tick_invalid = 0
+    for idx_i, rec in score_tick_source_map.items():
+        try:
+            ii = int(idx_i)
+            tick_y = int(rec.get("y", -1))
+            tick_pnl = float(rec.get("pnl", float("nan")))
+            tick_t_exit = int(rec.get("t_exit", -1))
+            tick_tp_hits = int(rec.get("tp_hits", -1))
+            if "t_qual" not in rec:
+                raise ValueError("missing tick_t_qual")
+            tick_t_qual = int(rec.get("t_qual", -2))
+        except Exception:
+            score_tick_invalid += 1
+            continue
+        tick_record_valid = (
+            0 <= ii < n
+            and tick_y in (0, 1)
+            and np.isfinite(tick_pnl)
+            and 1 <= tick_t_exit <= int(args.hold)
+            and tick_tp_hits >= 0
+            and -1 <= tick_t_qual <= int(args.hold)
+        )
+        if not tick_record_valid:
+            score_tick_invalid += 1
+            continue
+        score_y[ii] = tick_y
+        score_pnl[ii] = tick_pnl
+        score_t_exit[ii] = tick_t_exit
+        score_tp_hits[ii] = tick_tp_hits
+        score_t_qual[ii] = tick_t_qual
+        score_tick_overrides += 1
+    score_y_train = score_y[:train_idx]
+    score_y_test = score_y[train_idx:]
+    score_tradable_train = ((score_y_train == 0) | (score_y_train == 1))
+    score_tradable_test = ((score_y_test == 0) | (score_y_test == 1))
+    score_basis = "mixed_tick_labelcache" if score_tick_overrides > 0 else "labelcache"
+    score_tick_override_share = float(score_tick_overrides / max(1, n))
+    print(
+        "[prefilter-score-basis] "
+        f"score_basis={score_basis} "
+        f"score_tick_overrides={score_tick_overrides} "
+        f"score_tick_invalid={score_tick_invalid} "
+        f"score_tick_override_share={score_tick_override_share:.6f}"
+    )
+
     rank_sort_t0 = time.perf_counter()
     if tick_refined_mode:
         rank_lift = _with_rank_context(sorted(fam_top, key=lambda z: (-float(z.get("ratio", 0.0)), -int(z.get("_single_pos_hits", 0)), int(z.get("_single_mask_count", 0)))), "ratio")
@@ -2207,16 +2261,16 @@ def main() -> None:
         weeks = days / 7.0
         if enforce_filters:
             raw = np.asarray(mask, dtype=bool)
-            raw_train = raw[:train_idx] & tradable_train
-            raw_pos_hits = int(np.sum(raw_train & (y_train == 1)))
+            raw_train = raw[:train_idx] & score_tradable_train
+            raw_pos_hits = int(np.sum(raw_train & (score_y_train == 1)))
             if raw_pos_hits < float(args.min_pos_per_week) * weeks:
                 if bool(args.debug_reject_stats):
                     reject_stats["rejected_pre_min_pos_per_week"] += 1
                 return None
-        selected_mask, raw_evaluable, clusters_count = _select_entries_for_mask(mask, y, t_exit, only_lower_entry=only_lower_entry)
-        mt = selected_mask[:train_idx] & tradable_train
-        pos_hits = int(np.sum(mt & (y_train == 1)))
-        neg_hits = int(np.sum(mt & (y_train == 0)))
+        selected_mask, raw_evaluable, clusters_count = _select_entries_for_mask(mask, score_y, score_t_exit, only_lower_entry=only_lower_entry)
+        mt = selected_mask[:train_idx] & score_tradable_train
+        pos_hits = int(np.sum(mt & (score_y_train == 1)))
+        neg_hits = int(np.sum(mt & (score_y_train == 0)))
         if enforce_filters and pos_hits < float(args.min_pos_per_week) * weeks:
             if bool(args.debug_reject_stats):
                 reject_stats["rejected_min_pos_per_week"] += 1
@@ -2226,11 +2280,11 @@ def main() -> None:
             if bool(args.debug_reject_stats):
                 reject_stats["rejected_min_main_score"] += 1
             return None
-        mt_test = selected_mask[train_idx:] & tradable_test
-        pos_test = int(np.sum(mt_test & (y_test == 1)))
-        neg_test = int(np.sum(mt_test & (y_test == 0)))
+        mt_test = selected_mask[train_idx:] & score_tradable_test
+        pos_test = int(np.sum(mt_test & (score_y_test == 1)))
+        neg_test = int(np.sum(mt_test & (score_y_test == 0)))
         ratio_test = pos_test / max(1, neg_test)
-        wf_mean, wf_min, wf_hits = _calc_wf(mt_test, y_test, int(args.wf_folds))
+        wf_mean, wf_min, wf_hits = _calc_wf(mt_test, score_y_test, int(args.wf_folds))
         precision = pos_hits / max(1, (pos_hits + neg_hits))
         selected_evaluable = int(pos_hits + neg_hits + pos_test + neg_test)
         return {
