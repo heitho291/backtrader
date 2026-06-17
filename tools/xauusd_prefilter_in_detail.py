@@ -1057,6 +1057,149 @@ def _build_or_load_askbid_m1(
     )
 
 
+def _valid_price(value) -> bool:
+    try:
+        x = float(value)
+    except Exception:
+        return False
+    return bool(np.isfinite(x) and x > 0.0)
+
+
+def _simulate_multitp_trailing_askbid_m1(
+    *,
+    ask_entry_latency: np.ndarray,
+    bid_high_after_entry_latency: np.ndarray,
+    bid_low_after_entry_latency: np.ndarray,
+    bid_high: np.ndarray,
+    bid_low: np.ndarray,
+    bid_close: np.ndarray,
+    tps: list[float],
+    tp_w: np.ndarray,
+    tp_enabled: bool,
+    sl: float,
+    hold: int,
+    slippage_bps: float,
+    trail: bool,
+    trail_activate: float,
+    trail_offset: float,
+    trail_factor: float,
+    include_unrealized_at_test_end: bool,
+    period_end_indices: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    n = int(len(ask_entry_latency))
+    pnl = np.full(n, np.nan, dtype=np.float64)
+    y = np.full(n, -1, dtype=np.int8)
+    t_exit = np.full(n, -1, dtype=np.int32)
+    t_qual = np.full(n, -1, dtype=np.int32)
+    tp_hits = np.zeros(n, dtype=np.int8)
+
+    slip = float(slippage_bps) / 10000.0
+    tps_arr = np.asarray(tps, dtype=np.float64)
+    tp_w_arr = np.asarray(tp_w, dtype=np.float64)
+    k_max = int(len(tps_arr))
+
+    for i in range(max(0, n - 1)):
+        entry_i = i + 1
+        if entry_i >= n:
+            continue
+        entry_ask = float(ask_entry_latency[entry_i])
+        if not _valid_price(entry_ask):
+            continue
+        entry = entry_ask * (1.0 + slip)
+        if not _valid_price(entry):
+            continue
+
+        stop_ret = -float(sl)
+        stop_level = entry * (1.0 + stop_ret)
+        tp_levels = entry * (1.0 + tps_arr)
+
+        remaining = 1.0
+        realized = 0.0
+        hits = 0
+        max_profit_ret = 0.0
+        trailing_active = (not bool(trail))
+
+        period_end = int(period_end_indices[i]) if period_end_indices is not None else (n - 1)
+        period_end = max(i, min(period_end, n - 1))
+        max_k = min(period_end - i, max(1, int(hold)))
+        if max_k <= 0:
+            continue
+        hold_reached = (i + max(1, int(hold))) <= period_end
+        qualified = False
+        invalid_data = False
+
+        for k in range(1, max_k + 1):
+            j = i + k
+            if j == entry_i:
+                h = float(bid_high_after_entry_latency[j])
+                l = float(bid_low_after_entry_latency[j])
+            else:
+                h = float(bid_high[j])
+                l = float(bid_low[j])
+            if not (_valid_price(h) and _valid_price(l)):
+                invalid_data = True
+                break
+
+            curr_profit_ret = (h / entry) - 1.0
+            if curr_profit_ret > max_profit_ret:
+                max_profit_ret = curr_profit_ret
+
+            if trail and (not trailing_active) and max_profit_ret >= float(trail_activate):
+                trailing_active = True
+
+            if trail and trailing_active:
+                cand = (max_profit_ret - float(trail_offset)) * float(trail_factor)
+                if cand > stop_ret:
+                    stop_ret = cand
+                    stop_level = entry * (1.0 + stop_ret)
+
+            if (not qualified) and trail and k <= int(hold) and max_profit_ret >= float(trail_activate):
+                qualified = True
+                t_qual[i] = k
+
+            if l <= stop_level:
+                realized += remaining * stop_ret
+                pnl[i] = realized
+                y[i] = 1 if qualified else (1 if realized > 0 else 0)
+                t_exit[i] = k
+                tp_hits[i] = hits
+                break
+
+            if tp_enabled and hits < k_max and h >= tp_levels[hits]:
+                w = min(float(tp_w_arr[hits]), remaining)
+                if w > 0:
+                    realized += w * float(tps_arr[hits])
+                    remaining -= w
+                hits += 1
+                if remaining <= 1e-12:
+                    pnl[i] = realized
+                    y[i] = 1 if qualified else (1 if realized > 0 else 0)
+                    t_exit[i] = k
+                    tp_hits[i] = hits
+                    break
+
+        if invalid_data:
+            continue
+
+        if y[i] == -1:
+            if hold_reached or include_unrealized_at_test_end:
+                j_end = i + max_k
+                if trail and trailing_active:
+                    endpoint_ret = float(stop_ret)
+                else:
+                    endpoint_close = float(bid_close[j_end])
+                    if not _valid_price(endpoint_close):
+                        continue
+                    endpoint_ret = (endpoint_close / entry) - 1.0
+                final_pnl = realized + remaining * endpoint_ret
+                pnl[i] = final_pnl
+                y[i] = 1 if qualified else (1 if final_pnl > 0 else 0)
+                t_exit[i] = max_k
+                tp_hits[i] = hits
+
+    return pnl, y, t_exit, t_qual, tp_hits
+
+
 def _critical_minutes_for_entries(
     entry_indices: np.ndarray,
     high: np.ndarray,
@@ -1535,20 +1678,20 @@ def main() -> None:
     close = df["close"].to_numpy(dtype=np.float32, copy=False)
     bar_time_ns = _datetime_index_to_minute_ns(df.index)
 
-    askbid_m1_arrays = None
-    if args.askbid_m1_parquet is not None:
-        askbid_m1_arrays = _build_or_load_askbid_m1(
-            path=args.askbid_m1_parquet,
-            feature_index=df.index,
-            entry_latency_ms=int(args.entry_latency_ms),
-            tick_source_path=args.tick_data,
-            tick_datetime_column=args.tick_datetime_column,
-            tick_sep=args.tick_sep,
-        )
-        print(
-            "[prefilter-askbid-m1] "
-            f"status=loaded_not_used_until_patch_b arrays={len(askbid_m1_arrays)}"
-        )
+    if args.askbid_m1_parquet is None:
+        raise ValueError("--askbid-m1-parquet is required for Prefilter labels/outcomes; old OHLC label simulation is disabled")
+    askbid_m1_arrays = _build_or_load_askbid_m1(
+        path=args.askbid_m1_parquet,
+        feature_index=df.index,
+        entry_latency_ms=int(args.entry_latency_ms),
+        tick_source_path=args.tick_data,
+        tick_datetime_column=args.tick_datetime_column,
+        tick_sep=args.tick_sep,
+    )
+    print(
+        "[prefilter-askbid-m1] "
+        f"status=active_label_outcome_basis arrays={len(askbid_m1_arrays)}"
+    )
 
     tick_prices_all = None
     tick_minute_bounds = None
@@ -1575,6 +1718,17 @@ def main() -> None:
 
     cache_key_obj = {
         "features_sig": _file_sig(args.features),
+        "price_basis": "askbid_m1",
+        "askbid_m1_sig": _file_sig(args.askbid_m1_parquet),
+        "askbid_m1_semantics": ASKBID_M1_SEMANTICS,
+        "entry_latency_ms": int(args.entry_latency_ms),
+        "entry_indexing": "entry_i_to_minute_i_plus_1",
+        "spread_handling": "ask_contains_spread_spread_bps_not_added",
+        "slippage_handling": "ask_entry_latency_times_1_plus_slippage_bps",
+        "exit_price_basis": "bid",
+        "entry_minute_exit_bounds": "bid_high_low_after_entry_latency",
+        "following_minute_exit_bounds": "bid_high_low",
+        "endpoint_price_basis": "bid_close",
         "tps": [float(x) for x in tps],
         "tp_weights": [float(x) for x in tp_w.tolist()],
         "tp_mode": str(tp_mode),
@@ -1612,26 +1766,24 @@ def main() -> None:
             print(f"[prefilter-cache] failed to load cache: {e}")
     t0 = time.perf_counter()
     if not loaded_cache:
-        pnl, y, t_exit, t_qual, tp_hits = miner.simulate_multitp_trailing_pessimistic(
-            high=high,
-            low=low,
-            close=close,
+        pnl, y, t_exit, t_qual, tp_hits = _simulate_multitp_trailing_askbid_m1(
+            ask_entry_latency=askbid_m1_arrays["ask_entry_latency"],
+            bid_high_after_entry_latency=askbid_m1_arrays["bid_high_after_entry_latency"],
+            bid_low_after_entry_latency=askbid_m1_arrays["bid_low_after_entry_latency"],
+            bid_high=askbid_m1_arrays["bid_high"],
+            bid_low=askbid_m1_arrays["bid_low"],
+            bid_close=askbid_m1_arrays["bid_close"],
             tps=tps,
             tp_w=tp_w,
             tp_enabled=bool(tp_enabled),
             sl=float(args.sl),
             hold=int(args.hold),
             slippage_bps=float(args.slippage_bps),
-            spread_bps=float(args.spread_bps),
             trail=bool(args.trail),
             trail_activate=float(args.trail_activate),
             trail_offset=float(args.trail_offset),
             trail_factor=float(args.trail_factor),
-            trail_min_level=float(args.trail_min_level),
             include_unrealized_at_test_end=bool(args.include_unrealized_at_test_end),
-            bar_time_ns=bar_time_ns,
-            tick_prices_all=None,
-            tick_minute_bounds=None,
             period_end_indices=np.where(np.arange(n) < train_idx, train_idx - 1, n - 1).astype(np.int64),
         )
         if args.label_cache_npz is not None:
@@ -1737,6 +1889,10 @@ def main() -> None:
     allow_keys, allow_keys_refined = _load_allowlist(args.include_candidates_file)
     coarse_ctx = {
         "features_sig": _file_sig(args.features),
+        "price_basis": "askbid_m1",
+        "askbid_m1_sig": _file_sig(args.askbid_m1_parquet),
+        "entry_latency_ms": int(args.entry_latency_ms),
+        "askbid_m1_semantics": ASKBID_M1_SEMANTICS,
         "binned_sig": _file_sig(args.binned_features),
         "meta_sig": _file_sig(args.binned_metadata),
         "label_cache_key": cache_key,
@@ -2006,6 +2162,7 @@ def main() -> None:
         fam_top.extend(arr[: int(args.family_top_n)])
     family_top_elapsed = time.perf_counter() - fam_top_build_t0
     timing_detail2["family_top_sec"] += family_top_elapsed
+    legacy_tick_refine_enabled = False
     tick_refined_mode = False
     refined_ctx = {
         **coarse_ctx,
@@ -2121,7 +2278,7 @@ def main() -> None:
     timing_detail["tick_missing_metrics_scan_sec"] += time.perf_counter() - missing_metrics_scan_t0
     if args.tick_entry_cache_npz is None and refined_resume is not None and not tick_missing_items and any(_has_full_tick_metrics(it) for it in tick_scope_items):
         print("[prefilter-tick] warning: using tick_lift from refined CSV; without --tick-entry-cache-npz it cannot be exactly rebaselined to the current tick_refine_scope.")
-    if (args.tick_data is not None or args.tick_entry_cache_npz is not None) and len(tick_scope_items) > 0 and (tick_missing_items or args.tick_entry_cache_npz is not None):
+    if legacy_tick_refine_enabled and (args.tick_data is not None or args.tick_entry_cache_npz is not None) and len(tick_scope_items) > 0 and (tick_missing_items or args.tick_entry_cache_npz is not None):
         print(f"[prefilter-tick] tick_refine_scope={args.tick_refine_scope}")
         print(f"[prefilter-tick] tick_refine_candidates_count={len(tick_scope_items)}")
         print(f"[prefilter-tick] tick_refine_missing_to_compute={len(tick_missing_items)}")
@@ -2421,11 +2578,11 @@ def main() -> None:
                 print("[prefilter-tick-cache] warning: some current-scope entries are missing tick cache results; affected candidates remain missing.")
             timing_detail["tick_candidate_metrics_sec"] += time.perf_counter() - candidate_metrics_t0
             print(f"[prefilter] tick-refined {args.tick_refine_scope} scope on {len(entry_indices)} union entry rows.")
-    elif args.tick_data is not None and len(tick_scope_items) > 0:
+    elif legacy_tick_refine_enabled and args.tick_data is not None and len(tick_scope_items) > 0:
         print(f"[prefilter-tick] tick_refine_scope={args.tick_refine_scope}")
         print(f"[prefilter-tick] tick_refine_candidates_count={len(tick_scope_items)}")
         print("[prefilter-tick] all requested candidates already have full tick metrics")
-    elif args.tick_data is not None:
+    elif legacy_tick_refine_enabled and args.tick_data is not None:
         print(f"[prefilter-tick] skipped: tick_refine_scope={args.tick_refine_scope} produced empty candidate scope")
     wrote_coarse = False
     wrote_refined = False
@@ -2603,7 +2760,7 @@ def main() -> None:
     print(f"[prefilter-tick] tick_candidates_with_metrics={tick_candidates_with_metrics}")
     print(f"[prefilter-tick] tick_candidates_missing_metrics={tick_candidates_missing_metrics}")
     print(f"[prefilter-tick] tick_candidates_used_for_phase_d={len(phase_d_pool_base)}")
-    if args.tick_data is not None and len(tick_scope_items) > 0 and int(tick_candidates_with_metrics) <= 0:
+    if legacy_tick_refine_enabled and args.tick_data is not None and len(tick_scope_items) > 0 and int(tick_candidates_with_metrics) <= 0:
         raise ValueError(
             "tick-data is configured and tick_refine_scope is non-empty, but tick_candidates_with_metrics=0. "
             "Run aborted to avoid silently continuing with coarse/OHLC-only behavior."
@@ -2645,7 +2802,7 @@ def main() -> None:
     score_y_test = score_y[train_idx:]
     score_tradable_train = ((score_y_train == 0) | (score_y_train == 1))
     score_tradable_test = ((score_y_test == 0) | (score_y_test == 1))
-    score_basis = "mixed_tick_labelcache" if score_tick_overrides > 0 else "labelcache"
+    score_basis = "mixed_legacy_tick_askbid_m1" if score_tick_overrides > 0 else "askbid_m1"
     score_tick_override_share = float(score_tick_overrides / max(1, n))
     print(
         "[prefilter-score-basis] "
