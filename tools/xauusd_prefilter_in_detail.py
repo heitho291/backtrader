@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Standalone in-detail prefilter combinatorial search.
 
-Builds labels via TP/SL/Hold/Trail simulation directly from features OHLC,
-then searches complete rule combinations (no greedy extension) over unlocked pools.
+Uses feature and binned-feature files for feature/mask construction, builds labels
+from AskBid-M1 entry/exit prices, then searches complete rule combinations.
 """
 
 from __future__ import annotations
@@ -828,6 +828,7 @@ def _build_askbid_m1_frame(
     max_carry_ns = int(ASKBID_M1_MAX_CARRY_GAP_MINUTES) * NS_PER_MINUTE
     rows: list[dict] = []
     allowed_feature_gaps = 0
+    session_open_from_first_tick_count = 0
     missing_price_minutes: list[int] = []
     tick_pos = 0
     last_bid = float("nan")
@@ -856,6 +857,10 @@ def _build_askbid_m1_frame(
         elif carry_valid:
             ask_open = float(last_ask)
             bid_open = float(last_bid)
+        elif start < end:
+            ask_open = float(ask[start])
+            bid_open = float(bid[start])
+            session_open_from_first_tick_count += 1
         else:
             missing_price_minutes.append(minute_ns)
             tick_pos = end
@@ -922,7 +927,10 @@ def _build_askbid_m1_frame(
             "This usually indicates Feature-DF minutes inside an offmarket/data gap or missing initial quote."
         )
     frame = pd.DataFrame(rows, columns=ASKBID_M1_COLUMNS)
-    return frame, {"allowed_feature_gaps": int(allowed_feature_gaps)}
+    return frame, {
+        "allowed_feature_gaps": int(allowed_feature_gaps),
+        "session_open_from_first_tick_count": int(session_open_from_first_tick_count),
+    }
 
 
 def _validate_askbid_m1_frame(
@@ -1047,6 +1055,7 @@ def _build_or_load_askbid_m1(
         f"build=done path={path} rows={len(frame)} "
         f"feature_minutes={len(feature_minute_ns)} covered_feature_minutes={len(frame)} "
         f"allowed_offmarket_gaps={int(build_stats.get('allowed_feature_gaps', 0))} "
+        f"session_open_from_first_tick_count={int(build_stats.get('session_open_from_first_tick_count', 0))} "
         f"entry_latency_ms={int(entry_latency_ms)}"
     )
     return _load_askbid_m1_arrays(
@@ -1692,6 +1701,13 @@ def main() -> None:
         "[prefilter-askbid-m1] "
         f"status=active_label_outcome_basis arrays={len(askbid_m1_arrays)}"
     )
+    selection_entry_price = np.full(n, np.nan, dtype=np.float64)
+    if n > 1:
+        ask_entry_for_selection = np.asarray(askbid_m1_arrays["ask_entry_latency"], dtype=np.float64)
+        valid_entry = np.isfinite(ask_entry_for_selection[1:]) & (ask_entry_for_selection[1:] > 0.0)
+        selection_entry_price[np.flatnonzero(valid_entry)] = (
+            ask_entry_for_selection[1:][valid_entry] * (1.0 + float(args.slippage_bps) / 10000.0)
+        )
 
     tick_prices_all = None
     tick_minute_bounds = None
@@ -1847,7 +1863,7 @@ def main() -> None:
         open_trades: list[int] = []
         prev_idx: int | None = None
         entries_in_cluster = 0
-        cluster_min_close = float("nan")
+        cluster_min_entry_price = float("nan")
         selected_cluster_ids: set[int] = set()
         cluster_id = -1
 
@@ -1862,16 +1878,19 @@ def main() -> None:
             if new_cluster:
                 cluster_id += 1
                 entries_in_cluster = 0
-                cluster_min_close = float("nan")
+                cluster_min_entry_price = float("nan")
             prev_idx = i
 
             open_trades = [x for x in open_trades if int(x) > i]
             if entries_in_cluster >= int(args.max_entries_per_cluster):
                 continue
-            if use_lower and entries_in_cluster > 0:
-                c = float(close[i])
-                if (not np.isfinite(c)) or (not np.isfinite(cluster_min_close)) or not (c < cluster_min_close):
+            entry_price_i = float(selection_entry_price[i]) if i < len(selection_entry_price) else float("nan")
+            if use_lower:
+                if not np.isfinite(entry_price_i):
                     continue
+                if entries_in_cluster > 0:
+                    if (not np.isfinite(cluster_min_entry_price)) or not (entry_price_i < cluster_min_entry_price):
+                        continue
             if len(open_trades) >= int(args.max_open_trades):
                 continue
 
@@ -1879,9 +1898,8 @@ def main() -> None:
             selected[i] = True
             entries_in_cluster += 1
             selected_cluster_ids.add(int(cluster_id))
-            c = float(close[i])
-            if np.isfinite(c):
-                cluster_min_close = c if not np.isfinite(cluster_min_close) else min(cluster_min_close, c)
+            if np.isfinite(entry_price_i):
+                cluster_min_entry_price = entry_price_i if not np.isfinite(cluster_min_entry_price) else min(cluster_min_entry_price, entry_price_i)
             open_trades.append(int(exit_idx))
         return selected, int(raw_idxs.size), int(len(selected_cluster_ids))
 
