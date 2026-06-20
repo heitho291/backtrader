@@ -277,7 +277,7 @@ def _atomic_write_npz(path: Path, **arrays) -> None:
                 pass
 
 
-TICK_ENTRY_CACHE_SEMANTICS_VERSION = "tick_entry_cache_askbid_m1_critical_replay_v1"
+TICK_ENTRY_CACHE_SEMANTICS_VERSION = "tick_entry_cache_askbid_m1_critical_replay_c1_tp_weights_trail_order_v1"
 
 
 def _load_tick_entry_cache(path: Path | None, cache_key: str) -> dict[int, dict] | None:
@@ -1223,6 +1223,7 @@ def _critical_minutes_for_entries_askbid_m1(
     trail_offset: float,
     trail_factor: float,
     tps: np.ndarray,
+    tp_w: np.ndarray,
     sl: float,
     period_end_indices: np.ndarray | None,
 ) -> dict[int, set[int]]:
@@ -1235,7 +1236,9 @@ def _critical_minutes_for_entries_askbid_m1(
     bid_low = np.asarray(askbid_m1_arrays["bid_low"], dtype=np.float64)
     entries = np.asarray(selection_entry_price, dtype=np.float64)
     tps_arr = np.asarray(tps, dtype=np.float64)
+    tp_w_arr = np.asarray(tp_w, dtype=np.float64)
     n = int(len(entries))
+    eps = 1e-12
     for idx_i in entry_indices.tolist():
         i = int(idx_i)
         entry_i = i + 1
@@ -1247,6 +1250,8 @@ def _critical_minutes_for_entries_askbid_m1(
         stop_ret = -float(sl)
         stop_level = entry * (1.0 + stop_ret)
         tp_levels = entry * (1.0 + tps_arr)
+        remaining = 1.0
+        realized = 0.0
         hits = 0
         max_profit_ret = 0.0
         trailing_active = (not bool(trail))
@@ -1267,21 +1272,32 @@ def _critical_minutes_for_entries_askbid_m1(
             if not (_valid_price(bar_bid_high) and _valid_price(bar_bid_low)):
                 continue
             curr_profit_ret = (bar_bid_high / entry) - 1.0
-            trail_can_activate = bool(trail and (not trailing_active) and curr_profit_ret >= float(trail_activate))
-            stop_hit = bool(bar_bid_low <= stop_level)
+            max_profit_after_bar = max(max_profit_ret, curr_profit_ret)
+            current_stop_hit = bool(bar_bid_low <= stop_level)
             tp_hit = bool(tp_enabled and hits < len(tp_levels) and bar_bid_high >= tp_levels[hits])
-            event_count = int(stop_hit) + int(tp_hit) + int(trail_can_activate)
+            candidate_stop_ret = float(stop_ret)
             if trail:
-                is_critical = bool(trail_can_activate or event_count >= 2)
-            else:
-                is_critical = bool(stop_hit and tp_hit)
+                trail_can_be_active_after_bar = bool(trailing_active or max_profit_after_bar >= float(trail_activate))
+                if trail_can_be_active_after_bar:
+                    candidate_stop_ret = max(
+                        candidate_stop_ret,
+                        (max_profit_after_bar - float(trail_offset)) * float(trail_factor),
+                    )
+            candidate_stop_level = entry * (1.0 + candidate_stop_ret)
+            trail_stop_level_can_increase = bool(trail and candidate_stop_ret > stop_ret + eps)
+            trail_stop_order_ambiguous = bool(
+                trail
+                and trail_stop_level_can_increase
+                and bar_bid_low <= candidate_stop_level
+            )
+            is_critical = bool((tp_hit and current_stop_hit) or trail_stop_order_ambiguous)
             if is_critical:
                 crit.add(int(bar_time_ns[j]))
 
             # Keep a conservative M1 state so later minutes can be inspected with
             # approximately current TP/trailing state; replay itself is authoritative.
-            if curr_profit_ret > max_profit_ret:
-                max_profit_ret = curr_profit_ret
+            if max_profit_after_bar > max_profit_ret:
+                max_profit_ret = max_profit_after_bar
             if trail and (not trailing_active) and max_profit_ret >= float(trail_activate):
                 trailing_active = True
             if trail and trailing_active:
@@ -1289,11 +1305,15 @@ def _critical_minutes_for_entries_askbid_m1(
                 if cand > stop_ret:
                     stop_ret = cand
                     stop_level = entry * (1.0 + stop_ret)
-            if stop_hit:
+            if current_stop_hit and not is_critical:
                 break
             if tp_enabled and hits < len(tp_levels) and tp_hit:
+                w = min(float(tp_w_arr[hits]), remaining)
+                if w > 0:
+                    realized += w * float(tps_arr[hits])
+                    remaining -= w
                 hits += 1
-                if hits >= len(tp_levels):
+                if remaining <= 1e-12:
                     break
         if crit:
             critical_by_entry[i] = crit
@@ -1788,20 +1808,37 @@ def _load_askbid_tick_replay_minutes(
                 raise ValueError("AskBid tick replay requires a Bid column in tick CSV")
             dt_raw = ch[dt_col]
             date_src = None
-            for dname in ("date", "<dtyyyymmdd>", "dtyyyymmdd"):
+            time_src = None
+            date_candidates = ("date", "<date>", "<dtyyyymmdd>", "dtyyyymmdd")
+            time_candidates = ("time", "<time>", "time_msc", "timestamp_time")
+            for dname in date_candidates:
                 if dname in cols_lower and cols_lower[dname] != dt_col:
                     cand = ch[cols_lower[dname]].astype(str).str.strip()
-                    if bool((cand.str.fullmatch(r"\d{8}", na=False)).any()):
+                    if bool((cand.str.fullmatch(r"\d{8}", na=False)).any()) or bool((cand.str.fullmatch(r"\d{4}-\d{2}-\d{2}", na=False)).any()):
                         date_src = cand
+                        break
+            for tname in time_candidates:
+                if tname in cols_lower and cols_lower[tname] != dt_col:
+                    cand = ch[cols_lower[tname]].astype(str).str.strip()
+                    if bool((cand.str.fullmatch(r"\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?", na=False)).any()):
+                        time_src = cand
                         break
             if date_src is None and isinstance(ch.index, pd.Index):
                 idx_s = ch.index.to_series(index=ch.index).astype(str).str.strip()
                 if bool((idx_s.str.fullmatch(r"\d{8}", na=False)).any()):
                     date_src = idx_s
             time_s = dt_raw.astype(str).str.strip()
-            looks_time_like = bool((time_s.str.fullmatch(r"\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?", na=False)).any())
+            looks_time_like = bool((time_s.str.fullmatch(r"\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?", na=False)).any())
+            looks_date_like = bool((time_s.str.fullmatch(r"\d{8}", na=False)).any()) or bool((time_s.str.fullmatch(r"\d{4}-\d{2}-\d{2}", na=False)).any())
             if date_src is not None and looks_time_like:
                 dt_join = date_src.astype(str).str.strip() + " " + time_s
+                dt_full = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S.%f", errors="coerce", utc=True)
+                if not bool(dt_full.notna().any()):
+                    dt_full = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S", errors="coerce", utc=True)
+                if not bool(dt_full.notna().any()):
+                    dt_full = pd.to_datetime(dt_join, errors="coerce", utc=True)
+            elif looks_date_like and time_src is not None:
+                dt_join = time_s + " " + time_src.astype(str).str.strip()
                 dt_full = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S.%f", errors="coerce", utc=True)
                 if not bool(dt_full.notna().any()):
                     dt_full = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S", errors="coerce", utc=True)
@@ -2573,7 +2610,7 @@ def main() -> None:
         "askbid_m1_semantics": ASKBID_M1_SEMANTICS,
         "entry_latency_ms": int(args.entry_latency_ms),
         "tick_replay_price_basis": "askbid_m1",
-        "critical_minutes_semantics": "askbid_m1_bounds_order_ambiguity_v1",
+        "critical_minutes_semantics": "askbid_m1_bounds_order_ambiguity_tp_weights_trail_stop_order_c1_v1",
         "tick_replay_semantics": "chronological_bid_ticks_from_entry_latency_v1",
         "tick_entry_cache_semantics_version": TICK_ENTRY_CACHE_SEMANTICS_VERSION,
     }
@@ -2603,7 +2640,7 @@ def main() -> None:
         "entry_price_basis": "ask_entry_latency_plus_slippage",
         "exit_price_basis": "bid_ticks",
         "endpoint_price_basis": "bid_close",
-        "critical_minutes_semantics": "askbid_m1_bounds_order_ambiguity_v1",
+        "critical_minutes_semantics": "askbid_m1_bounds_order_ambiguity_tp_weights_trail_stop_order_c1_v1",
         "tick_replay_semantics": "chronological_bid_ticks_from_entry_latency_v1",
         "spread_handling": "ask_contains_spread_spread_bps_not_added",
         "slippage_handling": "ask_entry_latency_times_1_plus_slippage_bps",
@@ -2711,6 +2748,7 @@ def main() -> None:
             trail_offset=float(args.trail_offset),
             trail_factor=float(args.trail_factor),
             tps=np.asarray(tps, dtype=np.float64),
+            tp_w=np.asarray(tp_w, dtype=np.float64),
             sl=float(args.sl),
             period_end_indices=tick_period_end_indices,
         )
