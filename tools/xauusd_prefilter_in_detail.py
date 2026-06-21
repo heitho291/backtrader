@@ -277,7 +277,7 @@ def _atomic_write_npz(path: Path, **arrays) -> None:
                 pass
 
 
-TICK_ENTRY_CACHE_SEMANTICS_VERSION = "tick_entry_cache_askbid_m1_critical_replay_c1_tp_weights_trail_order_v1"
+TICK_ENTRY_CACHE_SEMANTICS_VERSION = "tick_entry_cache_askbid_m1_critical_replay_c1_tp_weights_trail_order_final_stop_v1"
 
 
 def _load_tick_entry_cache(path: Path | None, cache_key: str) -> dict[int, dict] | None:
@@ -1293,6 +1293,8 @@ def _critical_minutes_for_entries_askbid_m1(
             is_critical = bool((tp_hit and current_stop_hit) or trail_stop_order_ambiguous)
             if is_critical:
                 crit.add(int(bar_time_ns[j]))
+            if current_stop_hit:
+                break
 
             # Keep a conservative M1 state so later minutes can be inspected with
             # approximately current TP/trailing state; replay itself is authoritative.
@@ -1305,8 +1307,6 @@ def _critical_minutes_for_entries_askbid_m1(
                 if cand > stop_ret:
                     stop_ret = cand
                     stop_level = entry * (1.0 + stop_ret)
-            if current_stop_hit and not is_critical:
-                break
             if tp_enabled and hits < len(tp_levels) and tp_hit:
                 w = min(float(tp_w_arr[hits]), remaining)
                 if w > 0:
@@ -1506,234 +1506,6 @@ def _simulate_selected_entries_with_askbid_ticks(
         else:
             out[i] = dict(invalid_rec)
     return out
-
-
-def _load_tick_minute_map_partial(
-    path: Path,
-    datetime_col: str,
-    price_col: str,
-    sep: str,
-    minute_filter: set[int],
-    tick_chunk_size: int | str = "auto",
-) -> tuple[np.ndarray, dict[int, tuple[int, int]], np.ndarray | None, np.ndarray | None, int]:
-    if not minute_filter:
-        return np.asarray([], dtype=np.float64), {}, None, None, 0
-    if path.suffix.lower() in {".parquet", ".pq"}:
-        try:
-            import pyarrow.parquet as pa_parquet  # type: ignore
-        except Exception as exc:
-            raise RuntimeError("pyarrow is required for memory-safe tick parquet loading") from exc
-
-        cols = ["DateTime", "Bid", "Ask", "Volume"]
-        pf = pa_parquet.ParquetFile(path)
-        schema_cols = set(str(c) for c in pf.schema_arrow.names)
-        missing = set(cols) - schema_cols
-        if missing:
-            raise ValueError(f"tick parquet missing columns: {sorted(missing)}")
-
-        chunk_size_eff = 150_000 if str(tick_chunk_size).lower() == "auto" else max(10_000, int(tick_chunk_size))
-        minute_filter_arr = np.asarray(list(minute_filter), dtype=np.int64)
-        nat_ns = np.iinfo(np.int64).min
-        minute_parts: list[np.ndarray] = []
-        time_parts: list[np.ndarray] = []
-        bid_parts: list[np.ndarray] = []
-        ask_parts: list[np.ndarray] = []
-        row_order_parts: list[np.ndarray] = []
-        row_groups_total = int(pf.num_row_groups)
-        row_groups_read = 0
-        row_groups_skipped = 0
-        rows_matched = 0
-        source_row_offset = 0
-
-        for row_group_index in range(row_groups_total):
-            row_group_rows = int(pf.metadata.row_group(row_group_index).num_rows)
-            row_groups_read += 1
-            batch_offset = 0
-            for batch in pf.iter_batches(row_groups=[row_group_index], columns=cols, batch_size=chunk_size_eff):
-                batch_rows = int(batch.num_rows)
-                ch = batch.to_pandas()
-                dt_full = pd.to_datetime(ch["DateTime"], errors="coerce", utc=True)
-                bid = pd.to_numeric(ch["Bid"], errors="coerce").to_numpy(dtype=np.float64)
-                ask = pd.to_numeric(ch["Ask"], errors="coerce").to_numpy(dtype=np.float64)
-                dt_valid = dt_full.notna().to_numpy()
-                dt_ns = dt_full.astype("int64").to_numpy(dtype=np.int64)
-                minute_ns = ((dt_ns // NS_PER_MINUTE) * NS_PER_MINUTE).astype(np.int64, copy=False)
-                valid = dt_valid & (dt_ns != nat_ns) & np.isfinite(bid) & np.isfinite(ask) & (bid > 0) & (ask > 0)
-                if np.any(valid):
-                    keep = valid & np.isin(minute_ns, minute_filter_arr)
-                    if np.any(keep):
-                        keep_indices = np.flatnonzero(keep)
-                        minute_parts.append(minute_ns[keep_indices].astype(np.int64, copy=False))
-                        time_parts.append(dt_ns[keep_indices].astype(np.int64, copy=False))
-                        bid_parts.append(bid[keep_indices].astype(np.float64, copy=False))
-                        ask_parts.append(ask[keep_indices].astype(np.float64, copy=False))
-                        row_order_parts.append((source_row_offset + batch_offset + keep_indices).astype(np.int64, copy=False))
-                        rows_matched += int(len(keep_indices))
-                batch_offset += batch_rows
-            source_row_offset += row_group_rows
-
-        if not minute_parts:
-            print(
-                f"[prefilter-tick-parquet-load] row_groups_total={row_groups_total} row_groups_read={row_groups_read} "
-                f"row_groups_skipped={row_groups_skipped} rows_matched=0 matched_minutes=0",
-                flush=True,
-            )
-            return np.asarray([], dtype=np.float64), {}, None, None, 0
-
-        mins = np.concatenate(minute_parts).astype(np.int64, copy=False)
-        times = np.concatenate(time_parts).astype(np.int64, copy=False)
-        bids = np.concatenate(bid_parts).astype(np.float64, copy=False)
-        asks = np.concatenate(ask_parts).astype(np.float64, copy=False)
-        row_order = np.concatenate(row_order_parts).astype(np.int64, copy=False)
-        order = np.lexsort((row_order, times, mins))
-        mins = mins[order]
-        bids = bids[order]
-        asks = asks[order]
-        prices = bids.copy()
-        bounds: dict[int, tuple[int, int]] = {}
-        i = 0
-        while i < len(mins):
-            m = int(mins[i]); j = i + 1
-            while j < len(mins) and int(mins[j]) == m:
-                j += 1
-            bounds[m] = (i, j)
-            i = j
-        print(
-            f"[prefilter-tick-parquet-load] row_groups_total={row_groups_total} row_groups_read={row_groups_read} "
-            f"row_groups_skipped={row_groups_skipped} rows_matched={rows_matched} matched_minutes={len(bounds)}",
-            flush=True,
-        )
-        return prices, bounds, bids, asks, int(len(bounds))
-    use_price_col = None if str(price_col).lower() == "auto" else str(price_col)
-    chunk_size_eff = 150_000 if str(tick_chunk_size).lower() == "auto" else max(10_000, int(tick_chunk_size))
-    minute_filter_arr = np.asarray(list(minute_filter), dtype=np.int64)
-    minute_parts: list[np.ndarray] = []
-    time_parts: list[np.ndarray] = []
-    price_parts: list[np.ndarray] = []
-    bid_parts: list[np.ndarray] = []
-    ask_parts: list[np.ndarray] = []
-    saw_bid = False
-    saw_ask = False
-    matched_minute_set: set[int] = set()
-    for ch in pd.read_csv(path, sep=sep, chunksize=chunk_size_eff):
-        pcol = use_price_col
-        cols_lower = {str(c).lower(): str(c) for c in ch.columns}
-        dt_col = cols_lower.get(str(datetime_col).strip().lower())
-        if dt_col is None:
-            for cand in ("datetime", "time", "timestamp", "date"):
-                if cand in cols_lower:
-                    dt_col = cols_lower[cand]
-                    break
-        if dt_col is None:
-            raise ValueError(f"tick-data missing datetime column: {datetime_col}")
-        bid_col = cols_lower.get("bid")
-        ask_col = cols_lower.get("ask")
-        if pcol is None:
-            for cand in ("price", "last", "close", "mid", "bid", "ask"):
-                if cand in cols_lower:
-                    pcol = cols_lower[cand]
-                    break
-            if pcol is None:
-                raise ValueError("tick-data price column not found")
-        dt_raw = ch[dt_col]
-        date_src = None
-        for dname in ("date", "<dtyyyymmdd>", "dtyyyymmdd"):
-            if dname in cols_lower and cols_lower[dname] != dt_col:
-                cand = ch[cols_lower[dname]].astype(str).str.strip()
-                if bool((cand.str.fullmatch(r"\d{8}", na=False)).any()):
-                    date_src = cand
-                    break
-        if date_src is None and isinstance(ch.index, pd.Index):
-            idx_s = ch.index.to_series(index=ch.index).astype(str).str.strip()
-            if bool((idx_s.str.fullmatch(r"\d{8}", na=False)).any()):
-                date_src = idx_s
-        if date_src is None and len(ch.columns) > 0:
-            first_col = str(ch.columns[0])
-            if first_col != dt_col:
-                cand = ch[first_col].astype(str).str.strip()
-                if bool((cand.str.fullmatch(r"\d{8}", na=False)).any()):
-                    date_src = cand
-        time_s = dt_raw.astype(str).str.strip()
-        looks_time_like = bool((time_s.str.fullmatch(r"\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?", na=False)).any())
-        if date_src is not None and looks_time_like:
-            dt_join = date_src.astype(str).str.strip() + " " + time_s
-            dt_full = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S.%f", errors="coerce", utc=True)
-            if not bool(dt_full.notna().any()):
-                dt_full = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S", errors="coerce", utc=True)
-            if not bool(dt_full.notna().any()):
-                dt_full = pd.to_datetime(dt_join, errors="coerce", utc=True)
-        else:
-            dt_full = pd.to_datetime(dt_raw, errors="coerce", utc=True)
-        if bool(dt_full.notna().any()):
-            y_min = int(dt_full.dropna().dt.year.min())
-            y_max = int(dt_full.dropna().dt.year.max())
-            if y_max <= 1971:
-                raise ValueError(
-                    f"tick-data datetime parse is implausible (range {y_min}-{y_max}); "
-                    "expected full timestamps (e.g. YYYYMMDD + HH:MM:SS.mmm) or valid epoch datetimes."
-                )
-        dt_ns = (
-            dt_full.dt.tz_convert("UTC")
-            .dt.tz_localize(None)
-            .to_numpy(dtype="datetime64[ns]")
-            .astype("int64")
-        )
-        minute_ns = ((dt_ns // NS_PER_MINUTE) * NS_PER_MINUTE).astype(np.int64, copy=False)
-        keep = np.isin(minute_ns, minute_filter_arr)
-        if not np.any(keep):
-            continue
-        price_arr = pd.to_numeric(ch.loc[keep, pcol], errors="coerce").to_numpy(dtype=np.float64)
-        kept_minutes = minute_ns[keep].astype(np.int64, copy=False)
-        kept_times = dt_ns[keep].astype(np.int64, copy=False)
-        valid = np.isfinite(price_arr) & (kept_times != np.iinfo(np.int64).min)
-        bid_arr = None
-        ask_arr = None
-        if bid_col is not None:
-            bid_arr = pd.to_numeric(ch.loc[keep, bid_col], errors="coerce").to_numpy(dtype=np.float64)
-            saw_bid = True
-        if ask_col is not None:
-            ask_arr = pd.to_numeric(ch.loc[keep, ask_col], errors="coerce").to_numpy(dtype=np.float64)
-            saw_ask = True
-        if not np.any(valid):
-            continue
-        kept_minutes = kept_minutes[valid]
-        kept_times = kept_times[valid]
-        price_arr = price_arr[valid]
-        minute_parts.append(kept_minutes)
-        time_parts.append(kept_times)
-        price_parts.append(price_arr)
-        if bid_arr is not None:
-            bid_parts.append(bid_arr[valid])
-        elif saw_bid:
-            bid_parts.append(np.full(price_arr.shape, np.nan, dtype=np.float64))
-        if ask_arr is not None:
-            ask_parts.append(ask_arr[valid])
-        elif saw_ask:
-            ask_parts.append(np.full(price_arr.shape, np.nan, dtype=np.float64))
-        matched_minute_set.update({int(x) for x in np.unique(kept_minutes).tolist()})
-    if not price_parts:
-        return np.asarray([], dtype=np.float64), {}, None, None, 0
-    mins = np.concatenate(minute_parts).astype(np.int64, copy=False)
-    times = np.concatenate(time_parts).astype(np.int64, copy=False)
-    prices = np.concatenate(price_parts).astype(np.float64, copy=False)
-    bids = np.concatenate(bid_parts).astype(np.float64, copy=False) if saw_bid and bid_parts else None
-    asks = np.concatenate(ask_parts).astype(np.float64, copy=False) if saw_ask and ask_parts else None
-    order = np.lexsort((times, mins))
-    mins = mins[order]
-    prices = prices[order]
-    if bids is not None:
-        bids = bids[order]
-    if asks is not None:
-        asks = asks[order]
-    bounds: dict[int, tuple[int, int]] = {}
-    i = 0
-    while i < len(mins):
-        m = int(mins[i]); j = i + 1
-        while j < len(mins) and int(mins[j]) == m:
-            j += 1
-        bounds[m] = (i, j)
-        i = j
-    return prices, bounds, bids, asks, int(len(matched_minute_set))
 
 
 def _load_askbid_tick_replay_minutes(
@@ -2026,6 +1798,7 @@ def main() -> None:
     timing_detail: dict[str, float] = {
         "tick_cache_load_sec": 0.0,
         "tick_scope_build_sec": 0.0,
+        "tick_replay_plan_sec": 0.0,
         "tick_raw_load_sec": 0.0,
         "tick_simulate_selected_entries_sec": 0.0,
         "tick_cache_write_sec": 0.0,
@@ -2068,6 +1841,13 @@ def main() -> None:
     timing_counts: dict[str, int] = {
         "tick_cache_loaded_entries_count": 0,
         "tick_cache_diagnostics_entries_count": 0,
+        "tick_scope_entries_count": 0,
+        "tick_replay_relevant_entries_count": 0,
+        "tick_replay_critical_minutes_count": 0,
+        "tick_replay_cache_hits_count": 0,
+        "tick_replay_cache_missing_entries_count": 0,
+        "tick_replay_raw_critical_minutes_requested_count": 0,
+        "tick_replay_raw_loaded_minutes_count": 0,
     }
     timing_flags: dict[str, bool] = {
         "tick_raw_load_skipped": True,
@@ -2500,6 +2280,7 @@ def main() -> None:
         build_items_candidate_loop_elapsed = time.perf_counter() - t0
         timing_detail2["build_items_candidate_loop_sec"] += build_items_candidate_loop_elapsed
         build_items_metadata_t0 = time.perf_counter()
+        build_items_mask_before = float(timing_detail2["build_items_mask_sec"])
         for i, it in enumerate(items, start=1):
             x = dict(it); x["candidate_key"] = f"cand_{i:06d}"
             x["stable_candidate_key"] = _stable_candidate_key(str(x["col"]), str(x["op"]), _canonicalize_candidate_value(str(x["col"]), str(x["op"]), float(x["value"])))
@@ -2524,7 +2305,9 @@ def main() -> None:
             x["coarse_single_ratio_change"] = _safe_ratio_or_nan(x["_single_ratio"], coarse_raw_ratio)
             x["_family"] = _candidate_family(str(x["col"]), bool(args.family_split_delta_window))
             filtered_items.append(x)
-        timing_detail2["build_items_metadata_sec"] += time.perf_counter() - build_items_metadata_t0
+        build_items_metadata_elapsed = time.perf_counter() - build_items_metadata_t0
+        build_items_mask_elapsed = float(timing_detail2["build_items_mask_sec"]) - build_items_mask_before
+        timing_detail2["build_items_metadata_sec"] += max(0.0, build_items_metadata_elapsed - build_items_mask_elapsed)
         filtered_items_build_t0 = time.perf_counter()
         by_mask: dict[str, dict] = {}
         for it in filtered_items:
@@ -2558,6 +2341,7 @@ def main() -> None:
         return len(atr_items), len(after_pos), len(after_lift), len(after_mask)
     atr_candidates_built, atr_candidates_after_min_pos, atr_candidates_after_min_lift, atr_candidates_after_mask_count = _atr_debug_pass_counts(atr_debug_source)
     filtered_items_build_t0 = time.perf_counter()
+    allowlist_filter_elapsed = 0.0
     full_filtered_items = list(filtered_items)
     filtered_items = list(full_filtered_items)
     if int(args.min_single_pos_hits) > 0:
@@ -2577,9 +2361,10 @@ def main() -> None:
         before = len(filtered_items)
         filtered_items = [it for it in filtered_items if str(it.get("candidate_key")) in allow_keys]
         single_rejects["allowlist"] = max(0, before - len(filtered_items))
-        timing_detail2["allowlist_filter_sec"] += time.perf_counter() - allowlist_filter_t0
+        allowlist_filter_elapsed = time.perf_counter() - allowlist_filter_t0
+        timing_detail2["allowlist_filter_sec"] += allowlist_filter_elapsed
     print(f"[prefilter-resume] rows_after_allowlist={len(filtered_items)}")
-    filtered_elapsed = time.perf_counter() - filtered_items_build_t0
+    filtered_elapsed = max(0.0, time.perf_counter() - filtered_items_build_t0 - allowlist_filter_elapsed)
     timing_detail2["filtered_items_sec"] += filtered_elapsed
     fam_top_build_t0 = time.perf_counter()
     fam_top: list[dict] = []
@@ -2610,7 +2395,7 @@ def main() -> None:
         "askbid_m1_semantics": ASKBID_M1_SEMANTICS,
         "entry_latency_ms": int(args.entry_latency_ms),
         "tick_replay_price_basis": "askbid_m1",
-        "critical_minutes_semantics": "askbid_m1_bounds_order_ambiguity_tp_weights_trail_stop_order_c1_v1",
+        "critical_minutes_semantics": "askbid_m1_bounds_order_ambiguity_tp_weights_trail_stop_final_stop_c1_v1",
         "tick_replay_semantics": "chronological_bid_ticks_from_entry_latency_v1",
         "tick_entry_cache_semantics_version": TICK_ENTRY_CACHE_SEMANTICS_VERSION,
     }
@@ -2640,7 +2425,7 @@ def main() -> None:
         "entry_price_basis": "ask_entry_latency_plus_slippage",
         "exit_price_basis": "bid_ticks",
         "endpoint_price_basis": "bid_close",
-        "critical_minutes_semantics": "askbid_m1_bounds_order_ambiguity_tp_weights_trail_stop_order_c1_v1",
+        "critical_minutes_semantics": "askbid_m1_bounds_order_ambiguity_tp_weights_trail_stop_final_stop_c1_v1",
         "tick_replay_semantics": "chronological_bid_ticks_from_entry_latency_v1",
         "spread_handling": "ask_contains_spread_spread_bps_not_added",
         "slippage_handling": "ask_entry_latency_times_1_plus_slippage_bps",
@@ -2735,6 +2520,9 @@ def main() -> None:
             fam_union |= np.asarray(it["mask"], dtype=bool)
         entry_indices = np.flatnonzero(fam_union).astype(np.int64, copy=False)
         tick_period_end_indices = np.where(np.arange(n) < train_idx, train_idx - 1, n - 1).astype(np.int64)
+        timing_detail["tick_scope_build_sec"] += time.perf_counter() - tick_scope_t0
+        timing_counts["tick_scope_entries_count"] = int(len(entry_indices))
+        tick_replay_plan_t0 = time.perf_counter()
         critical_by_entry_all = _critical_minutes_for_entries_askbid_m1(
             entry_indices=entry_indices,
             askbid_m1_arrays=askbid_m1_arrays,
@@ -2755,7 +2543,9 @@ def main() -> None:
         replay_entry_indices = np.asarray(sorted(critical_by_entry_all.keys()), dtype=np.int64)
         replay_entry_index_set = {int(i) for i in replay_entry_indices.tolist()}
         critical_minutes_all = {int(m) for mins in critical_by_entry_all.values() for m in mins}
-        timing_detail["tick_scope_build_sec"] += time.perf_counter() - tick_scope_t0
+        timing_detail["tick_replay_plan_sec"] += time.perf_counter() - tick_replay_plan_t0
+        timing_counts["tick_replay_relevant_entries_count"] = int(len(replay_entry_indices))
+        timing_counts["tick_replay_critical_minutes_count"] = int(len(critical_minutes_all))
         print(f"[prefilter-tick-replay] replay_relevant_entries={len(replay_entry_indices)}")
         print(f"[prefilter-tick-replay] critical_minutes_count={len(critical_minutes_all)}")
         if bool(args.debug_tick_cache_scope_counts):
@@ -2776,6 +2566,8 @@ def main() -> None:
             cached_present = {int(k) for k in cached_entries.keys() if int(k) in replay_entry_index_set}
             tick_map = {int(i): dict(cached_entries[int(i)]) for i in cached_present if int(i) in cached_entries}
             missing_entry_indices = np.asarray([int(i) for i in replay_entry_indices.tolist() if int(i) not in cached_present], dtype=np.int64)
+            timing_counts["tick_replay_cache_hits_count"] = int(len(cached_present))
+            timing_counts["tick_replay_cache_missing_entries_count"] = int(len(missing_entry_indices))
             print(f"[prefilter-tick-cache] requested_entries={len(replay_entry_indices)} cached_entries_used={len(cached_present)} missing_entries={len(missing_entry_indices)}")
             if missing_entry_indices.size > 0:
                 if args.tick_data is None:
@@ -2784,6 +2576,7 @@ def main() -> None:
                         "--tick-data is required to compute them."
                     )
                 missing_critical_minutes = {int(m) for i in missing_entry_indices.tolist() for m in critical_by_entry_all.get(int(i), set())}
+                timing_counts["tick_replay_raw_critical_minutes_requested_count"] = int(len(missing_critical_minutes))
                 if missing_critical_minutes:
                     raw_load_t0 = time.perf_counter()
                     tick_time_ns_all, tick_minute_bounds, tick_bids_all, tick_asks_all, matched_total_minutes_count = _load_askbid_tick_replay_minutes(
@@ -2797,6 +2590,7 @@ def main() -> None:
                     timing_flags["tick_raw_load_skipped"] = False
                     missing_minutes = sorted(int(m) for m in missing_critical_minutes if int(m) not in tick_minute_bounds)
                     print(f"[prefilter-tick-raw-load] critical_minutes_count={len(missing_critical_minutes)}")
+                    timing_counts["tick_replay_raw_loaded_minutes_count"] = int(matched_total_minutes_count)
                     print(f"[prefilter-tick-raw-load] matched_total_minutes_count={int(matched_total_minutes_count)}")
                     print(f"[prefilter-tick-raw-load] used_real_ticks_source={'parquet_ticks' if args.tick_data.suffix.lower() in {'.parquet', '.pq'} else 'raw_ticks'}")
                     if missing_minutes:
@@ -3544,6 +3338,7 @@ def main() -> None:
         + float(timing_detail2.get("refined_tick_metric_restore_sec", 0.0))
         + float(timing_detail.get("tick_cache_load_sec", 0.0))
         + float(timing_detail.get("tick_scope_build_sec", 0.0))
+        + float(timing_detail.get("tick_replay_plan_sec", 0.0))
         + float(timing_detail.get("tick_missing_metrics_scan_sec", 0.0))
         + float(timing_detail.get("tick_raw_load_sec", 0.0))
         + float(timing_detail.get("tick_simulate_selected_entries_sec", 0.0))
@@ -3566,6 +3361,14 @@ def main() -> None:
             f"tick_cache_load_sec={timing_detail['tick_cache_load_sec']:.3f} "
             f"tick_cache_loaded_entries_count={timing_counts['tick_cache_loaded_entries_count']} "
             f"tick_scope_build_sec={timing_detail['tick_scope_build_sec']:.3f} "
+            f"tick_scope_entries_count={timing_counts['tick_scope_entries_count']} "
+            f"tick_replay_plan_sec={timing_detail['tick_replay_plan_sec']:.3f} "
+            f"tick_replay_relevant_entries_count={timing_counts['tick_replay_relevant_entries_count']} "
+            f"tick_replay_critical_minutes_count={timing_counts['tick_replay_critical_minutes_count']} "
+            f"tick_replay_cache_hits_count={timing_counts['tick_replay_cache_hits_count']} "
+            f"tick_replay_cache_missing_entries_count={timing_counts['tick_replay_cache_missing_entries_count']} "
+            f"tick_replay_raw_critical_minutes_requested_count={timing_counts['tick_replay_raw_critical_minutes_requested_count']} "
+            f"tick_replay_raw_loaded_minutes_count={timing_counts['tick_replay_raw_loaded_minutes_count']} "
             f"tick_raw_load_sec={timing_detail['tick_raw_load_sec']:.3f} "
             f"tick_raw_load_skipped={bool(timing_flags['tick_raw_load_skipped'])} "
             f"tick_simulate_selected_entries_sec={timing_detail['tick_simulate_selected_entries_sec']:.3f} "
