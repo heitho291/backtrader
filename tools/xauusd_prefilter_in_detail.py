@@ -949,8 +949,8 @@ def _build_askbid_m1_parquet_streaming(
     encoded_meta = {str(k).encode("utf-8"): str(v).encode("utf-8") for k, v in metadata.items()}
     schema = schema.with_metadata({**(schema.metadata or {}), **encoded_meta})
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(output_path.parent), suffix=".parquet") as tf:
-        tmp = Path(tf.name)
+    if output_path.exists():
+        output_path.unlink()
 
     chunk_iter = iter(_iter_askbid_tick_chunks(
         tick_source_path,
@@ -1009,7 +1009,7 @@ def _build_askbid_m1_parquet_streaming(
                 arrays.append(pa.array(batch_cols[col], type=pa.float64()))
         table = pa.Table.from_arrays(arrays, schema=schema)
         if writer is None:
-            writer = pq.ParquetWriter(tmp, schema)
+            writer = pq.ParquetWriter(output_path, schema)
         writer.write_table(table)
         rows_written += len(batch_cols["datetime"])
         batch_cols = {c: [] for c in ASKBID_M1_COLUMNS}
@@ -1124,16 +1124,15 @@ def _build_askbid_m1_parquet_streaming(
         _flush()
         if writer is not None:
             writer.close(); writer = None
-        os.replace(tmp, output_path)
     except Exception:
         if writer is not None:
             try:
                 writer.close()
             except Exception:
                 pass
-        if tmp.exists():
+        if output_path.exists():
             try:
-                tmp.unlink()
+                output_path.unlink()
             except Exception:
                 pass
         raise
@@ -1219,9 +1218,13 @@ def _ensure_askbid_m1_parquet_ready(
         feature_minute_ns=feature_minute_ns,
         source_tick_path=tick_source_path,
     )
-    print(f"[prefilter-askbid-m1] streaming_build=start path={path} tick_source={tick_source_path}")
+    tmp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
+    invalid_path = path.with_name(f"{path.stem}.invalid{path.suffix}")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    print(f"[prefilter-askbid-m1] streaming_build=start path={path} tmp_path={tmp_path} tick_source={tick_source_path}")
     build_stats = _build_askbid_m1_parquet_streaming(
-        output_path=path,
+        output_path=tmp_path,
         feature_minute_ns=feature_minute_ns,
         tick_source_path=tick_source_path,
         tick_datetime_column=tick_datetime_column,
@@ -1231,12 +1234,24 @@ def _ensure_askbid_m1_parquet_ready(
         tick_chunk_size=tick_chunk_size,
     )
     gc.collect()
-    _validate_askbid_m1_parquet_against_grid(
-        path,
-        feature_minute_ns=feature_minute_ns,
-        entry_latency_ms=int(entry_latency_ms),
-        expected_source_tick_path=tick_source_path,
-    )
+    try:
+        _validate_askbid_m1_parquet_against_grid(
+            tmp_path,
+            feature_minute_ns=feature_minute_ns,
+            entry_latency_ms=int(entry_latency_ms),
+            expected_source_tick_path=tick_source_path,
+        )
+    except Exception:
+        if tmp_path.exists():
+            os.replace(tmp_path, invalid_path)
+            print(f"[prefilter-askbid-m1] streaming_build_invalid_moved path={invalid_path}")
+        raise
+    os.replace(tmp_path, path)
+    if invalid_path.exists():
+        try:
+            invalid_path.unlink()
+        except Exception:
+            pass
     print(
         "[prefilter-askbid-m1] "
         f"streaming_build=done path={path} rows={int(build_stats.get('rows_written', 0))} "
