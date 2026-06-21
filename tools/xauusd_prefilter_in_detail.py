@@ -739,8 +739,10 @@ def _load_feature_minute_grid_minimal(path: Path) -> np.ndarray:
             )
         parts: list[np.ndarray] = []
         for batch in pf.iter_batches(columns=[dt_col], batch_size=250_000):
-            ch = batch.to_pandas()
-            dt = _parse_datetime_series_robust_local(ch[dt_col])
+            # Arrow may restore a stored pandas index as the DataFrame index when using
+            # to_pandas(), so read the selected physical column directly.
+            raw_dt = batch.column(0).to_pandas()
+            dt = _parse_datetime_series_robust_local(raw_dt)
             dt_ns = (
                 dt.dt.tz_convert("UTC")
                 .dt.tz_localize(None)
