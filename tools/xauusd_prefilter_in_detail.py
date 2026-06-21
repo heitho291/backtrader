@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import collections
+import gc
 import hashlib
 import importlib.util
 import itertools
@@ -657,6 +658,595 @@ def _feature_grid_sig(feature_minute_ns: np.ndarray) -> str:
     return hashlib.sha1(arr.tobytes()).hexdigest()
 
 
+def _parse_datetime_series_robust_local(raw) -> pd.Series:
+    direct = pd.to_datetime(raw, errors="coerce", utc=True)
+    base = pd.Series(raw)
+    as_num = pd.to_numeric(base, errors="coerce")
+    if not bool(as_num.notna().any()):
+        return direct
+    candidates = [direct]
+    for unit in ("ns", "us", "ms", "s"):
+        candidates.append(pd.to_datetime(as_num, errors="coerce", unit=unit, utc=True))
+
+    def _score(dt: pd.Series) -> tuple[int, int]:
+        valid = dt.notna()
+        valid_count = int(valid.sum())
+        if valid_count <= 0:
+            return (0, 0)
+        years = dt.loc[valid].dt.year
+        return (int(((years >= 2000) & (years <= 2100)).sum()), valid_count)
+
+    return max(candidates, key=_score)
+
+
+def _ensure_plausible_minute_grid(feature_minute_ns: np.ndarray, *, context: str) -> np.ndarray:
+    arr = np.asarray(feature_minute_ns, dtype=np.int64)
+    if arr.size <= 0:
+        raise ValueError(f"{context}: feature datetime grid is empty")
+    if np.any(np.diff(arr) <= 0):
+        raise ValueError(f"{context}: feature datetime grid must be strictly increasing and unique")
+    idx = pd.to_datetime(arr, errors="coerce", utc=True)
+    if bool(pd.isna(idx).any()):
+        raise ValueError(f"{context}: feature datetime grid contains invalid datetimes")
+    min_year = int(idx.min().year)
+    max_year = int(idx.max().year)
+    if min_year < 2000 or max_year > 2100:
+        raise ValueError(
+            f"{context}: implausible datetime range min={idx.min().isoformat()} max={idx.max().isoformat()} "
+            "(expected roughly years 2000..2100); check timestamp unit (ns/us/ms/s)."
+        )
+    return arr
+
+
+def _load_feature_minute_grid_minimal(path: Path) -> np.ndarray:
+    """Load only the feature datetime/index grid without materializing feature columns."""
+    path = Path(path)
+    if not path.exists():
+        raise ValueError(f"features file does not exist: {path}")
+    context = "load_feature_minute_grid_minimal"
+    if path.suffix.lower() in {".parquet", ".pq"}:
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("pyarrow is required for minimal feature datetime grid loading from parquet") from exc
+        pf = pq.ParquetFile(path)
+        schema_cols = [str(c) for c in pf.schema_arrow.names]
+        lower_cols = {c.strip().lower(): c for c in schema_cols}
+        dt_col = lower_cols.get("datetime") or lower_cols.get("date_time") or lower_cols.get("timestamp")
+        if dt_col is None:
+            raw_meta = pf.metadata.metadata or {}
+            pandas_meta_raw = raw_meta.get(b"pandas")
+            if pandas_meta_raw:
+                try:
+                    pandas_meta = json.loads(pandas_meta_raw.decode("utf-8"))
+                    for idx_col in pandas_meta.get("index_columns", []):
+                        if isinstance(idx_col, str) and idx_col in schema_cols:
+                            dt_col = idx_col
+                            break
+                        if isinstance(idx_col, dict):
+                            name = idx_col.get("name") or idx_col.get("field_name")
+                            if isinstance(name, str) and name in schema_cols:
+                                dt_col = name
+                                break
+                except Exception:
+                    dt_col = None
+        if dt_col is None and "__index_level_0__" in schema_cols:
+            dt_col = "__index_level_0__"
+        if dt_col is None:
+            raise ValueError(
+                f"{context}: could not determine feature datetime/index column minimally from {path}; "
+                "refusing to load the full feature file. Ensure the feature parquet stores a datetime column/index."
+            )
+        parts: list[np.ndarray] = []
+        for batch in pf.iter_batches(columns=[dt_col], batch_size=250_000):
+            ch = batch.to_pandas()
+            dt = _parse_datetime_series_robust_local(ch[dt_col])
+            dt_ns = (
+                dt.dt.tz_convert("UTC")
+                .dt.tz_localize(None)
+                .to_numpy(dtype="datetime64[ns]")
+                .astype("int64")
+            )
+            parts.append(((dt_ns // NS_PER_MINUTE) * NS_PER_MINUTE).astype(np.int64, copy=False))
+        if not parts:
+            raise ValueError(f"{context}: no datetime rows found in {path}")
+        arr = np.sort(np.concatenate(parts).astype(np.int64, copy=False))
+        return _ensure_plausible_minute_grid(arr, context=context)
+
+    header = pd.read_csv(path, compression="infer", nrows=0)
+    cols = [str(c) for c in header.columns]
+    lower_cols = {c.strip().lower(): c for c in cols}
+    dt_col = lower_cols.get("datetime") or lower_cols.get("date_time") or lower_cols.get("timestamp")
+    if dt_col is None and cols and cols[0].lower().startswith("unnamed"):
+        dt_col = cols[0]
+    if dt_col is None:
+        raise ValueError(
+            f"{context}: could not determine feature datetime/index column minimally from {path}; "
+            "refusing to load the full feature file. Ensure the feature CSV has a datetime column or unnamed datetime index."
+        )
+    raw = pd.read_csv(path, compression="infer", usecols=[dt_col])[dt_col]
+    dt = _parse_datetime_series_robust_local(raw)
+    dt_ns = (
+        dt.dt.tz_convert("UTC")
+        .dt.tz_localize(None)
+        .to_numpy(dtype="datetime64[ns]")
+        .astype("int64")
+    )
+    arr = np.sort(((dt_ns // NS_PER_MINUTE) * NS_PER_MINUTE).astype(np.int64, copy=False))
+    return _ensure_plausible_minute_grid(arr, context=context)
+
+
+def _askbid_m1_arrow_schema():
+    try:
+        import pyarrow as pa  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("pyarrow is required for AskBid-M1 Parquet streaming") from exc
+    fields = []
+    for col in ASKBID_M1_COLUMNS:
+        if col == "datetime":
+            fields.append(pa.field(col, pa.timestamp("ns")))
+        elif col == "ticks_count":
+            fields.append(pa.field(col, pa.int64()))
+        else:
+            fields.append(pa.field(col, pa.float64()))
+    return pa.schema(fields)
+
+
+def _datetime_series_to_ns(dt_full: pd.Series) -> np.ndarray:
+    return (
+        dt_full.dt.tz_convert("UTC")
+        .dt.tz_localize(None)
+        .to_numpy(dtype="datetime64[ns]")
+        .astype("int64")
+    )
+
+
+def _tick_datetime_ns_from_chunk(ch: pd.DataFrame, dt_col: str, cols_lower: dict[str, str] | None = None) -> np.ndarray:
+    if cols_lower is None:
+        cols_lower = {str(c).strip().lower(): str(c) for c in ch.columns}
+    dt_raw = ch[dt_col]
+    date_src = None
+    time_src = None
+    date_candidates = ("date", "<date>", "<dtyyyymmdd>", "dtyyyymmdd")
+    time_candidates = ("time", "<time>", "time_msc", "timestamp_time")
+    for dname in date_candidates:
+        if dname in cols_lower and cols_lower[dname] != dt_col:
+            cand = ch[cols_lower[dname]].astype(str).str.strip()
+            if bool((cand.str.fullmatch(r"\d{8}", na=False)).any()) or bool((cand.str.fullmatch(r"\d{4}-\d{2}-\d{2}", na=False)).any()):
+                date_src = cand
+                break
+    for tname in time_candidates:
+        if tname in cols_lower and cols_lower[tname] != dt_col:
+            cand = ch[cols_lower[tname]].astype(str).str.strip()
+            if bool((cand.str.fullmatch(r"\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?", na=False)).any()):
+                time_src = cand
+                break
+    time_s = dt_raw.astype(str).str.strip()
+    looks_time_like = bool((time_s.str.fullmatch(r"\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?", na=False)).any())
+    looks_date_like = bool((time_s.str.fullmatch(r"\d{8}", na=False)).any()) or bool((time_s.str.fullmatch(r"\d{4}-\d{2}-\d{2}", na=False)).any())
+    if date_src is not None and looks_time_like:
+        dt_join = date_src.astype(str).str.strip() + " " + time_s
+        dt_full = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S.%f", errors="coerce", utc=True)
+        if not bool(dt_full.notna().any()):
+            dt_full = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S", errors="coerce", utc=True)
+        if not bool(dt_full.notna().any()):
+            dt_full = pd.to_datetime(dt_join, errors="coerce", utc=True)
+    elif looks_date_like and time_src is not None:
+        dt_join = time_s + " " + time_src.astype(str).str.strip()
+        dt_full = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S.%f", errors="coerce", utc=True)
+        if not bool(dt_full.notna().any()):
+            dt_full = pd.to_datetime(dt_join, format="%Y%m%d %H:%M:%S", errors="coerce", utc=True)
+        if not bool(dt_full.notna().any()):
+            dt_full = pd.to_datetime(dt_join, errors="coerce", utc=True)
+    else:
+        dt_full = _parse_datetime_series_robust_local(dt_raw)
+    if bool(dt_full.notna().any()):
+        years = dt_full.dropna().dt.year
+        if int(years.max()) <= 1971:
+            raise ValueError("AskBid-M1 streaming build parsed implausible tick datetimes; check DateTime/Date/Time columns")
+    return _datetime_series_to_ns(dt_full)
+
+
+def _iter_askbid_tick_chunks(
+    path: Path,
+    *,
+    datetime_col: str,
+    sep: str,
+    tick_chunk_size: int | str = "auto",
+):
+    chunk_size_eff = 150_000 if str(tick_chunk_size).lower() == "auto" else max(10_000, int(tick_chunk_size))
+    nat_ns = np.iinfo(np.int64).min
+    prev_ns: int | None = None
+
+    def _prepare_chunk(ch: pd.DataFrame, source: str):
+        nonlocal prev_ns
+        cols_lower = {str(c).strip().lower(): str(c) for c in ch.columns}
+        dt_col = cols_lower.get(str(datetime_col).strip().lower()) if datetime_col else None
+        if dt_col is None:
+            for cand in ("datetime", "date_time", "timestamp", "time", "date"):
+                if cand in cols_lower:
+                    dt_col = cols_lower[cand]
+                    break
+        bid_col = cols_lower.get("bid")
+        ask_col = cols_lower.get("ask")
+        vol_col = cols_lower.get("volume") or cols_lower.get("vol")
+        if dt_col is None or bid_col is None or ask_col is None:
+            raise ValueError(f"AskBid-M1 streaming build requires DateTime, Bid and Ask columns in {source}")
+        dt_ns = _tick_datetime_ns_from_chunk(ch, dt_col, cols_lower)
+        bid = pd.to_numeric(ch[bid_col], errors="coerce").to_numpy(dtype=np.float64)
+        ask = pd.to_numeric(ch[ask_col], errors="coerce").to_numpy(dtype=np.float64)
+        if vol_col is not None:
+            volume = pd.to_numeric(ch[vol_col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+        else:
+            volume = np.zeros(len(ch), dtype=np.float64)
+        valid = (dt_ns != nat_ns) & np.isfinite(bid) & np.isfinite(ask) & (bid > 0.0) & (ask > 0.0)
+        if not np.any(valid):
+            return None
+        dt_ns = dt_ns[valid].astype(np.int64, copy=False)
+        bid = bid[valid].astype(np.float64, copy=False)
+        ask = ask[valid].astype(np.float64, copy=False)
+        volume = volume[valid].astype(np.float64, copy=False)
+        if dt_ns.size > 1 and np.any(np.diff(dt_ns) < 0):
+            raise ValueError(
+                f"AskBid-M1 streaming build requires a chronologically sorted tick source; "
+                f"datetime goes backwards within {source}. Pre-sort/build the tick parquet first."
+            )
+        if prev_ns is not None and dt_ns.size and int(dt_ns[0]) < int(prev_ns):
+            raise ValueError(
+                "AskBid-M1 streaming build requires a chronologically sorted tick source; "
+                "datetime goes backwards across batch/row-group boundaries. Pre-sort/build the tick parquet first."
+            )
+        if dt_ns.size:
+            prev_ns = int(dt_ns[-1])
+        return dt_ns, bid, ask, volume
+
+    if path.suffix.lower() in {".parquet", ".pq"}:
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("pyarrow is required for AskBid-M1 streaming build from tick parquet") from exc
+        pf = pq.ParquetFile(path)
+        schema_cols = set(str(c) for c in pf.schema_arrow.names)
+        missing = {"DateTime", "Bid", "Ask"} - schema_cols
+        if missing:
+            raise ValueError(f"tick parquet missing columns for AskBid-M1 streaming build: {sorted(missing)}")
+        cols = ["DateTime", "Bid", "Ask"] + (["Volume"] if "Volume" in schema_cols else [])
+        for batch in pf.iter_batches(columns=cols, batch_size=chunk_size_eff):
+            prepared = _prepare_chunk(batch.to_pandas(), "tick parquet")
+            if prepared is not None:
+                yield prepared
+    else:
+        for ch in pd.read_csv(path, sep=sep, chunksize=chunk_size_eff):
+            prepared = _prepare_chunk(ch, "tick CSV")
+            if prepared is not None:
+                yield prepared
+
+
+def _build_askbid_m1_parquet_streaming(
+    *,
+    output_path: Path,
+    feature_minute_ns: np.ndarray,
+    tick_source_path: Path,
+    tick_datetime_column: str,
+    tick_sep: str,
+    entry_latency_ms: int,
+    metadata: dict[str, str],
+    tick_chunk_size: int | str = "auto",
+) -> dict[str, int]:
+    try:
+        import pyarrow as pa  # type: ignore
+        import pyarrow.parquet as pq  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("pyarrow is required for AskBid-M1 streaming parquet build") from exc
+    if tick_source_path is None:
+        raise ValueError("--tick-data is required to build missing --askbid-m1-parquet")
+    if not tick_source_path.exists():
+        raise ValueError(f"tick source does not exist: {tick_source_path}")
+    feature_minute_ns = _ensure_plausible_minute_grid(feature_minute_ns, context="build_askbid_m1_streaming")
+    entry_latency_ns = int(entry_latency_ms) * 1_000_000
+    max_carry_ns = int(ASKBID_M1_MAX_CARRY_GAP_MINUTES) * NS_PER_MINUTE
+    schema = _askbid_m1_arrow_schema()
+    encoded_meta = {str(k).encode("utf-8"): str(v).encode("utf-8") for k, v in metadata.items()}
+    schema = schema.with_metadata({**(schema.metadata or {}), **encoded_meta})
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(output_path.parent), suffix=".parquet") as tf:
+        tmp = Path(tf.name)
+
+    chunk_iter = iter(_iter_askbid_tick_chunks(
+        tick_source_path,
+        datetime_col=tick_datetime_column,
+        sep=tick_sep,
+        tick_chunk_size=tick_chunk_size,
+    ))
+    cur_dt = cur_bid = cur_ask = cur_vol = None
+    cur_pos = 0
+    no_more_ticks = False
+
+    def _load_next_chunk() -> bool:
+        nonlocal cur_dt, cur_bid, cur_ask, cur_vol, cur_pos, no_more_ticks
+        try:
+            cur_dt, cur_bid, cur_ask, cur_vol = next(chunk_iter)
+            cur_pos = 0
+            return True
+        except StopIteration:
+            cur_dt = cur_bid = cur_ask = cur_vol = None
+            cur_pos = 0
+            no_more_ticks = True
+            return False
+
+    def _has_tick() -> bool:
+        nonlocal cur_dt, cur_pos
+        while not no_more_ticks and (cur_dt is None or cur_pos >= len(cur_dt)):
+            if not _load_next_chunk():
+                break
+        return cur_dt is not None and cur_pos < len(cur_dt)
+
+    last_bid = float("nan")
+    last_ask = float("nan")
+    last_tick_ns: int | None = None
+    allowed_feature_gaps = 0
+    session_open_from_first_tick_count = 0
+    rows_written = 0
+    missing_price_minutes: list[int] = []
+    batch_cols: dict[str, list] = {c: [] for c in ASKBID_M1_COLUMNS}
+    writer = None
+
+    def _append_row(row: dict) -> None:
+        for col in ASKBID_M1_COLUMNS:
+            batch_cols[col].append(row[col])
+
+    def _flush() -> None:
+        nonlocal writer, batch_cols, rows_written
+        if not batch_cols["datetime"]:
+            return
+        arrays = []
+        for col in ASKBID_M1_COLUMNS:
+            if col == "datetime":
+                arrays.append(pa.array(batch_cols[col], type=pa.timestamp("ns")))
+            elif col == "ticks_count":
+                arrays.append(pa.array(batch_cols[col], type=pa.int64()))
+            else:
+                arrays.append(pa.array(batch_cols[col], type=pa.float64()))
+        table = pa.Table.from_arrays(arrays, schema=schema)
+        if writer is None:
+            writer = pq.ParquetWriter(tmp, schema)
+        writer.write_table(table)
+        rows_written += len(batch_cols["datetime"])
+        batch_cols = {c: [] for c in ASKBID_M1_COLUMNS}
+
+    try:
+        for row_pos, minute_ns_raw in enumerate(feature_minute_ns.tolist()):
+            minute_ns = int(minute_ns_raw)
+            next_minute_ns = minute_ns + NS_PER_MINUTE
+            if row_pos > 0 and minute_ns - int(feature_minute_ns[row_pos - 1]) > NS_PER_MINUTE:
+                allowed_feature_gaps += 1
+            while _has_tick() and int(cur_dt[cur_pos]) < minute_ns:
+                last_bid = float(cur_bid[cur_pos])
+                last_ask = float(cur_ask[cur_pos])
+                last_tick_ns = int(cur_dt[cur_pos])
+                cur_pos += 1
+
+            minute_dt_parts: list[np.ndarray] = []
+            minute_bid_parts: list[np.ndarray] = []
+            minute_ask_parts: list[np.ndarray] = []
+            minute_vol_parts: list[np.ndarray] = []
+            while _has_tick() and int(cur_dt[cur_pos]) < next_minute_ns:
+                end = int(np.searchsorted(cur_dt, next_minute_ns, side="left", sorter=None))
+                if end <= cur_pos:
+                    end = cur_pos + 1
+                minute_dt_parts.append(cur_dt[cur_pos:end])
+                minute_bid_parts.append(cur_bid[cur_pos:end])
+                minute_ask_parts.append(cur_ask[cur_pos:end])
+                minute_vol_parts.append(cur_vol[cur_pos:end])
+                cur_pos = end
+            if minute_dt_parts:
+                dt_slice = np.concatenate(minute_dt_parts).astype(np.int64, copy=False)
+                bid_slice = np.concatenate(minute_bid_parts).astype(np.float64, copy=False)
+                ask_slice = np.concatenate(minute_ask_parts).astype(np.float64, copy=False)
+                vol_slice = np.concatenate(minute_vol_parts).astype(np.float64, copy=False)
+            else:
+                dt_slice = np.asarray([], dtype=np.int64)
+                bid_slice = np.asarray([], dtype=np.float64)
+                ask_slice = np.asarray([], dtype=np.float64)
+                vol_slice = np.asarray([], dtype=np.float64)
+
+            exact_start = len(dt_slice) > 0 and int(dt_slice[0]) == minute_ns
+            carry_valid = last_tick_ns is not None and (minute_ns - int(last_tick_ns)) <= max_carry_ns
+            if exact_start:
+                ask_open = float(ask_slice[0]); bid_open = float(bid_slice[0])
+            elif carry_valid:
+                ask_open = float(last_ask); bid_open = float(last_bid)
+            elif len(dt_slice) > 0:
+                ask_open = float(ask_slice[0]); bid_open = float(bid_slice[0])
+                session_open_from_first_tick_count += 1
+            else:
+                missing_price_minutes.append(minute_ns)
+                if len(missing_price_minutes) >= 10:
+                    break
+                continue
+
+            if len(dt_slice) > 0:
+                ask_high = float(max(float(np.max(ask_slice)), ask_open))
+                ask_low = float(min(float(np.min(ask_slice)), ask_open))
+                bid_high = float(max(float(np.max(bid_slice)), bid_open))
+                bid_low = float(min(float(np.min(bid_slice)), bid_open))
+                ask_close = float(ask_slice[-1])
+                bid_close = float(bid_slice[-1])
+            else:
+                ask_high = ask_low = ask_close = ask_open
+                bid_high = bid_low = bid_close = bid_open
+
+            latency_ns = minute_ns + entry_latency_ns
+            le_idx = int(np.searchsorted(dt_slice, latency_ns, side="right")) if len(dt_slice) else 0
+            if le_idx > 0:
+                ask_entry_latency = float(ask_slice[le_idx - 1])
+                bid_at_latency = float(bid_slice[le_idx - 1])
+            else:
+                ask_entry_latency = ask_open
+                bid_at_latency = bid_open
+            after_idx = int(np.searchsorted(dt_slice, latency_ns, side="left")) if len(dt_slice) else 0
+            after_bid = bid_slice[after_idx:] if len(dt_slice) else np.asarray([], dtype=np.float64)
+            if len(after_bid) > 0:
+                bid_high_after = float(max(float(np.max(after_bid)), bid_at_latency))
+                bid_low_after = float(min(float(np.min(after_bid)), bid_at_latency))
+            else:
+                bid_high_after = bid_low_after = bid_at_latency
+
+            _append_row({
+                "datetime": np.datetime64(minute_ns, "ns"),
+                "ask_open": ask_open,
+                "ask_entry_latency": ask_entry_latency,
+                "ask_high": ask_high,
+                "ask_low": ask_low,
+                "ask_close": ask_close,
+                "bid_open": bid_open,
+                "bid_high": bid_high,
+                "bid_low": bid_low,
+                "bid_close": bid_close,
+                "bid_high_after_entry_latency": bid_high_after,
+                "bid_low_after_entry_latency": bid_low_after,
+                "volume_check": float(np.nansum(vol_slice)) if len(vol_slice) else 0.0,
+                "ticks_count": int(len(dt_slice)),
+            })
+            if len(dt_slice) > 0:
+                last_bid = float(bid_slice[-1])
+                last_ask = float(ask_slice[-1])
+                last_tick_ns = int(dt_slice[-1])
+            if len(batch_cols["datetime"]) >= 50_000:
+                _flush()
+        if missing_price_minutes:
+            sample = ",".join(_ns_to_utc_iso(x) for x in missing_price_minutes[:5])
+            raise ValueError(
+                "AskBid-M1 streaming build could not derive quote-continuous prices for "
+                f"{len(missing_price_minutes)} feature minutes; sample={sample}. "
+                "This usually indicates Feature-DF minutes inside an offmarket/data gap or missing initial quote."
+            )
+        _flush()
+        if writer is not None:
+            writer.close(); writer = None
+        os.replace(tmp, output_path)
+    except Exception:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+        raise
+    return {
+        "allowed_feature_gaps": int(allowed_feature_gaps),
+        "session_open_from_first_tick_count": int(session_open_from_first_tick_count),
+        "rows_written": int(rows_written),
+    }
+
+
+def _validate_askbid_m1_parquet_against_grid(
+    path: Path,
+    *,
+    feature_minute_ns: np.ndarray,
+    entry_latency_ms: int,
+    expected_source_tick_path: Path | None,
+) -> None:
+    try:
+        import pyarrow.parquet as pq  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("pyarrow is required for streaming AskBid-M1 Parquet validation") from exc
+    metadata = _parquet_metadata(path)
+    expected_meta = _askbid_m1_metadata(
+        entry_latency_ms=int(entry_latency_ms),
+        feature_minute_ns=np.asarray(feature_minute_ns, dtype=np.int64),
+        source_tick_path=expected_source_tick_path,
+    )
+    meta_errors = _askbid_m1_required_metadata_errors(metadata, expected_meta)
+    if meta_errors:
+        raise ValueError("AskBid-M1 metadata mismatch: " + "; ".join(meta_errors[:5]))
+    pf = pq.ParquetFile(path)
+    schema_cols = [str(c) for c in pf.schema_arrow.names]
+    if schema_cols != ASKBID_M1_COLUMNS:
+        raise ValueError(f"AskBid-M1 schema mismatch: expected={ASKBID_M1_COLUMNS} actual={schema_cols}")
+    if int(pf.metadata.num_rows) != int(len(feature_minute_ns)):
+        raise ValueError(f"AskBid-M1 row count mismatch: got={int(pf.metadata.num_rows)} expected={int(len(feature_minute_ns))}")
+    offset = 0
+    expected_ns = np.asarray(feature_minute_ns, dtype=np.int64)
+    for batch in pf.iter_batches(columns=ASKBID_M1_COLUMNS, batch_size=100_000):
+        ch = batch.to_pandas()
+        dt_ns = pd.to_datetime(ch["datetime"], errors="coerce", utc=True).astype("int64").to_numpy(dtype=np.int64)
+        exp = expected_ns[offset:offset + len(dt_ns)]
+        if len(dt_ns) != len(exp) or not np.array_equal(dt_ns, exp):
+            bad = int(np.flatnonzero(dt_ns != exp)[0]) if len(dt_ns) == len(exp) and np.any(dt_ns != exp) else 0
+            raise ValueError(
+                "AskBid-M1 datetime alignment mismatch during streaming validation: "
+                f"row={offset + bad} got={_ns_to_utc_iso(int(dt_ns[bad])) if len(dt_ns) else 'n/a'} "
+                f"expected={_ns_to_utc_iso(int(exp[bad])) if len(exp) else 'n/a'}"
+            )
+        price_values = ch[ASKBID_M1_PRICE_COLUMNS].to_numpy(dtype=np.float64, copy=False)
+        if not np.isfinite(price_values).all() or not (price_values > 0).all():
+            bad = np.argwhere((~np.isfinite(price_values)) | ~(price_values > 0))[:5].tolist()
+            raise ValueError(f"AskBid-M1 contains invalid price fields during streaming validation; sample_positions={bad}")
+        offset += len(dt_ns)
+    if offset != len(expected_ns):
+        raise ValueError(f"AskBid-M1 validation row count mismatch after scan: got={offset} expected={len(expected_ns)}")
+
+
+def _ensure_askbid_m1_parquet_ready(
+    *,
+    path: Path,
+    feature_minute_ns: np.ndarray,
+    entry_latency_ms: int,
+    tick_source_path: Path | None,
+    tick_datetime_column: str,
+    tick_sep: str,
+    tick_chunk_size: int | str = "auto",
+) -> None:
+    feature_minute_ns = _ensure_plausible_minute_grid(feature_minute_ns, context="ensure_askbid_m1_parquet_ready")
+    if path.exists():
+        print(f"[prefilter-askbid-m1] early_validate=existing path={path}")
+        _validate_askbid_m1_parquet_against_grid(
+            path,
+            feature_minute_ns=feature_minute_ns,
+            entry_latency_ms=int(entry_latency_ms),
+            expected_source_tick_path=tick_source_path,
+        )
+        return
+    if tick_source_path is None:
+        raise ValueError("--tick-data is required to build missing --askbid-m1-parquet")
+    metadata = _askbid_m1_metadata(
+        entry_latency_ms=int(entry_latency_ms),
+        feature_minute_ns=feature_minute_ns,
+        source_tick_path=tick_source_path,
+    )
+    print(f"[prefilter-askbid-m1] streaming_build=start path={path} tick_source={tick_source_path}")
+    build_stats = _build_askbid_m1_parquet_streaming(
+        output_path=path,
+        feature_minute_ns=feature_minute_ns,
+        tick_source_path=tick_source_path,
+        tick_datetime_column=tick_datetime_column,
+        tick_sep=tick_sep,
+        entry_latency_ms=int(entry_latency_ms),
+        metadata=metadata,
+        tick_chunk_size=tick_chunk_size,
+    )
+    gc.collect()
+    _validate_askbid_m1_parquet_against_grid(
+        path,
+        feature_minute_ns=feature_minute_ns,
+        entry_latency_ms=int(entry_latency_ms),
+        expected_source_tick_path=tick_source_path,
+    )
+    print(
+        "[prefilter-askbid-m1] "
+        f"streaming_build=done path={path} rows={int(build_stats.get('rows_written', 0))} "
+        f"feature_minutes={len(feature_minute_ns)} "
+        f"allowed_offmarket_gaps={int(build_stats.get('allowed_feature_gaps', 0))} "
+        f"session_open_from_first_tick_count={int(build_stats.get('session_open_from_first_tick_count', 0))} "
+        f"entry_latency_ms={int(entry_latency_ms)}"
+    )
+
+
 def _askbid_m1_metadata(
     *,
     entry_latency_ms: int,
@@ -746,193 +1336,6 @@ def _normalize_tick_datetime_series_for_askbid(raw) -> pd.Series:
     return pd.to_datetime(raw, errors="coerce", utc=True)
 
 
-def _load_tick_source_for_askbid_m1(
-    path: Path,
-    *,
-    datetime_col: str,
-    sep: str,
-) -> pd.DataFrame:
-    if path is None:
-        raise ValueError("--tick-data is required to build --askbid-m1-parquet when the AskBid-M1 file is missing")
-    if not path.exists():
-        raise ValueError(f"tick source does not exist: {path}")
-    if path.suffix.lower() in {".parquet", ".pq"}:
-        try:
-            import pyarrow.parquet as pq  # type: ignore
-        except Exception as exc:
-            raise RuntimeError("pyarrow is required for AskBid-M1 build from tick parquet") from exc
-        cols_needed = ["DateTime", "Bid", "Ask", "Volume"]
-        pf = pq.ParquetFile(path)
-        schema_cols = set(str(c) for c in pf.schema_arrow.names)
-        missing = set(cols_needed) - schema_cols
-        if missing:
-            raise ValueError(f"tick parquet missing columns for AskBid-M1 build: {sorted(missing)}")
-        raw = pf.read(columns=cols_needed).to_pandas()
-        source_kind = "parquet"
-    else:
-        raw = pd.read_csv(path, sep=sep, low_memory=False)
-        source_kind = "csv"
-    lower_cols = {str(c).strip().lower(): str(c) for c in raw.columns}
-    dt_col = lower_cols.get(str(datetime_col).strip().lower()) if datetime_col else None
-    if dt_col is None:
-        for cand in ("datetime", "date_time", "timestamp", "time", "date"):
-            if cand in lower_cols:
-                dt_col = lower_cols[cand]
-                break
-    bid_col = lower_cols.get("bid")
-    ask_col = lower_cols.get("ask")
-    vol_col = lower_cols.get("volume") or lower_cols.get("vol")
-    if dt_col is None or bid_col is None or ask_col is None:
-        raise ValueError("AskBid-M1 build requires tick DateTime, Bid and Ask columns")
-    dt = _normalize_tick_datetime_series_for_askbid(raw[dt_col])
-    bid = pd.to_numeric(raw[bid_col], errors="coerce")
-    ask = pd.to_numeric(raw[ask_col], errors="coerce")
-    if vol_col is not None:
-        volume = pd.to_numeric(raw[vol_col], errors="coerce").fillna(0.0)
-    else:
-        volume = pd.Series(np.zeros(len(raw), dtype=np.float64), index=raw.index)
-    out = pd.DataFrame({"datetime": dt, "bid": bid, "ask": ask, "volume": volume})
-    out = out.dropna(subset=["datetime", "bid", "ask"])
-    out = out[(out["bid"] > 0) & (out["ask"] > 0)].copy()
-    if out.empty:
-        raise ValueError("AskBid-M1 build found no valid tick rows")
-    out["_datetime_ns"] = out["datetime"].astype("int64")
-    out = out.sort_values("_datetime_ns", kind="mergesort").reset_index(drop=True)
-    print(
-        "[prefilter-askbid-m1] "
-        f"tick_source_kind={source_kind} tick_rows_valid={len(out)} "
-        f"tick_first={_ns_to_utc_iso(int(out['_datetime_ns'].iloc[0]))} "
-        f"tick_last={_ns_to_utc_iso(int(out['_datetime_ns'].iloc[-1]))}"
-    )
-    return out
-
-
-def _build_askbid_m1_frame(
-    *,
-    feature_minute_ns: np.ndarray,
-    tick_df: pd.DataFrame,
-    entry_latency_ms: int,
-) -> tuple[pd.DataFrame, dict[str, int]]:
-    feature_minute_ns = np.asarray(feature_minute_ns, dtype=np.int64)
-    if feature_minute_ns.size <= 0:
-        raise ValueError("Feature-DF has no minutes for AskBid-M1 build")
-    if np.any(np.diff(feature_minute_ns) <= 0):
-        raise ValueError("Feature-DF datetimes must be strictly increasing and unique for AskBid-M1")
-    dt_ns = tick_df["_datetime_ns"].to_numpy(dtype=np.int64, copy=False)
-    bid = tick_df["bid"].to_numpy(dtype=np.float64, copy=False)
-    ask = tick_df["ask"].to_numpy(dtype=np.float64, copy=False)
-    volume = tick_df["volume"].to_numpy(dtype=np.float64, copy=False)
-    if dt_ns.size == 0:
-        raise ValueError("AskBid-M1 build requires at least one valid tick")
-    entry_latency_ns = int(entry_latency_ms) * 1_000_000
-    max_carry_ns = int(ASKBID_M1_MAX_CARRY_GAP_MINUTES) * NS_PER_MINUTE
-    rows: list[dict] = []
-    allowed_feature_gaps = 0
-    session_open_from_first_tick_count = 0
-    missing_price_minutes: list[int] = []
-    tick_pos = 0
-    last_bid = float("nan")
-    last_ask = float("nan")
-    last_tick_ns = None
-    for row_pos, minute_ns in enumerate(feature_minute_ns.tolist()):
-        minute_ns = int(minute_ns)
-        next_minute_ns = minute_ns + NS_PER_MINUTE
-        if row_pos > 0 and minute_ns - int(feature_minute_ns[row_pos - 1]) > NS_PER_MINUTE:
-            allowed_feature_gaps += 1
-        while tick_pos < len(dt_ns) and int(dt_ns[tick_pos]) < minute_ns:
-            last_bid = float(bid[tick_pos])
-            last_ask = float(ask[tick_pos])
-            last_tick_ns = int(dt_ns[tick_pos])
-            tick_pos += 1
-
-        start = tick_pos
-        end = start
-        while end < len(dt_ns) and int(dt_ns[end]) < next_minute_ns:
-            end += 1
-        exact_start = start < end and int(dt_ns[start]) == minute_ns
-        carry_valid = last_tick_ns is not None and (minute_ns - int(last_tick_ns)) <= max_carry_ns
-        if exact_start:
-            ask_open = float(ask[start])
-            bid_open = float(bid[start])
-        elif carry_valid:
-            ask_open = float(last_ask)
-            bid_open = float(last_bid)
-        elif start < end:
-            ask_open = float(ask[start])
-            bid_open = float(bid[start])
-            session_open_from_first_tick_count += 1
-        else:
-            missing_price_minutes.append(minute_ns)
-            tick_pos = end
-            continue
-
-        slice_ask = ask[start:end]
-        slice_bid = bid[start:end]
-        if len(slice_ask):
-            ask_high = float(max(float(np.max(slice_ask)), ask_open))
-            ask_low = float(min(float(np.min(slice_ask)), ask_open))
-            bid_high = float(max(float(np.max(slice_bid)), bid_open))
-            bid_low = float(min(float(np.min(slice_bid)), bid_open))
-            ask_close = float(slice_ask[-1])
-            bid_close = float(slice_bid[-1])
-        else:
-            ask_high = ask_low = ask_close = ask_open
-            bid_high = bid_low = bid_close = bid_open
-
-        latency_ns = minute_ns + entry_latency_ns
-        latency_end = start
-        while latency_end < end and int(dt_ns[latency_end]) <= latency_ns:
-            latency_end += 1
-        if latency_end > start:
-            ask_entry_latency = float(ask[latency_end - 1])
-            bid_at_latency = float(bid[latency_end - 1])
-        else:
-            ask_entry_latency = ask_open
-            bid_at_latency = bid_open
-        after_start = latency_end
-        while after_start > start and int(dt_ns[after_start - 1]) >= latency_ns:
-            after_start -= 1
-        after_bid = bid[after_start:end]
-        if len(after_bid):
-            bid_high_after = float(max(float(np.max(after_bid)), bid_at_latency))
-            bid_low_after = float(min(float(np.min(after_bid)), bid_at_latency))
-        else:
-            bid_high_after = bid_low_after = bid_at_latency
-        rows.append({
-            "datetime": pd.Timestamp(minute_ns, unit="ns", tz="UTC").tz_localize(None),
-            "ask_open": ask_open,
-            "ask_entry_latency": ask_entry_latency,
-            "ask_high": ask_high,
-            "ask_low": ask_low,
-            "ask_close": ask_close,
-            "bid_open": bid_open,
-            "bid_high": bid_high,
-            "bid_low": bid_low,
-            "bid_close": bid_close,
-            "bid_high_after_entry_latency": bid_high_after,
-            "bid_low_after_entry_latency": bid_low_after,
-            "volume_check": float(np.nansum(volume[start:end])) if end > start else 0.0,
-            "ticks_count": int(end - start),
-        })
-        if end > start:
-            last_bid = float(bid[end - 1])
-            last_ask = float(ask[end - 1])
-            last_tick_ns = int(dt_ns[end - 1])
-        tick_pos = end
-    if missing_price_minutes:
-        sample = ",".join(_ns_to_utc_iso(x) for x in missing_price_minutes[:5])
-        raise ValueError(
-            "AskBid-M1 build could not derive quote-continuous prices for "
-            f"{len(missing_price_minutes)} feature minutes; sample={sample}. "
-            "This usually indicates Feature-DF minutes inside an offmarket/data gap or missing initial quote."
-        )
-    frame = pd.DataFrame(rows, columns=ASKBID_M1_COLUMNS)
-    return frame, {
-        "allowed_feature_gaps": int(allowed_feature_gaps),
-        "session_open_from_first_tick_count": int(session_open_from_first_tick_count),
-    }
-
-
 def _validate_askbid_m1_frame(
     frame: pd.DataFrame,
     *,
@@ -1018,45 +1421,27 @@ def _load_askbid_m1_arrays(
 def _build_or_load_askbid_m1(
     *,
     path: Path,
-    feature_index,
+    feature_index=None,
+    feature_minute_ns: np.ndarray | None = None,
     entry_latency_ms: int,
     tick_source_path: Path | None,
     tick_datetime_column: str,
     tick_sep: str,
+    tick_chunk_size: int | str = "auto",
 ) -> dict[str, np.ndarray]:
-    feature_minute_ns = _datetime_index_to_minute_ns(feature_index)
-    if np.any(np.diff(feature_minute_ns) <= 0):
-        raise ValueError("Feature-DF datetimes must be strictly increasing and unique for AskBid-M1")
-    if path.exists():
-        print(f"[prefilter-askbid-m1] load=existing path={path}")
-        return _load_askbid_m1_arrays(
-            path,
-            feature_minute_ns=feature_minute_ns,
-            entry_latency_ms=entry_latency_ms,
-            source_tick_path=tick_source_path,
-        )
-    if tick_source_path is None:
-        raise ValueError("--tick-data is required to build missing --askbid-m1-parquet")
-    print(f"[prefilter-askbid-m1] build=start path={path} tick_source={tick_source_path}")
-    tick_df = _load_tick_source_for_askbid_m1(tick_source_path, datetime_col=tick_datetime_column, sep=tick_sep)
-    frame, build_stats = _build_askbid_m1_frame(
+    if feature_minute_ns is None:
+        if feature_index is None:
+            raise ValueError("feature_index or feature_minute_ns is required for AskBid-M1 load/build")
+        feature_minute_ns = _datetime_index_to_minute_ns(feature_index)
+    feature_minute_ns = _ensure_plausible_minute_grid(feature_minute_ns, context="build_or_load_askbid_m1")
+    _ensure_askbid_m1_parquet_ready(
+        path=path,
         feature_minute_ns=feature_minute_ns,
-        tick_df=tick_df,
         entry_latency_ms=int(entry_latency_ms),
-    )
-    metadata = _askbid_m1_metadata(
-        entry_latency_ms=int(entry_latency_ms),
-        feature_minute_ns=feature_minute_ns,
-        source_tick_path=tick_source_path,
-    )
-    _write_askbid_m1_parquet(path, frame, metadata)
-    print(
-        "[prefilter-askbid-m1] "
-        f"build=done path={path} rows={len(frame)} "
-        f"feature_minutes={len(feature_minute_ns)} covered_feature_minutes={len(frame)} "
-        f"allowed_offmarket_gaps={int(build_stats.get('allowed_feature_gaps', 0))} "
-        f"session_open_from_first_tick_count={int(build_stats.get('session_open_from_first_tick_count', 0))} "
-        f"entry_latency_ms={int(entry_latency_ms)}"
+        tick_source_path=tick_source_path,
+        tick_datetime_column=tick_datetime_column,
+        tick_sep=tick_sep,
+        tick_chunk_size=tick_chunk_size,
     )
     return _load_askbid_m1_arrays(
         path,
@@ -1856,6 +2241,25 @@ def main() -> None:
         "tick_cache_diagnostics_skipped": True,
     }
 
+    if args.askbid_m1_parquet is None:
+        raise ValueError("--askbid-m1-parquet is required for Prefilter labels/outcomes; old OHLC label simulation is disabled")
+
+    t0 = time.perf_counter()
+    feature_minute_ns_minimal = _load_feature_minute_grid_minimal(args.features)
+    timing["load_feature_minute_grid_minimal_sec"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    _ensure_askbid_m1_parquet_ready(
+        path=args.askbid_m1_parquet,
+        feature_minute_ns=feature_minute_ns_minimal,
+        entry_latency_ms=int(args.entry_latency_ms),
+        tick_source_path=args.tick_data,
+        tick_datetime_column=args.tick_datetime_column,
+        tick_sep=args.tick_sep,
+        tick_chunk_size=args.tick_chunk_size,
+    )
+    timing["ensure_askbid_m1_sec"] = time.perf_counter() - t0
+
     t0 = time.perf_counter()
     df = miner.load_features(args.features)
     timing["load_features_sec"] = time.perf_counter() - t0
@@ -1870,16 +2274,14 @@ def main() -> None:
     train_idx = max(1, min(int(n * float(args.train_frac)), n - 1))
 
     bar_time_ns = _datetime_index_to_minute_ns(df.index)
+    if not np.array_equal(bar_time_ns, feature_minute_ns_minimal):
+        raise ValueError("Full feature datetime index differs from the early minimal feature datetime grid")
 
-    if args.askbid_m1_parquet is None:
-        raise ValueError("--askbid-m1-parquet is required for Prefilter labels/outcomes; old OHLC label simulation is disabled")
-    askbid_m1_arrays = _build_or_load_askbid_m1(
-        path=args.askbid_m1_parquet,
-        feature_index=df.index,
+    askbid_m1_arrays = _load_askbid_m1_arrays(
+        args.askbid_m1_parquet,
+        feature_minute_ns=bar_time_ns,
         entry_latency_ms=int(args.entry_latency_ms),
-        tick_source_path=args.tick_data,
-        tick_datetime_column=args.tick_datetime_column,
-        tick_sep=args.tick_sep,
+        source_tick_path=args.tick_data,
     )
     print(
         "[prefilter-askbid-m1] "
@@ -2627,6 +3029,8 @@ def main() -> None:
                     for idx_i, rec in tick_map_new.items():
                         tick_map[int(idx_i)] = dict(rec)
                         cached_entries[int(idx_i)] = dict(rec)
+                    del tick_time_ns_all, tick_minute_bounds, tick_bids_all, tick_asks_all
+                    gc.collect()
                     if args.tick_entry_cache_npz is not None:
                         cache_write_t0 = time.perf_counter()
                         _write_tick_entry_cache(args.tick_entry_cache_npz, tick_entry_cache_sig, cached_entries)
