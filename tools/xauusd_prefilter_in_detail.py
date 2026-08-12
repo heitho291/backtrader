@@ -550,12 +550,42 @@ def _load_stage_csv_if_match(
         return None
     df = pd.read_csv(path)
     if df.empty:
-        if rebuild_legacy:
-            print(f"[prefilter-resume] {expected_stage} CSV is empty; rebuilding it from source data: {path}")
-            return None
         raise ValueError(f"{expected_stage} CSV is empty and was not modified: {path}. Use a different output path.")
+    if "__stage" not in df.columns:
+        raise ValueError(
+            f"Cannot identify {expected_stage} CSV stage at {path}: missing __stage. "
+            "The existing file was not modified."
+        )
+    stage_vals = {str(x) for x in df["__stage"].dropna().unique().tolist()}
+    if stage_vals != {expected_stage}:
+        raise ValueError(
+            f"Invalid {expected_stage} CSV stage at {path}: found={sorted(stage_vals)} expected={expected_stage}. "
+            "The existing file was not modified."
+        )
     if "__schema_version" not in df.columns:
         if rebuild_legacy:
+            legacy_coarse_cols = {
+                "candidate_key",
+                "stable_candidate_key",
+                "col",
+                "op",
+                "value",
+                "coarse_single_pos_hits",
+                "coarse_single_neg_hits",
+                "coarse_single_mask_count",
+                "coarse_single_ratio",
+                "coarse_lift",
+                "build_min_single_pos_hits",
+                "build_max_single_mask_count",
+                "build_min_single_lift",
+                "__ctx_sig",
+            }
+            missing_legacy_cols = sorted(legacy_coarse_cols.difference(df.columns))
+            if missing_legacy_cols:
+                raise ValueError(
+                    f"Cannot identify legacy coarse CSV at {path}: missing legacy columns={missing_legacy_cols}. "
+                    "The existing file was not modified."
+                )
             print(f"[prefilter-resume] legacy {expected_stage} CSV schema detected; rebuilding from source data without reusing rows: {path}")
             return None
         raise ValueError(
@@ -568,9 +598,9 @@ def _load_stage_csv_if_match(
             f"Incompatible {expected_stage} CSV schema at {path}: found={sorted(schema_vals)} "
             f"expected={expected_schema_version}. The existing file was not modified; use a different output path."
         )
-    if "__stage" not in df.columns or "__ctx_sig" not in df.columns:
+    if "__ctx_sig" not in df.columns:
         raise ValueError(
-            f"Invalid current-schema {expected_stage} CSV at {path}: missing __stage/__ctx_sig. "
+            f"Invalid current-schema {expected_stage} CSV at {path}: missing __ctx_sig. "
             "The existing file was not modified."
         )
     required_cols = {
@@ -598,18 +628,20 @@ def _load_stage_csv_if_match(
             f"Invalid current-schema {expected_stage} CSV at {path}: missing columns={missing_cols}. "
             "The existing file was not modified."
         )
-    stage_vals = {str(x) for x in df["__stage"].dropna().unique().tolist()}
     sig_vals = {str(x) for x in df["__ctx_sig"].dropna().unique().tolist()}
-    if stage_vals != {expected_stage}:
-        raise ValueError(
-            f"Invalid {expected_stage} CSV stage at {path}: found={sorted(stage_vals)} expected={expected_stage}. "
-            "The existing file was not modified."
-        )
     if sig_vals != {expected_ctx_sig}:
         raise ValueError(
             f"{expected_stage} CSV context mismatch at {path}: csv_ctx_sigs={sorted(sig_vals)} "
             f"expected_ctx_sig={expected_ctx_sig}. The existing file was not modified because it belongs "
             "to a different semantic context; use a different output path."
+        )
+    duplicate_stable_keys = df["stable_candidate_key"].astype(str).str.strip().duplicated(keep=False)
+    empty_stable_keys = df["stable_candidate_key"].isna() | (df["stable_candidate_key"].astype(str).str.strip() == "")
+    if bool(duplicate_stable_keys.any()) or bool(empty_stable_keys.any()):
+        duplicate_values = sorted(set(df.loc[duplicate_stable_keys, "stable_candidate_key"].astype(str).tolist()))
+        raise ValueError(
+            f"Invalid {expected_stage} CSV at {path}: duplicate_stable_candidate_keys={duplicate_values} "
+            f"empty_stable_candidate_keys={int(empty_stable_keys.sum())}. The existing file was not modified."
         )
     return df
 

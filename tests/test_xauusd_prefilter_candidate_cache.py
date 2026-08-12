@@ -49,6 +49,15 @@ def _current_coarse_frame(ctx_sig="ctx"):
     return pd.DataFrame(rows)
 
 
+def _legacy_coarse_frame(stage="coarse"):
+    frame = _current_coarse_frame().drop(columns=["__schema_version"])
+    frame["__stage"] = stage
+    frame["build_min_single_pos_hits"] = 2
+    frame["build_max_single_mask_count"] = 0
+    frame["build_min_single_lift"] = 1.01
+    return frame
+
+
 def test_runtime_filters_do_not_mutate_inventory():
     inventory = _rows()
     strict = prefilter._filter_candidate_inventory_rows(inventory, 5, 1.5, 10, None)
@@ -83,7 +92,7 @@ def test_full_tick_metrics_do_not_require_tick_lift():
 
 def test_legacy_coarse_requests_fresh_rebuild(tmp_path):
     path = tmp_path / "coarse.csv"
-    _current_coarse_frame().drop(columns=["__schema_version"]).to_csv(path, index=False)
+    _legacy_coarse_frame().to_csv(path, index=False)
     assert prefilter._load_stage_csv_if_match(
         path,
         "coarse",
@@ -346,3 +355,72 @@ def test_single_candidate_masks_are_released_before_search_setup():
     assert "if str(it[\"stable_candidate_key\"]) in mask_required_keys" in source
     assert "by_mask.clear()" in source
     assert "x = m = raw_train_m = m_sel = cur = None" in source
+
+
+def test_schema_less_refined_stage_is_not_rebuilt_as_legacy_coarse(tmp_path):
+    path = tmp_path / "wrong-stage.csv"
+    _legacy_coarse_frame(stage="refined").to_csv(path, index=False)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match=r"found=\['refined'\].*expected=coarse"):
+        prefilter._load_stage_csv_if_match(
+            path, "coarse", "ctx", prefilter.CANDIDATE_CACHE_SCHEMA_VERSION, rebuild_legacy=True
+        )
+    assert path.read_bytes() == before
+
+
+def test_current_coarse_reload_preserves_inventory_runtime_family_and_tick_scope(tmp_path):
+    path = tmp_path / "coarse.csv"
+    frame = _current_coarse_frame()
+    frame.to_csv(path, index=False)
+    loaded = prefilter._load_stage_csv_if_match(
+        path, "coarse", "ctx", prefilter.CANDIDATE_CACHE_SCHEMA_VERSION, rebuild_legacy=True
+    )
+    inventory = loaded.to_dict("records")
+    for row in inventory:
+        row.update(
+            {
+                "_family": row["family"],
+                "lift": row["coarse_lift"],
+                "_single_pos_hits": row["coarse_single_pos_hits"],
+                "_single_mask_count": row["coarse_single_mask_count"],
+            }
+        )
+    runtime = prefilter._filter_candidate_inventory_rows(inventory, 2, 1.5, 0, None)
+    family = prefilter._family_top_rows(runtime, 1)
+    assert {row["stable_candidate_key"] for row in inventory} == {"a|>=|1", "b|>=|2"}
+    assert [row["stable_candidate_key"] for row in runtime] == ["b|>=|2"]
+    assert [row["stable_candidate_key"] for row in family] == ["b|>=|2"]
+    assert prefilter._tick_scope_keys("all_coarse", inventory, runtime, family) == {"a|>=|1", "b|>=|2"}
+
+
+def test_strict_then_loose_filters_leave_same_current_coarse_cache_unchanged(tmp_path):
+    path = tmp_path / "coarse.csv"
+    _current_coarse_frame().to_csv(path, index=False)
+    before = path.read_bytes()
+    strict_loaded = prefilter._load_stage_csv_if_match(
+        path, "coarse", "ctx", prefilter.CANDIDATE_CACHE_SCHEMA_VERSION, rebuild_legacy=True
+    ).to_dict("records")
+    strict = prefilter._filter_candidate_inventory_rows(strict_loaded, 5, 1.5, 10, None)
+    loose_loaded = prefilter._load_stage_csv_if_match(
+        path, "coarse", "ctx", prefilter.CANDIDATE_CACHE_SCHEMA_VERSION, rebuild_legacy=True
+    ).to_dict("records")
+    loose = prefilter._filter_candidate_inventory_rows(loose_loaded, 0, 0.0, 0, None)
+    assert len(strict) == 1
+    assert len(loose) == 2
+    assert {row["stable_candidate_key"] for row in strict_loaded} == {
+        row["stable_candidate_key"] for row in loose_loaded
+    }
+    assert path.read_bytes() == before
+
+
+def test_current_coarse_duplicate_stable_keys_fail_fast_and_preserve_file(tmp_path):
+    path = tmp_path / "coarse.csv"
+    frame = _current_coarse_frame()
+    frame.loc[1, "stable_candidate_key"] = frame.loc[0, "stable_candidate_key"]
+    frame.to_csv(path, index=False)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="duplicate_stable_candidate_keys"):
+        prefilter._load_stage_csv_if_match(
+            path, "coarse", "ctx", prefilter.CANDIDATE_CACHE_SCHEMA_VERSION, rebuild_legacy=True
+        )
+    assert path.read_bytes() == before
