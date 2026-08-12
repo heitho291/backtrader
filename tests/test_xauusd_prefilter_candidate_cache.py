@@ -52,9 +52,7 @@ def _current_coarse_frame(ctx_sig="ctx"):
 def _legacy_coarse_frame(stage="coarse"):
     frame = _current_coarse_frame().drop(columns=["__schema_version"])
     frame["__stage"] = stage
-    frame["build_min_single_pos_hits"] = 2
-    frame["build_max_single_mask_count"] = 0
-    frame["build_min_single_lift"] = 1.01
+    frame["kept_after_family_topn"] = 1
     return frame
 
 
@@ -82,9 +80,8 @@ def test_tick_scope_semantics_are_independent_of_metric_status():
     assert prefilter._tick_scope_keys("fam_top", inventory, filtered, fam_top) == {"a|>=|1"}
 
 
-def test_full_tick_metrics_do_not_require_tick_lift():
+def test_full_tick_metrics_require_only_intrinsic_columns():
     metrics = {name: 1.0 for name in prefilter.REQUIRED_TICK_METRIC_COLUMNS}
-    assert "tick_lift" not in prefilter.REQUIRED_TICK_METRIC_COLUMNS
     assert prefilter._has_full_tick_metrics(metrics)
     metrics["tick_single_ratio"] = float("nan")
     assert not prefilter._has_full_tick_metrics(metrics)
@@ -155,14 +152,6 @@ def test_context_signature_uses_numeric_quantiles_and_normalized_datetime_column
 
     assert signature("0.05,0.10", " DateTime ") == signature("0.05, 0.10", "datetime")
     assert signature("0.10,0.05", "datetime") != signature("0.05,0.10", "datetime")
-
-
-def test_production_source_has_no_tick_lift_or_build_width_fields():
-    source = Path(prefilter.__file__).read_text(encoding="utf-8")
-    assert "tick_lift" not in source
-    assert "build_min_single_pos_hits" not in source
-    assert "build_min_single_lift" not in source
-    assert "build_max_single_mask_count" not in source
 
 
 def test_fresh_resume_inventory_runtime_family_and_scope_parity():

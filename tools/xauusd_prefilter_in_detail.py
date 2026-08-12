@@ -574,16 +574,21 @@ def _load_stage_csv_if_match(
                 "coarse_single_neg_hits",
                 "coarse_single_mask_count",
                 "coarse_single_ratio",
+                "coarse_single_mask_keep_ratio",
+                "coarse_single_ratio_change",
                 "coarse_lift",
-                "build_min_single_pos_hits",
-                "build_max_single_mask_count",
-                "build_min_single_lift",
+                "family",
+                "binary",
+                "kept_after_family_topn",
                 "__ctx_sig",
             }
+            refined_specific_cols = {"candidate_key_refined", "tick_metric_status", *REQUIRED_TICK_METRIC_COLUMNS}
             missing_legacy_cols = sorted(legacy_coarse_cols.difference(df.columns))
-            if missing_legacy_cols:
+            found_refined_cols = sorted(refined_specific_cols.intersection(df.columns))
+            if missing_legacy_cols or found_refined_cols:
                 raise ValueError(
-                    f"Cannot identify legacy coarse CSV at {path}: missing legacy columns={missing_legacy_cols}. "
+                    f"Cannot identify legacy coarse CSV at {path}: missing legacy columns={missing_legacy_cols} "
+                    f"refined-specific columns={found_refined_cols}. "
                     "The existing file was not modified."
                 )
             print(f"[prefilter-resume] legacy {expected_stage} CSV schema detected; rebuilding from source data without reusing rows: {path}")
