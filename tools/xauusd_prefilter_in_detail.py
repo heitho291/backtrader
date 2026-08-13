@@ -4,6 +4,7 @@
 Uses feature and binned-feature files for feature/mask construction, builds labels
 from AskBid-M1 entry/exit prices, then searches complete rule combinations.
 """
+# TEMPORARY PR-BEHAVIOR PROBE 2 - remove after UI test.
 
 from __future__ import annotations
 
@@ -58,6 +59,16 @@ ASKBID_M1_PRICE_COLUMNS = [
 ]
 ASKBID_M1_SEMANTICS = "askbid_m1_quote_continuous_feature_grid_v1_entry_latency_after_bounds_v1"
 ASKBID_M1_MAX_CARRY_GAP_MINUTES = 360
+CANDIDATE_CACHE_SCHEMA_VERSION = "candidate_inventory_v2"
+REFINED_CACHE_SCHEMA_VERSION = "candidate_refined_intrinsic_metrics_v2"
+REQUIRED_TICK_METRIC_COLUMNS = (
+    "tick_single_pos_hits",
+    "tick_single_neg_hits",
+    "tick_single_mask_count",
+    "tick_single_ratio",
+    "tick_single_mask_keep_ratio",
+    "tick_single_ratio_change",
+)
 
 
 def _load_miner_module(path: Path):
@@ -258,7 +269,7 @@ def _write_csv_if_changed(path: Path, frame: pd.DataFrame, key_cols: list[str] |
 def _ordered_frame(rows: list[dict], preferred_cols: list[str]) -> pd.DataFrame:
     frame = pd.DataFrame(rows)
     if frame.empty:
-        return frame
+        return pd.DataFrame(columns=preferred_cols)
     extra = [c for c in frame.columns if c not in preferred_cols]
     return frame[[c for c in preferred_cols if c in frame.columns] + extra]
 
@@ -528,25 +539,201 @@ def _ctx_sig(obj: dict) -> str:
     return hashlib.sha1(json.dumps(obj, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def _load_stage_csv_if_match(path: Path | None, expected_stage: str, expected_ctx_sig: str) -> pd.DataFrame | None:
+def _load_stage_csv_if_match(
+    path: Path | None,
+    expected_stage: str,
+    expected_ctx_sig: str,
+    expected_schema_version: str,
+    *,
+    rebuild_legacy: bool,
+) -> pd.DataFrame | None:
     if path is None or (not path.exists()):
         return None
     df = pd.read_csv(path)
     if df.empty:
-        return None
-    if "__stage" not in df.columns or "__ctx_sig" not in df.columns:
-        return None
+        raise ValueError(f"{expected_stage} CSV is empty and was not modified: {path}. Use a different output path.")
+    if "__stage" not in df.columns:
+        raise ValueError(
+            f"Cannot identify {expected_stage} CSV stage at {path}: missing __stage. "
+            "The existing file was not modified."
+        )
     stage_vals = {str(x) for x in df["__stage"].dropna().unique().tolist()}
-    sig_vals = {str(x) for x in df["__ctx_sig"].dropna().unique().tolist()}
     if stage_vals != {expected_stage}:
-        return None
+        raise ValueError(
+            f"Invalid {expected_stage} CSV stage at {path}: found={sorted(stage_vals)} expected={expected_stage}. "
+            "The existing file was not modified."
+        )
+    if "__schema_version" not in df.columns:
+        if rebuild_legacy:
+            legacy_coarse_cols = {
+                "candidate_key",
+                "stable_candidate_key",
+                "col",
+                "op",
+                "value",
+                "coarse_single_pos_hits",
+                "coarse_single_neg_hits",
+                "coarse_single_mask_count",
+                "coarse_single_ratio",
+                "coarse_single_mask_keep_ratio",
+                "coarse_single_ratio_change",
+                "coarse_lift",
+                "family",
+                "binary",
+                "kept_after_family_topn",
+                "__ctx_sig",
+            }
+            refined_specific_cols = {"candidate_key_refined", "tick_metric_status", *REQUIRED_TICK_METRIC_COLUMNS}
+            missing_legacy_cols = sorted(legacy_coarse_cols.difference(df.columns))
+            found_refined_cols = sorted(refined_specific_cols.intersection(df.columns))
+            if missing_legacy_cols or found_refined_cols:
+                raise ValueError(
+                    f"Cannot identify legacy coarse CSV at {path}: missing legacy columns={missing_legacy_cols} "
+                    f"refined-specific columns={found_refined_cols}. "
+                    "The existing file was not modified."
+                )
+            print(f"[prefilter-resume] legacy {expected_stage} CSV schema detected; rebuilding from source data without reusing rows: {path}")
+            return None
+        raise ValueError(
+            f"Legacy {expected_stage} CSV schema at {path}; the existing file was not modified. "
+            "Use a different output path for the current refined schema."
+        )
+    schema_vals = {str(x) for x in df["__schema_version"].dropna().unique().tolist()}
+    if schema_vals != {expected_schema_version}:
+        raise ValueError(
+            f"Incompatible {expected_stage} CSV schema at {path}: found={sorted(schema_vals)} "
+            f"expected={expected_schema_version}. The existing file was not modified; use a different output path."
+        )
+    if "__ctx_sig" not in df.columns:
+        raise ValueError(
+            f"Invalid current-schema {expected_stage} CSV at {path}: missing __ctx_sig. "
+            "The existing file was not modified."
+        )
+    required_cols = {
+        "stable_candidate_key",
+        "col",
+        "op",
+        "value",
+        "family",
+        "coarse_single_pos_hits",
+        "coarse_single_neg_hits",
+        "coarse_single_mask_count",
+        "coarse_single_ratio",
+        "coarse_single_mask_keep_ratio",
+        "coarse_single_ratio_change",
+        "coarse_lift",
+        "binary",
+    }
+    if expected_stage == "refined":
+        required_cols.update({"candidate_key_refined", "tick_metric_status", *REQUIRED_TICK_METRIC_COLUMNS})
+    else:
+        required_cols.add("candidate_key")
+    missing_cols = sorted(required_cols.difference(df.columns))
+    if missing_cols:
+        raise ValueError(
+            f"Invalid current-schema {expected_stage} CSV at {path}: missing columns={missing_cols}. "
+            "The existing file was not modified."
+        )
+    sig_vals = {str(x) for x in df["__ctx_sig"].dropna().unique().tolist()}
     if sig_vals != {expected_ctx_sig}:
-        got_sig = next(iter(sig_vals), "")
-        print(f"[prefilter-resume] {expected_stage} CSV context mismatch")
-        print(f"[prefilter-resume] csv_ctx_sig={got_sig}")
-        print(f"[prefilter-resume] expected_ctx_sig={expected_ctx_sig}")
-        return None
+        raise ValueError(
+            f"{expected_stage} CSV context mismatch at {path}: csv_ctx_sigs={sorted(sig_vals)} "
+            f"expected_ctx_sig={expected_ctx_sig}. The existing file was not modified because it belongs "
+            "to a different semantic context; use a different output path."
+        )
+    duplicate_stable_keys = df["stable_candidate_key"].astype(str).str.strip().duplicated(keep=False)
+    empty_stable_keys = df["stable_candidate_key"].isna() | (df["stable_candidate_key"].astype(str).str.strip() == "")
+    if bool(duplicate_stable_keys.any()) or bool(empty_stable_keys.any()):
+        duplicate_values = sorted(set(df.loc[duplicate_stable_keys, "stable_candidate_key"].astype(str).tolist()))
+        raise ValueError(
+            f"Invalid {expected_stage} CSV at {path}: duplicate_stable_candidate_keys={duplicate_values} "
+            f"empty_stable_candidate_keys={int(empty_stable_keys.sum())}. The existing file was not modified."
+        )
     return df
+
+
+def _has_full_tick_metrics(obj: dict) -> bool:
+    try:
+        return all(np.isfinite(float(obj.get(k, np.nan))) for k in REQUIRED_TICK_METRIC_COLUMNS)
+    except Exception:
+        return False
+
+
+def _filter_candidate_inventory_rows(
+    rows: list[dict],
+    min_pos: int,
+    min_lift: float,
+    max_mask: int,
+    allow_keys: set[str] | None,
+) -> list[dict]:
+    out = list(rows)
+    if int(min_pos) > 0:
+        out = [r for r in out if int(r.get("coarse_single_pos_hits", r.get("_single_pos_hits", 0))) >= int(min_pos)]
+    if float(min_lift) > 0:
+        out = [r for r in out if float(r.get("coarse_lift", r.get("lift", 0.0))) >= float(min_lift)]
+    if int(max_mask) > 0:
+        out = [r for r in out if int(r.get("coarse_single_mask_count", r.get("_single_mask_count", 0))) <= int(max_mask)]
+    if allow_keys is not None:
+        out = [r for r in out if str(r.get("candidate_key", "")) in allow_keys]
+    return out
+
+
+def _tick_scope_keys(scope: str, inventory: list[dict], filtered: list[dict], fam_top: list[dict]) -> set[str]:
+    selected = fam_top if scope == "fam_top" else filtered if scope == "filtered" else inventory
+    return {str(r.get("stable_candidate_key", "")) for r in selected}
+
+
+def _family_top_rows(rows: list[dict], family_top_n: int) -> list[dict]:
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(str(row["_family"]), []).append(row)
+    out: list[dict] = []
+    for group in groups.values():
+        ranked = sorted(group, key=lambda z: (-float(z["lift"]), -int(z["_single_pos_hits"]), int(z["_single_mask_count"])))
+        out.extend(ranked[: int(family_top_n)])
+    return out
+
+
+def _mask_required_keys(tick_scope_keys: set[str], replay_enabled: bool) -> set[str]:
+    return set(tick_scope_keys) if replay_enabled else set()
+
+
+def _partition_tick_metric_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    full = [row for row in rows if _has_full_tick_metrics(row)]
+    missing = [row for row in rows if not _has_full_tick_metrics(row)]
+    return full, missing
+
+
+def _prefer_refined_row(old: dict | None, new: dict, ctx_sig: str, schema_version: str) -> dict:
+    if old is None:
+        return new
+    status_rank = {"full": 3, "missing": 2, "out_of_scope": 1}
+    old_status = "full" if _has_full_tick_metrics(old) else str(old.get("tick_metric_status", "out_of_scope"))
+    new_status = "full" if _has_full_tick_metrics(new) else str(new.get("tick_metric_status", "out_of_scope"))
+    if int(status_rank.get(new_status, 0)) >= int(status_rank.get(old_status, 0)):
+        return new
+    kept = dict(old)
+    kept["__ctx_sig"] = ctx_sig
+    kept["__stage"] = "refined"
+    kept["__schema_version"] = schema_version
+    kept["tick_metric_status"] = "full" if _has_full_tick_metrics(kept) else old_status
+    return kept
+
+
+def _refined_rows_for_inventory(inventory: list[dict], rows_by_key: dict[str, dict]) -> list[dict]:
+    return [rows_by_key[str(row["stable_candidate_key"])] for row in inventory]
+
+
+def _refinement_state(scope_rows: int, replay_enabled: bool, missing_after: int, replay_entries: int) -> str:
+    if int(scope_rows) == 0:
+        return "empty_scope"
+    if not replay_enabled:
+        return "no_replay_configured"
+    if int(missing_after) > 0 and int(replay_entries) == 0:
+        return "null_critical_entries_existing_semantics"
+    if int(missing_after) > 0:
+        return "incomplete"
+    return "complete"
 
 
 def _load_allowlist(path: Path | None) -> tuple[set[str] | None, bool]:
@@ -2515,6 +2702,7 @@ def main() -> None:
 
     ranking_prep_t0 = time.perf_counter()
     allow_keys, allow_keys_refined = _load_allowlist(args.include_candidates_file)
+    qs = [float(x) for x in str(args.quantiles).split(",") if x.strip()]
     coarse_ctx = {
         "features_sig": _file_sig(args.features),
         "price_basis": "askbid_m1",
@@ -2525,142 +2713,60 @@ def main() -> None:
         "meta_sig": _file_sig(args.binned_metadata),
         "label_cache_key": cache_key,
         "train_frac": float(args.train_frac),
-        "quantiles": str(args.quantiles),
+        "quantiles": qs,
         "family_split_delta_window": int(bool(args.family_split_delta_window)),
         "entry_selection_semantics_version": "cluster_gap_lower_maxopen_v1",
         "cluster_gap_minutes": int(args.cluster_gap_minutes),
         "max_entries_per_cluster": int(args.max_entries_per_cluster),
         "max_open_trades": int(args.max_open_trades),
         "cluster_only_lower_entry": int(bool(args.cluster_only_lower_entry)),
+        "candidate_inventory_semantics_version": CANDIDATE_CACHE_SCHEMA_VERSION,
     }
     coarse_ctx_sig = _ctx_sig(coarse_ctx)
     coarse_out = args.out_candidates_coarse_csv
     refined_out = args.out_candidates_refined_csv
     coarse_csv_load_t0 = time.perf_counter()
-    coarse_resume = _load_stage_csv_if_match(coarse_out, "coarse", coarse_ctx_sig)
+    coarse_resume = _load_stage_csv_if_match(
+        coarse_out,
+        "coarse",
+        coarse_ctx_sig,
+        CANDIDATE_CACHE_SCHEMA_VERSION,
+        rebuild_legacy=True,
+    )
     timing_detail2["coarse_csv_load_sec"] += time.perf_counter() - coarse_csv_load_t0
-    coarse_existing_rows: dict[str, dict] = {}
-    coarse_build_min_pos = int(args.min_single_pos_hits)
-    coarse_build_max_mask = int(args.max_single_mask_count)
-    coarse_build_min_lift = float(args.min_single_lift)
-    if coarse_resume is not None and len(coarse_resume) > 0:
-        b_pos = int(coarse_resume.get("build_min_single_pos_hits", pd.Series([args.min_single_pos_hits])).iloc[0])
-        b_mask = int(coarse_resume.get("build_max_single_mask_count", pd.Series([args.max_single_mask_count])).iloc[0])
-        b_lift = float(coarse_resume.get("build_min_single_lift", pd.Series([args.min_single_lift])).iloc[0])
-        c_pos = int(args.min_single_pos_hits)
-        c_mask = int(args.max_single_mask_count)
-        c_lift = float(args.min_single_lift)
-        coarse_build_min_pos = min(b_pos, c_pos)
-        coarse_build_min_lift = min(b_lift, c_lift)
-        coarse_build_max_mask = 0 if (b_mask == 0 or c_mask == 0) else max(b_mask, c_mask)
-        too_narrow_reasons = []
-        if b_mask == 0:
-            pass
-        elif c_mask == 0:
-            too_narrow_reasons.append("max_single_mask_count")
-        elif c_mask > b_mask:
-            too_narrow_reasons.append("max_single_mask_count")
-        if c_pos < b_pos:
-            too_narrow_reasons.append("min_single_pos_hits")
-        if c_lift < b_lift:
-            too_narrow_reasons.append("min_single_lift")
-        for _, r in coarse_resume.iterrows():
-            try:
-                c_col = str(r.get("col", ""))
-                c_op = str(r.get("op", ""))
-                c_val = _canonicalize_candidate_value(c_col, c_op, float(r.get("value", np.nan)))
-                stable_k = _stable_candidate_key(c_col, c_op, c_val)
-            except Exception:
-                stable_k = str(r.get("candidate_key", "")).strip()
-            if stable_k:
-                row = {k: r.get(k) for k in r.index}
-                row["stable_candidate_key"] = stable_k
-                coarse_existing_rows[stable_k] = row
-        print(f"[prefilter-resume] coarse_build_min_single_pos_hits={b_pos} current_min_single_pos_hits={c_pos}")
-        print(f"[prefilter-resume] coarse_build_max_single_mask_count={b_mask} current_max_single_mask_count={c_mask}")
-        print(f"[prefilter-resume] coarse_build_min_single_lift={b_lift} current_min_single_lift={c_lift}")
-        if too_narrow_reasons:
-            print(f"[prefilter-resume] coarse CSV will be extended for wider runtime filters: {','.join(too_narrow_reasons)}")
-            coarse_resume = None
-        else:
-            print("[prefilter-resume] coarse CSV reused (build width is sufficient)")
-
     items = []
-    filtered_items: list[dict] = []
+    inventory_mask_items: list[dict] = []
+    candidate_inventory_rows: list[dict] = []
     single_rejects = {"min_pos": 0, "min_lift": 0, "mask_count": 0, "allowlist": 0}
     if coarse_resume is not None:
         rows_loaded_coarse = int(len(coarse_resume))
-        rows_reconstructed = 0
+        stable_seen: set[str] = set()
         for _, r in coarse_resume.iterrows():
-            coarse_filter_t0 = time.perf_counter()
             key = str(r.get("candidate_key", "")).strip()
             col = str(r["col"]); op = str(r["op"]); val = _canonicalize_candidate_value(col, op, float(r["value"]))
             stable_k = _stable_candidate_key(col, op, val)
             if not key:
                 key = stable_k
-            pos0 = int(r.get("coarse_single_pos_hits", 0))
-            lift0 = float(r.get("coarse_lift", 0.0))
-            mask0 = int(r.get("coarse_single_mask_count", 0))
-            if int(args.min_single_pos_hits) > 0 and pos0 < int(args.min_single_pos_hits):
-                timing_detail2["coarse_rows_filter_sec"] += time.perf_counter() - coarse_filter_t0
-                single_rejects["min_pos"] += 1; continue
-            if float(args.min_single_lift) > 0 and lift0 < float(args.min_single_lift):
-                timing_detail2["coarse_rows_filter_sec"] += time.perf_counter() - coarse_filter_t0
-                single_rejects["min_lift"] += 1; continue
-            if int(args.max_single_mask_count) > 0 and mask0 > int(args.max_single_mask_count):
-                timing_detail2["coarse_rows_filter_sec"] += time.perf_counter() - coarse_filter_t0
-                single_rejects["mask_count"] += 1; continue
-            if allow_keys is not None and str(key) not in allow_keys:
-                timing_detail2["coarse_rows_filter_sec"] += time.perf_counter() - coarse_filter_t0
-                single_rejects["allowlist"] += 1; continue
-            timing_detail2["coarse_rows_filter_sec"] += time.perf_counter() - coarse_filter_t0
-            coarse_reconstruct_t0 = time.perf_counter()
-            xvec = pd.to_numeric(bdf[col] if op == "==" else df[col], errors="coerce").to_numpy(copy=False)
-            if op == "==":
-                m = np.isfinite(xvec) & (np.abs(xvec - val) <= 1e-6)
-            elif op == ">=":
-                m = np.isfinite(xvec) & (xvec >= val)
-            else:
-                m = np.isfinite(xvec) & (xvec <= val)
-            raw_train_m = m[:train_idx]
-            coarse_raw_pos = int(np.sum(raw_train_m & (y_train == 1)))
-            coarse_raw_neg = int(np.sum(raw_train_m & (y_train == 0)))
-            coarse_raw_mask_count = int(coarse_raw_pos + coarse_raw_neg)
-            coarse_raw_ratio = coarse_raw_pos / max(1, coarse_raw_neg)
-            m_sel, _, _ = _select_entries_for_mask(m, y, t_exit)
-            rows_reconstructed += 1
-            pos_hits = int(np.sum(m_sel[:train_idx] & (y_train == 1)))
-            neg_hits = int(np.sum(m_sel[:train_idx] & (y_train == 0)))
-            mask_count = int(pos_hits + neg_hits)
-            ratio = pos_hits / max(1, neg_hits)
-            lift = (pos_hits / max(1, int(np.sum(y_train == 1)))) / max(1e-12, (neg_hits / max(1, int(np.sum(y_train == 0)))))
-            coarse_mask_keep_ratio = _safe_ratio_or_nan(mask_count, coarse_raw_mask_count)
-            coarse_ratio_change = _safe_ratio_or_nan(ratio, coarse_raw_ratio)
-            reconstruct_elapsed = time.perf_counter() - coarse_reconstruct_t0
-            timing_detail2["coarse_reconstruct_sec"] += reconstruct_elapsed
-            filtered_items.append({
-                "candidate_key": key, "stable_candidate_key": stable_k, "col": col, "op": op, "value": val, "mask": m,
+            if not stable_k or stable_k in stable_seen:
+                raise ValueError(f"Invalid coarse CSV {coarse_out}: duplicate/empty stable_candidate_key={stable_k!r}; file was not modified")
+            stable_seen.add(stable_k)
+            pos_hits = int(r.get("coarse_single_pos_hits", 0)); neg_hits = int(r.get("coarse_single_neg_hits", 0))
+            mask_count = int(r.get("coarse_single_mask_count", pos_hits + neg_hits))
+            ratio = float(r.get("coarse_single_ratio", pos_hits / max(1, neg_hits)))
+            lift = float(r.get("coarse_lift", 0.0))
+            candidate_inventory_rows.append({
+                "candidate_key": key, "stable_candidate_key": stable_k, "col": col, "op": op, "value": val,
                 "binary": bool(int(r.get("binary", 0))), "_family": str(r.get("family", _candidate_family(col, bool(args.family_split_delta_window)))),
-                "_single_pos_hits": pos_hits,
-                "_single_neg_hits": neg_hits,
-                "_single_mask_count": mask_count,
-                "_single_ratio": float(ratio),
-                "coarse_single_pos_hits": pos_hits,
-                "coarse_single_neg_hits": neg_hits,
-                "coarse_single_mask_count": mask_count,
-                "coarse_single_ratio": float(ratio),
-                "coarse_single_mask_keep_ratio": float(coarse_mask_keep_ratio),
-                "coarse_single_ratio_change": float(coarse_ratio_change),
-                "coarse_lift": float(lift),
-                "lift": float(lift),
-                "ratio": float(ratio),
+                "_single_pos_hits": pos_hits, "_single_neg_hits": neg_hits, "_single_mask_count": mask_count,
+                "_single_ratio": ratio, "coarse_single_pos_hits": pos_hits, "coarse_single_neg_hits": neg_hits,
+                "coarse_single_mask_count": mask_count, "coarse_single_ratio": ratio,
+                "coarse_single_mask_keep_ratio": float(r.get("coarse_single_mask_keep_ratio", np.nan)),
+                "coarse_single_ratio_change": float(r.get("coarse_single_ratio_change", np.nan)),
+                "coarse_lift": lift, "lift": lift, "ratio": ratio,
             })
         print(f"[prefilter-resume] rows_loaded_coarse={rows_loaded_coarse}")
-        print(f"[prefilter-resume] rows_after_hard_filters={len(filtered_items)}")
-        print(f"[prefilter-resume] rows_reconstructed={rows_reconstructed}")
-        print(f"[prefilter-resume] loaded coarse candidates from {coarse_out} rows={len(filtered_items)}")
+        print(f"[prefilter-resume] loaded complete coarse inventory from {coarse_out} rows={len(candidate_inventory_rows)}")
     else:
-        qs = [float(x) for x in str(args.quantiles).split(",") if x.strip()]
         t0 = time.perf_counter()
         qmap = miner.quantile_thresholds(df.iloc[:train_idx], cols, qs)
         timing["quantile_thresholds_sec"] = time.perf_counter() - t0
@@ -2714,8 +2820,6 @@ def main() -> None:
             timing_detail2["build_items_mask_sec"] += time.perf_counter() - build_items_mask_t0
             pos_hits = int(np.sum(m_sel[:train_idx] & (y_train == 1))); neg_hits = int(np.sum(m_sel[:train_idx] & (y_train == 0)))
             mask_count = int(pos_hits + neg_hits)
-            if float(x["lift"]) < float(args.min_single_lift):
-                single_rejects["min_lift"] += 1; continue
             x["_single_pos_hits"] = pos_hits; x["_single_neg_hits"] = neg_hits; x["_single_mask_count"] = mask_count
             x["_single_ratio"] = pos_hits / max(1, neg_hits)
             x["coarse_single_pos_hits"] = int(pos_hits); x["coarse_single_neg_hits"] = int(neg_hits)
@@ -2723,13 +2827,13 @@ def main() -> None:
             x["coarse_single_mask_keep_ratio"] = _safe_ratio_or_nan(mask_count, coarse_raw_mask_count)
             x["coarse_single_ratio_change"] = _safe_ratio_or_nan(x["_single_ratio"], coarse_raw_ratio)
             x["_family"] = _candidate_family(str(x["col"]), bool(args.family_split_delta_window))
-            filtered_items.append(x)
+            inventory_mask_items.append(x)
         build_items_metadata_elapsed = time.perf_counter() - build_items_metadata_t0
         build_items_mask_elapsed = float(timing_detail2["build_items_mask_sec"]) - build_items_mask_before
         timing_detail2["build_items_metadata_sec"] += max(0.0, build_items_metadata_elapsed - build_items_mask_elapsed)
         filtered_items_build_t0 = time.perf_counter()
         by_mask: dict[str, dict] = {}
-        for it in filtered_items:
+        for it in inventory_mask_items:
             mh = _mask_hash_arr(np.asarray(it["mask"][:train_idx], dtype=bool))
             cur = by_mask.get(mh)
             if cur is None:
@@ -2738,18 +2842,23 @@ def main() -> None:
             tf_new = int(miner._parse_feature_meta(str(it["col"])).get("tf") or 10**9)
             if tf_new < tf_cur:
                 by_mask[mh] = it
-        filtered_items = list(by_mask.values())
+        inventory_mask_items = list(by_mask.values())
         timing_detail2["filtered_items_sec"] += time.perf_counter() - filtered_items_build_t0
-    atr_debug_source = list(items) if items else list(filtered_items)
+        for it in inventory_mask_items:
+            candidate_inventory_rows.append({k: v for k, v in it.items() if k != "mask"})
+
+    atr_debug_source = list(items) if items else list(candidate_inventory_rows)
     def _atr_debug_pass_counts(source_items: list[dict]) -> tuple[int, int, int, int]:
         atr_items = [it for it in source_items if _is_atr_candidate_col(str(it.get("col", "")))]
         after_pos = []
         after_lift = []
         after_mask = []
         for it in atr_items:
-            m = np.asarray(it.get("mask"), dtype=bool)
-            pos_hits = int(it.get("coarse_single_pos_hits", it.get("_single_pos_hits", np.sum(m[:train_idx] & (y_train == 1)))))
-            mask_count = int(it.get("coarse_single_mask_count", it.get("_single_mask_count", np.sum(m[:train_idx]))))
+            mask_obj = it.get("mask")
+            fallback_pos = int(np.sum(np.asarray(mask_obj, dtype=bool)[:train_idx] & (y_train == 1))) if mask_obj is not None else 0
+            fallback_count = int(np.sum(np.asarray(mask_obj, dtype=bool)[:train_idx])) if mask_obj is not None else 0
+            pos_hits = int(it.get("coarse_single_pos_hits", it.get("_single_pos_hits", fallback_pos)))
+            mask_count = int(it.get("coarse_single_mask_count", it.get("_single_mask_count", fallback_count)))
             lift_v = float(it.get("coarse_lift", it.get("lift", 0.0)))
             if pos_hits >= int(args.min_single_pos_hits):
                 after_pos.append(it)
@@ -2761,38 +2870,26 @@ def main() -> None:
     atr_candidates_built, atr_candidates_after_min_pos, atr_candidates_after_min_lift, atr_candidates_after_mask_count = _atr_debug_pass_counts(atr_debug_source)
     filtered_items_build_t0 = time.perf_counter()
     allowlist_filter_elapsed = 0.0
-    full_filtered_items = list(filtered_items)
-    filtered_items = list(full_filtered_items)
-    if int(args.min_single_pos_hits) > 0:
-        before = len(filtered_items)
-        filtered_items = [it for it in filtered_items if int(it.get("coarse_single_pos_hits", it.get("_single_pos_hits", 0))) >= int(args.min_single_pos_hits)]
-        single_rejects["min_pos"] = max(0, before - len(filtered_items))
-    if float(args.min_single_lift) > 0:
-        before = len(filtered_items)
-        filtered_items = [it for it in filtered_items if float(it.get("coarse_lift", it.get("lift", 0.0))) >= float(args.min_single_lift)]
-        single_rejects["min_lift"] = max(single_rejects.get("min_lift", 0), max(0, before - len(filtered_items)))
-    if int(args.max_single_mask_count) > 0:
-        before = len(filtered_items)
-        filtered_items = [it for it in filtered_items if int(it.get("coarse_single_mask_count", it.get("_single_mask_count", 0))) <= int(args.max_single_mask_count)]
-        single_rejects["mask_count"] = max(0, before - len(filtered_items))
-    if allow_keys is not None:
-        allowlist_filter_t0 = time.perf_counter()
-        before = len(filtered_items)
-        filtered_items = [it for it in filtered_items if str(it.get("candidate_key")) in allow_keys]
-        single_rejects["allowlist"] = max(0, before - len(filtered_items))
-        allowlist_filter_elapsed = time.perf_counter() - allowlist_filter_t0
-        timing_detail2["allowlist_filter_sec"] += allowlist_filter_elapsed
+    before = len(candidate_inventory_rows)
+    after_pos = _filter_candidate_inventory_rows(candidate_inventory_rows, args.min_single_pos_hits, 0.0, 0, None)
+    single_rejects["min_pos"] = before - len(after_pos)
+    after_lift = _filter_candidate_inventory_rows(after_pos, 0, args.min_single_lift, 0, None)
+    single_rejects["min_lift"] = len(after_pos) - len(after_lift)
+    after_mask = _filter_candidate_inventory_rows(after_lift, 0, 0.0, args.max_single_mask_count, None)
+    single_rejects["mask_count"] = len(after_lift) - len(after_mask)
+    allowlist_filter_t0 = time.perf_counter()
+    filtered_items = _filter_candidate_inventory_rows(after_mask, 0, 0.0, 0, allow_keys)
+    single_rejects["allowlist"] = len(after_mask) - len(filtered_items)
+    allowlist_filter_elapsed = time.perf_counter() - allowlist_filter_t0
+    timing_detail2["allowlist_filter_sec"] += allowlist_filter_elapsed
     print(f"[prefilter-resume] rows_after_allowlist={len(filtered_items)}")
+    print(f"[prefilter-candidates] candidate_inventory_rows={len(candidate_inventory_rows)}")
+    print(f"[prefilter-candidates] runtime_single_scope_rows={len(filtered_items)}")
     filtered_elapsed = max(0.0, time.perf_counter() - filtered_items_build_t0 - allowlist_filter_elapsed)
     timing_detail2["filtered_items_sec"] += filtered_elapsed
     fam_top_build_t0 = time.perf_counter()
-    fam_top: list[dict] = []
-    fam_groups: dict[str, list[dict]] = {}
-    for it in filtered_items:
-        fam_groups.setdefault(str(it["_family"]), []).append(it)
-    for _, arr in fam_groups.items():
-        arr = sorted(arr, key=lambda z: (-float(z["lift"]), -int(z["_single_pos_hits"]), int(z["_single_mask_count"])))
-        fam_top.extend(arr[: int(args.family_top_n)])
+    fam_top = _family_top_rows(filtered_items, int(args.family_top_n))
+    print(f"[prefilter-candidates] current_family_top_rows={len(fam_top)}")
     family_top_elapsed = time.perf_counter() - fam_top_build_t0
     timing_detail2["family_top_sec"] += family_top_elapsed
     askbid_tick_replay_enabled = args.tick_entry_cache_npz is not None
@@ -2801,13 +2898,11 @@ def main() -> None:
     refined_ctx = {
         **coarse_ctx,
         "tick_data_sig": _file_sig(args.tick_data),
-        "tick_cache_sig": _file_sig(args.tick_cache_parquet),
         "tp_mode": str(tp_mode),
         "trail": int(bool(args.trail)),
         "trail_activate": float(args.trail_activate),
         "hold": int(args.hold),
-        "tick_datetime_column": str(args.tick_datetime_column),
-        "tick_price_column": str(args.tick_price_column),
+        "tick_datetime_column": str(args.tick_datetime_column).strip().lower(),
         "tick_sep": str(args.tick_sep),
         "price_basis": "askbid_m1",
         "askbid_m1_sig": _file_sig(args.askbid_m1_parquet),
@@ -2817,6 +2912,7 @@ def main() -> None:
         "critical_minutes_semantics": "askbid_m1_bounds_order_ambiguity_tp_weights_trail_stop_final_stop_c1_v1",
         "tick_replay_semantics": "chronological_bid_ticks_from_entry_latency_v1",
         "tick_entry_cache_semantics_version": TICK_ENTRY_CACHE_SEMANTICS_VERSION,
+        "refined_candidate_metrics_semantics_version": REFINED_CACHE_SCHEMA_VERSION,
     }
     refined_ctx_sig = _ctx_sig(refined_ctx)
     tick_entry_cache_ctx = {
@@ -2852,28 +2948,62 @@ def main() -> None:
     }
     tick_entry_cache_sig = _ctx_sig(tick_entry_cache_ctx)
     refined_csv_load_t0 = time.perf_counter()
-    refined_resume = _load_stage_csv_if_match(refined_out, "refined", refined_ctx_sig)
+    refined_resume = _load_stage_csv_if_match(
+        refined_out,
+        "refined",
+        refined_ctx_sig,
+        REFINED_CACHE_SCHEMA_VERSION,
+        rebuild_legacy=False,
+    )
     timing_detail2["refined_csv_load_sec"] += time.perf_counter() - refined_csv_load_t0
-    if str(args.tick_refine_scope) == "fam_top":
-        tick_scope_items = fam_top
-    elif str(args.tick_refine_scope) == "filtered":
-        tick_scope_items = filtered_items
-    else:
-        tick_scope_items = full_filtered_items
-    print(f"[prefilter-resume] rows_runtime_scope={len(tick_scope_items)} scope={args.tick_refine_scope}")
-    all_by_key = {str(it["candidate_key"]): it for it in full_filtered_items}
-    req_tick_cols = ["tick_single_pos_hits", "tick_single_neg_hits", "tick_single_mask_count", "tick_single_ratio", "tick_single_mask_keep_ratio", "tick_single_ratio_change", "tick_lift"]
-    def _has_full_tick_metrics(obj: dict) -> bool:
-        try:
-            return all(np.isfinite(float(obj.get(k, np.nan))) for k in req_tick_cols)
-        except Exception:
-            return False
+    tick_scope_stable_keys = _tick_scope_keys(str(args.tick_refine_scope), candidate_inventory_rows, filtered_items, fam_top)
+    inventory_by_stable = {str(it["stable_candidate_key"]): it for it in candidate_inventory_rows}
+    mask_required_keys = _mask_required_keys(tick_scope_stable_keys, askbid_tick_replay_enabled)
+    fresh_masks = {
+        str(it["stable_candidate_key"]): it["mask"]
+        for it in inventory_mask_items
+        if str(it["stable_candidate_key"]) in mask_required_keys
+    }
 
+    def _reconstruct_candidate_mask(it: dict) -> np.ndarray:
+        stable_k = str(it["stable_candidate_key"])
+        if stable_k in fresh_masks:
+            return np.asarray(fresh_masks[stable_k], dtype=bool)
+        col = str(it["col"]); op = str(it["op"]); val = float(it["value"])
+        xvec = pd.to_numeric(bdf[col] if op == "==" else df[col], errors="coerce").to_numpy(copy=False)
+        if op == "==":
+            return np.isfinite(xvec) & (np.abs(xvec - val) <= 1e-6)
+        if op == ">=":
+            return np.isfinite(xvec) & (xvec >= val)
+        return np.isfinite(xvec) & (xvec <= val)
+
+    coarse_reconstruct_t0 = time.perf_counter()
+    for stable_k in mask_required_keys:
+        inventory_by_stable[stable_k]["mask"] = _reconstruct_candidate_mask(inventory_by_stable[stable_k])
+    timing_detail2["coarse_reconstruct_sec"] += time.perf_counter() - coarse_reconstruct_t0
+    print(f"[prefilter-resume] rows_reconstructed={len(mask_required_keys)}")
+    items_total_count = len(items) if items else len(candidate_inventory_rows)
+    dist_items_count = sum(1 for x in (items if items else candidate_inventory_rows) if str(x["col"]).startswith("dist_"))
+    binary_items_count = sum(1 for x in (items if items else candidate_inventory_rows) if bool(x.get("binary", False)))
+    fresh_masks.clear()
+    inventory_mask_items.clear()
+    items.clear()
+    atr_debug_source.clear()
+    if coarse_resume is None:
+        by_mask.clear()
+        x = m = raw_train_m = m_sel = cur = None
+    gc.collect()
+    tick_scope_items = [it for it in candidate_inventory_rows if str(it["stable_candidate_key"]) in tick_scope_stable_keys]
+    print(f"[prefilter-resume] rows_runtime_scope={len(tick_scope_items)} scope={args.tick_refine_scope}")
+    all_by_key = {str(it["candidate_key"]): it for it in candidate_inventory_rows}
+    req_tick_cols = list(REQUIRED_TICK_METRIC_COLUMNS)
+
+    refined_rows_total = int(len(refined_resume)) if refined_resume is not None else 0
+    refined_rows_with_tick = 0
+    refined_rows_missing_tick = refined_rows_total
     if refined_resume is not None:
         print(f"[prefilter-resume] rows_loaded_refined={int(len(refined_resume))}")
         by_key = {str(it["candidate_key"]): it for it in tick_scope_items}
-        refined_rows_total = int(len(refined_resume))
-        refined_rows_with_tick = 0
         refined_rows_missing_tick = 0
         for _, r in refined_resume.iterrows():
             refined_key_t0 = time.perf_counter()
@@ -2886,13 +3016,13 @@ def main() -> None:
                 stable_k = _stable_candidate_key(col_r, op_r, _canonicalize_candidate_value(col_r, op_r, val_r))
             it = all_by_key.get(k)
             if it is None and stable_k:
-                it = next((x for x in full_filtered_items if _stable_candidate_key(str(x["col"]), str(x["op"]), _canonicalize_candidate_value(str(x["col"]), str(x["op"]), float(x["value"]))) == stable_k), None)
+                it = inventory_by_stable.get(stable_k)
             timing_detail2["refined_key_match_sec"] += time.perf_counter() - refined_key_t0
             if it is None:
                 continue
             refined_restore_t0 = time.perf_counter()
-            req_vals = [r.get(c, np.nan) for c in req_tick_cols]
-            if any(pd.isna(v) for v in req_vals):
+            row_values = {c: r.get(c, np.nan) for c in req_tick_cols}
+            if not _has_full_tick_metrics(row_values):
                 timing_detail2["refined_tick_metric_restore_sec"] += time.perf_counter() - refined_restore_t0
                 refined_rows_missing_tick += 1
                 continue
@@ -2903,19 +3033,17 @@ def main() -> None:
             it["tick_single_ratio"] = float(r.get("tick_single_ratio", 0.0))
             it["tick_single_mask_keep_ratio"] = float(r.get("tick_single_mask_keep_ratio", np.nan))
             it["tick_single_ratio_change"] = float(r.get("tick_single_ratio_change", np.nan))
-            it["tick_lift"] = float(r.get("tick_lift", 0.0))
             if str(it.get("candidate_key")) in by_key:
                 it["_single_pos_hits"] = int(it["tick_single_pos_hits"])
                 it["_single_neg_hits"] = int(it["tick_single_neg_hits"])
                 it["_single_mask_count"] = int(it["tick_single_mask_count"])
                 it["_single_ratio"] = float(it["tick_single_ratio"])
                 it["ratio"] = float(it["tick_single_ratio"])
-                it["lift"] = float(it["tick_lift"])
             timing_detail2["refined_tick_metric_restore_sec"] += time.perf_counter() - refined_restore_t0
         tick_refined_mode = any(_has_full_tick_metrics(x) for x in by_key.values())
         print(f"[prefilter-resume] loaded refined candidates from {refined_out}")
-        print(f"[prefilter-resume] refined_rows_total={refined_rows_total}")
-        print(f"[prefilter-resume] refined_rows_with_tick_metrics={refined_rows_with_tick}")
+        print(f"[prefilter-resume] refined_csv_rows_total={refined_rows_total}")
+        print(f"[prefilter-resume] refined_rows_with_stored_tick_metrics={refined_rows_with_tick}")
         print(f"[prefilter-resume] refined_rows_missing_tick_metrics={refined_rows_missing_tick}")
         print(f"[prefilter-resume] requested_allowlist_keys={len(allow_keys) if allow_keys is not None else 0}")
         print(f"[prefilter-resume] usable_refined_keys_for_fam_top={sum(1 for it in fam_top if 'tick_single_ratio' in it)}")
@@ -2924,11 +3052,16 @@ def main() -> None:
         if refined_out is None or not refined_out.exists():
             raise ValueError("candidate_key_refined input requires --out-candidates-refined-csv file to reload refined metrics")
         raise ValueError("Refined TXT header provided, but refined candidate CSV context did not match current run.")
+    else:
+        print("[prefilter-resume] refined_csv_rows_total=0")
+        print("[prefilter-resume] refined_rows_with_stored_tick_metrics=0")
     missing_metrics_scan_t0 = time.perf_counter()
-    tick_missing_items = [it for it in tick_scope_items if not _has_full_tick_metrics(it)]
+    tick_full_items, tick_missing_items = _partition_tick_metric_rows(tick_scope_items)
     timing_detail["tick_missing_metrics_scan_sec"] += time.perf_counter() - missing_metrics_scan_t0
-    if args.tick_entry_cache_npz is None and refined_resume is not None and not tick_missing_items and any(_has_full_tick_metrics(it) for it in tick_scope_items):
-        print("[prefilter-tick] warning: using tick_lift from refined CSV; without --tick-entry-cache-npz it cannot be exactly rebaselined to the current tick_refine_scope.")
+    current_tick_scope_full_before = len(tick_full_items)
+    print(f"[prefilter-tick] current_tick_scope_rows={len(tick_scope_items)}")
+    print(f"[prefilter-tick] current_tick_scope_full_before={current_tick_scope_full_before}")
+    print(f"[prefilter-tick] current_tick_scope_missing_before={len(tick_missing_items)}")
     if askbid_tick_replay_enabled and len(tick_scope_items) > 0:
         print(f"[prefilter-tick] tick_refine_scope={args.tick_refine_scope}")
         print(f"[prefilter-tick] tick_refine_candidates_count={len(tick_scope_items)}")
@@ -3076,14 +3209,10 @@ def main() -> None:
                         y_ref[int(idx_i)] = np.int8(int(rec.get("y", -1)))
                         t_exit_ref[int(idx_i)] = np.int32(int(rec.get("t_exit", -1)))
                 y_ref_train = y_ref[:train_idx]
-                union_sel, _, _ = _select_entries_for_mask(fam_union, y_ref, t_exit_ref)
-                union_train_mask = union_sel[:train_idx] & tradable_train & ((y_ref_train == 0) | (y_ref_train == 1))
-                union_pos = int(np.sum(union_train_mask & (y_ref_train == 1)))
-                union_neg = int(np.sum(union_train_mask & (y_ref_train == 0)))
-                union_ratio = union_pos / max(1, union_neg)
                 metrics_complete = True
-                tick_missing_ids = {id(x) for x in tick_missing_items}
                 for it in tick_scope_items:
+                    if _has_full_tick_metrics(it):
+                        continue
                     raw_m = np.asarray(it["mask"], dtype=bool)
                     raw_tick_m = raw_m[:train_idx] & tradable_train & ((y_ref_train == 0) | (y_ref_train == 1))
                     tick_raw_pos = int(np.sum(raw_tick_m & (y_ref_train == 1)))
@@ -3096,12 +3225,10 @@ def main() -> None:
                     cached_for_item = sum(1 for idx_i in np.flatnonzero(raw_m).tolist() if int(idx_i) in tick_map and int(idx_i) in replay_entry_index_set)
                     if cached_for_item < requested_entries:
                         metrics_complete = False
-                        if id(it) in tick_missing_ids:
-                            continue
+                        continue
                     tick_pos = int(np.sum(valid_m & (y_ref_train == 1)))
                     tick_neg = int(np.sum(valid_m & (y_ref_train == 0)))
                     tick_ratio = tick_pos / max(1, tick_neg)
-                    tick_lift = tick_ratio / max(1e-12, union_ratio)
                     it["tick_single_pos_hits"] = tick_pos
                     it["tick_single_neg_hits"] = tick_neg
                     tick_mask_count = int(tick_pos + tick_neg)
@@ -3109,13 +3236,11 @@ def main() -> None:
                     it["tick_single_ratio"] = float(tick_ratio)
                     it["tick_single_mask_keep_ratio"] = _safe_ratio_or_nan(tick_mask_count, tick_raw_mask_count)
                     it["tick_single_ratio_change"] = _safe_ratio_or_nan(tick_ratio, tick_raw_ratio)
-                    it["tick_lift"] = float(tick_lift)
                     it["_single_pos_hits"] = tick_pos
                     it["_single_neg_hits"] = tick_neg
                     it["_single_mask_count"] = tick_mask_count
                     it["_single_ratio"] = float(tick_ratio)
                     it["ratio"] = float(tick_ratio)
-                    it["lift"] = float(tick_lift)
                 tick_refined_mode = any(_has_full_tick_metrics(it) for it in tick_scope_items)
                 if not metrics_complete:
                     print("[prefilter-tick-cache] warning: some replay-relevant current-scope entries are missing tick cache results; affected candidates remain missing.")
@@ -3132,11 +3257,10 @@ def main() -> None:
     if coarse_out is not None:
         coarse_csv_t0 = time.perf_counter()
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
-        existing_rows = dict(coarse_existing_rows)
-        for it in full_filtered_items:
+        coarse_rows = []
+        for it in candidate_inventory_rows:
             stable_k = str(it.get("stable_candidate_key", "")).strip() or _stable_candidate_key(str(it["col"]), str(it["op"]), _canonicalize_candidate_value(str(it["col"]), str(it["op"]), float(it["value"])))
-            row = existing_rows.get(stable_k, {})
-            row.update({
+            row = {
                 "candidate_key": str(it["candidate_key"]),
                 "stable_candidate_key": stable_k,
                 "col": str(it["col"]),
@@ -3152,24 +3276,15 @@ def main() -> None:
                 "coarse_lift": float(it.get("coarse_lift", it.get("lift", 0.0))),
                 "binary": int(bool(it.get("binary", False))),
                 "kept_after_family_topn": int(str(it["candidate_key"]) in fam_top_keys),
-                "build_min_single_pos_hits": int(coarse_build_min_pos),
-                "build_max_single_mask_count": int(coarse_build_max_mask),
-                "build_min_single_lift": float(coarse_build_min_lift),
                 "__stage": "coarse",
+                "__schema_version": CANDIDATE_CACHE_SCHEMA_VERSION,
                 "__ctx_sig": coarse_ctx_sig,
-            })
-            existing_rows[stable_k] = row
-        for row in existing_rows.values():
-            row["build_min_single_pos_hits"] = int(coarse_build_min_pos)
-            row["build_max_single_mask_count"] = int(coarse_build_max_mask)
-            row["build_min_single_lift"] = float(coarse_build_min_lift)
-            row["__stage"] = "coarse"
-            row["__ctx_sig"] = coarse_ctx_sig
-        coarse_rows = list(existing_rows.values())
-        coarse_cols = ["candidate_key", "stable_candidate_key", "col", "op", "value", "family", "coarse_single_pos_hits", "coarse_single_neg_hits", "coarse_single_mask_count", "coarse_single_ratio", "coarse_single_mask_keep_ratio", "coarse_single_ratio_change", "coarse_lift", "binary", "kept_after_family_topn", "build_min_single_pos_hits", "build_max_single_mask_count", "build_min_single_lift", "__stage", "__ctx_sig"]
+            }
+            coarse_rows.append(row)
+        coarse_cols = ["candidate_key", "stable_candidate_key", "col", "op", "value", "family", "coarse_single_pos_hits", "coarse_single_neg_hits", "coarse_single_mask_count", "coarse_single_ratio", "coarse_single_mask_keep_ratio", "coarse_single_ratio_change", "coarse_lift", "binary", "kept_after_family_topn", "__stage", "__schema_version", "__ctx_sig"]
         coarse_frame = _ordered_frame(coarse_rows, coarse_cols).drop(columns=["coarse_single_raw_mask_count", "coarse_single_raw_ratio", "tick_single_raw_mask_count", "tick_single_raw_ratio"], errors="ignore")
         wrote_coarse, coarse_reason = _write_csv_if_changed(coarse_out, coarse_frame, key_cols=["stable_candidate_key"])
-        coarse_rows_prev = int(len(coarse_existing_rows))
+        coarse_rows_prev = int(len(coarse_resume)) if coarse_resume is not None else 0
         coarse_rows_after = int(len(coarse_rows))
         coarse_rows_delta = int(coarse_rows_after - coarse_rows_prev)
         print(f"[prefilter-candidates] coarse_write={'done' if wrote_coarse else 'skipped'} reason_for_write={coarse_reason}")
@@ -3179,7 +3294,7 @@ def main() -> None:
         timing_detail["candidate_csv_write_sec"] += time.perf_counter() - coarse_csv_t0
 
     if bool(args.debug_atr_candidates):
-        atr_candidates_written_to_csv = sum(1 for it in full_filtered_items if _is_atr_candidate_col(str(it.get("col", ""))))
+        atr_candidates_written_to_csv = sum(1 for it in candidate_inventory_rows if _is_atr_candidate_col(str(it.get("col", ""))))
         print(
             "[prefilter-atr-debug] "
             f"atr_cols_available={atr_cols_available} "
@@ -3193,17 +3308,12 @@ def main() -> None:
             print("[prefilter-atr-debug] atr_cols_sample=" + ",".join(atr_cols_sample))
 
     phase_d_pool_t0 = time.perf_counter()
-    phase_d_pool_base: list[dict] = []
-    tick_scope_keys = {str(it.get("candidate_key")) for it in tick_scope_items}
-    for it in tick_scope_items:
-        if _has_full_tick_metrics(it):
-            phase_d_pool_base.append(it)
+    phase_d_pool_base, _ = _partition_tick_metric_rows(tick_scope_items)
     timing_detail["phase_d_pool_build_sec"] += time.perf_counter() - phase_d_pool_t0
 
     if refined_out is not None:
         refined_csv_t0 = time.perf_counter()
         fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
-        status_rank = {"full": 3, "missing": 2, "out_of_scope": 1}
 
         def _refined_row_key(row: dict) -> str:
             try:
@@ -3219,31 +3329,23 @@ def main() -> None:
                 return stable_k
             return str(row.get("candidate_key_refined", row.get("candidate_key", ""))).strip()
 
-        def _prefer_refined_row(old: dict | None, new: dict) -> dict:
-            if old is None:
-                return new
-            old_rank = int(status_rank.get(str(old.get("tick_metric_status", "out_of_scope")), 0))
-            new_rank = int(status_rank.get(str(new.get("tick_metric_status", "out_of_scope")), 0))
-            if new_rank >= old_rank:
-                return new
-            old = dict(old)
-            old["__ctx_sig"] = refined_ctx_sig
-            old["__stage"] = "refined"
-            return old
-
         existing_rows: dict[str, dict] = {}
         if refined_resume is not None:
             for _, r in refined_resume.iterrows():
                 stable_k = _refined_row_key({k: r.get(k) for k in r.index})
-                if not stable_k:
+                if not stable_k or stable_k not in inventory_by_stable:
                     continue
                 row = {k: r.get(k) for k in r.index}
                 row["stable_candidate_key"] = stable_k
                 row["tick_metric_status"] = str(row.get("tick_metric_status", "out_of_scope") or "out_of_scope")
                 row["__ctx_sig"] = refined_ctx_sig
                 row["__stage"] = "refined"
-                existing_rows[stable_k] = _prefer_refined_row(existing_rows.get(stable_k), row)
-        for it in full_filtered_items:
+                row["__schema_version"] = REFINED_CACHE_SCHEMA_VERSION
+                row["tick_metric_status"] = "full" if _has_full_tick_metrics(row) else row["tick_metric_status"]
+                existing_rows[stable_k] = _prefer_refined_row(
+                    existing_rows.get(stable_k), row, refined_ctx_sig, REFINED_CACHE_SCHEMA_VERSION
+                )
+        for it in candidate_inventory_rows:
             stable_k = _stable_candidate_key(str(it["col"]), str(it["op"]), _canonicalize_candidate_value(str(it["col"]), str(it["op"]), float(it["value"])))
             row = existing_rows.get(stable_k, {})
             row.update({
@@ -3263,25 +3365,33 @@ def main() -> None:
                 "binary": int(bool(it.get("binary", False))),
                 "kept_after_family_topn": int(str(it["candidate_key"]) in fam_top_keys),
                 "__stage": "refined",
+                "__schema_version": REFINED_CACHE_SCHEMA_VERSION,
                 "__ctx_sig": refined_ctx_sig,
             })
             for col_tick in req_tick_cols:
-                row[col_tick] = float(it.get(col_tick, row.get(col_tick, np.nan)))
-            if str(it.get("candidate_key")) not in tick_scope_keys:
-                row["tick_metric_status"] = "out_of_scope"
-            elif _has_full_tick_metrics(row):
+                if col_tick in it and np.isfinite(float(it.get(col_tick, np.nan))):
+                    row[col_tick] = float(it[col_tick])
+                else:
+                    row.setdefault(col_tick, np.nan)
+            if _has_full_tick_metrics(row):
                 row["tick_metric_status"] = "full"
-            else:
+            elif stable_k in tick_scope_stable_keys:
                 row["tick_metric_status"] = "missing"
-            existing_rows[stable_k] = _prefer_refined_row(existing_rows.get(stable_k), row)
+            else:
+                row["tick_metric_status"] = "out_of_scope"
+            existing_rows[stable_k] = _prefer_refined_row(
+                existing_rows.get(stable_k), row, refined_ctx_sig, REFINED_CACHE_SCHEMA_VERSION
+            )
         deduped_rows: dict[str, dict] = {}
         for row in existing_rows.values():
             k = _refined_row_key(row)
             if not k:
                 continue
-            deduped_rows[k] = _prefer_refined_row(deduped_rows.get(k), row)
-        cand_rows = list(deduped_rows.values())
-        refined_cols = ["candidate_key_refined", "stable_candidate_key", "col", "op", "value", "family", "coarse_single_pos_hits", "coarse_single_neg_hits", "coarse_single_mask_count", "coarse_single_ratio", "coarse_single_mask_keep_ratio", "coarse_single_ratio_change", "coarse_lift", "binary", "kept_after_family_topn", "tick_single_pos_hits", "tick_single_neg_hits", "tick_single_mask_count", "tick_single_ratio", "tick_single_mask_keep_ratio", "tick_single_ratio_change", "tick_lift", "tick_metric_status", "__stage", "__ctx_sig", "build_min_single_pos_hits", "build_max_single_mask_count", "build_min_single_lift"]
+            deduped_rows[k] = _prefer_refined_row(
+                deduped_rows.get(k), row, refined_ctx_sig, REFINED_CACHE_SCHEMA_VERSION
+            )
+        cand_rows = _refined_rows_for_inventory(candidate_inventory_rows, deduped_rows)
+        refined_cols = ["candidate_key_refined", "stable_candidate_key", "col", "op", "value", "family", "coarse_single_pos_hits", "coarse_single_neg_hits", "coarse_single_mask_count", "coarse_single_ratio", "coarse_single_mask_keep_ratio", "coarse_single_ratio_change", "coarse_lift", "binary", "kept_after_family_topn", "tick_single_pos_hits", "tick_single_neg_hits", "tick_single_mask_count", "tick_single_ratio", "tick_single_mask_keep_ratio", "tick_single_ratio_change", "tick_metric_status", "__stage", "__schema_version", "__ctx_sig"]
         refined_frame = _ordered_frame(cand_rows, refined_cols).drop(columns=["coarse_single_raw_mask_count", "coarse_single_raw_ratio", "tick_single_raw_mask_count", "tick_single_raw_ratio"], errors="ignore")
         prev_refined_rows = int(len(refined_resume)) if refined_resume is not None else 0
         wrote_refined, refined_reason = _write_csv_if_changed(refined_out, refined_frame, key_cols=["stable_candidate_key"])
@@ -3300,6 +3410,15 @@ def main() -> None:
     print(f"[prefilter-tick] tick_candidates_requested={tick_candidates_requested}")
     print(f"[prefilter-tick] tick_candidates_with_metrics={tick_candidates_with_metrics}")
     print(f"[prefilter-tick] tick_candidates_missing_metrics={tick_candidates_missing_metrics}")
+    print(f"[prefilter-tick] current_tick_scope_full_after={tick_candidates_with_metrics}")
+    print(f"[prefilter-tick] current_tick_scope_missing_after={tick_candidates_missing_metrics}")
+    refinement_state = _refinement_state(
+        len(tick_scope_items),
+        askbid_tick_replay_enabled,
+        tick_candidates_missing_metrics,
+        timing_counts["tick_replay_relevant_entries_count"],
+    )
+    print(f"[prefilter-tick] refinement_state={refinement_state}")
     print(f"[prefilter-tick] tick_candidates_used_for_phase_d={len(phase_d_pool_base)}")
     score_tick_overrides = 0
     score_tick_invalid = 0
@@ -3346,6 +3465,14 @@ def main() -> None:
         f"score_tick_invalid={score_tick_invalid} "
         f"score_tick_override_share={score_tick_override_share:.6f}"
     )
+
+    released_single_masks = 0
+    for it in candidate_inventory_rows:
+        if "mask" in it:
+            it.pop("mask", None)
+            released_single_masks += 1
+    gc.collect()
+    print(f"[prefilter-candidates] released_single_candidate_masks={released_single_masks}")
 
     rank_sort_t0 = time.perf_counter()
     if tick_refined_mode:
@@ -3815,12 +3942,12 @@ def main() -> None:
             f"ranking_prep_unaccounted_sec={timing_detail['ranking_prep_unaccounted_sec']:.3f}"
         )
     if bool(args.debug_timing_breakdown) or bool(args.debug_reject_stats):
-        dist_items = sum(1 for x in items if str(x["col"]).startswith("dist_"))
-        non_dist_items = len(items) - dist_items
-        bin_items = sum(1 for x in items if bool(x.get("binary", False)))
-        non_bin_items = len(items) - bin_items
+        dist_items = dist_items_count
+        non_dist_items = items_total_count - dist_items
+        bin_items = binary_items_count
+        non_bin_items = items_total_count - bin_items
         print(
-            f"[prefilter-items] cols={len(cols)} items={len(items)} "
+            f"[prefilter-items] cols={len(cols)} items={items_total_count} "
             f"filtered_items={len(filtered_items)} family_top_pool={len(rank_lift)} "
             f"dist_items={dist_items} non_dist_items={non_dist_items} "
             f"binary_items={bin_items} non_binary_items={non_bin_items}"
