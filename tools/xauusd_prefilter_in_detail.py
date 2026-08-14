@@ -4,7 +4,6 @@
 Uses feature and binned-feature files for feature/mask construction, builds labels
 from AskBid-M1 entry/exit prices, then searches complete rule combinations.
 """
-# TEMPORARY PR-BEHAVIOR PROBE 5 - remove after ancestry test.
 
 from __future__ import annotations
 
