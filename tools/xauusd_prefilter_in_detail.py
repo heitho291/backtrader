@@ -220,6 +220,369 @@ def _safe_ratio_or_nan(num, den) -> float:
     return float(out) if np.isfinite(out) else float("nan")
 
 
+def _train_search_sort_key(row: dict) -> tuple[float, int, int]:
+    return (-float(row["ratio"]), -int(row["pos_hits"]), int(row["neg_hits"]))
+
+
+def _is_final_valid_result(row: dict, min_main_score: float) -> bool:
+    return float(row["ratio"]) >= float(min_main_score)
+
+
+def _final_valid_results(rows: Iterable[dict], min_main_score: float) -> list[dict]:
+    return [row for row in rows if _is_final_valid_result(row, min_main_score)]
+
+
+def _bounded_train_survivors(rows: Iterable[dict], limit: int, dedupe) -> list[dict]:
+    return sorted(dedupe(list(rows)), key=_train_search_sort_key)[: int(limit)]
+
+
+def _update_ab_search_pools(
+    survivor_pool: Iterable[dict],
+    valid_pool: Iterable[dict],
+    out_batch: Iterable[dict],
+    min_main_score: float,
+    limit: int,
+    dedupe,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    batch = list(out_batch)
+    final_valid_batch = _final_valid_results(batch, min_main_score)
+    survivors = _bounded_train_survivors([*survivor_pool, *batch], limit, dedupe)
+    archive = _bounded_train_survivors([*valid_pool, *final_valid_batch], limit, dedupe)
+    return survivors, archive, final_valid_batch
+
+
+def _ab_parent_seed_snapshot(survivor_pool: Iterable[dict], limit: int) -> list[dict]:
+    return sorted(list(survivor_pool), key=_train_search_sort_key)[: int(limit)]
+
+
+def _binary_cap_allows(conditions: Iterable[dict], binary_cap: int) -> bool:
+    return sum(1 for condition in conditions if bool(condition.get("binary", False))) <= int(binary_cap)
+
+
+def _structure_reject_reason(conditions: Iterable[dict], binary_cap: int, validate_anchor) -> str | None:
+    conds = list(conditions)
+    if not _binary_cap_allows(conds, binary_cap):
+        return "binary_cap"
+    cond_triplets = [(str(c["col"]), str(c["op"]), float(c["value"])) for c in conds]
+    ok_bundle, _details = validate_anchor(cond_triplets)
+    return None if bool(ok_bundle) else "bundle_anchor"
+
+
+def _run_structure_gate(conditions: Iterable[dict], binary_cap: int, validate_anchor, evaluate_valid):
+    conds = list(conditions)
+    reject_reason = _structure_reject_reason(conds, binary_cap, validate_anchor)
+    return (None, reject_reason) if reject_reason is not None else (evaluate_valid(conds), None)
+
+
+def _min_pos_allows(pos_hits: int, weeks: float, min_pos_per_week: float, enforce_filters: bool = True) -> bool:
+    return (not bool(enforce_filters)) or int(pos_hits) >= float(min_pos_per_week) * float(weeks)
+
+
+def _run_min_pos_gate_pipeline(
+    raw_pos_hits: int,
+    weeks: float,
+    min_pos_per_week: float,
+    enforce_filters: bool,
+    select_entries,
+    count_selected_hits,
+):
+    if not _min_pos_allows(raw_pos_hits, weeks, min_pos_per_week, enforce_filters):
+        return None, "raw_min_pos"
+    selected_mask, raw_evaluable, clusters_count = select_entries()
+    pos_hits, neg_hits = count_selected_hits(selected_mask)
+    if not _min_pos_allows(pos_hits, weeks, min_pos_per_week, enforce_filters):
+        return None, "post_clm_min_pos"
+    return (selected_mask, raw_evaluable, clusters_count, int(pos_hits), int(neg_hits)), None
+
+
+def _run_scoring_gate_pipeline(
+    raw_pos_hits: int,
+    weeks: float,
+    min_pos_per_week: float,
+    enforce_filters: bool,
+    select_entries,
+    count_selected_hits,
+    finish_score,
+):
+    gated, reject_reason = _run_min_pos_gate_pipeline(
+        raw_pos_hits,
+        weeks,
+        min_pos_per_week,
+        enforce_filters,
+        select_entries,
+        count_selected_hits,
+    )
+    return (None, reject_reason) if gated is None else (finish_score(*gated), None)
+
+
+def _parent_score_allows(score: dict, parent: dict | None) -> bool:
+    if parent is None:
+        return True
+    score_key = (float(score["ratio"]), int(score["pos_hits"]), -int(score["neg_hits"]))
+    parent_key = (float(parent["ratio"]), int(parent["pos_hits"]), -int(parent["neg_hits"]))
+    return score_key > parent_key
+
+
+def _evaluate_without_immediate_parent(evaluate_combo, combo, pool_items, source: str):
+    return evaluate_combo(combo, pool_items, None, source=source)
+
+
+def _partition_level_roles(rows: Iterable[dict], min_main_score: float, max_depth: int) -> tuple[list[dict], list[dict]]:
+    candidates = list(rows)
+    archive = _final_valid_results(candidates, min_main_score)
+    expandable = [row for row in candidates if len(tuple(row.get("_combo", tuple()))) < int(max_depth)]
+    return archive, expandable
+
+
+def _select_level_results(
+    rows: Iterable[dict],
+    min_main_score: float,
+    max_depth: int,
+    beam_width: int,
+    dedupe=None,
+) -> tuple[list[dict], list[dict], dict[str, int]]:
+    candidates = list(rows)
+    archive, expandable = _partition_level_roles(candidates, min_main_score, max_depth)
+    beam_input = list(dedupe(expandable)) if dedupe is not None else expandable
+    beam = sorted(beam_input, key=_train_search_sort_key)[: int(beam_width)]
+    beam_final = sum(1 for row in beam if _is_final_valid_result(row, min_main_score))
+    diagnostics = {
+        "beam_candidates": len(candidates),
+        "beam_kept": len(beam),
+        "beam_kept_final_valid": beam_final,
+        "beam_kept_search_only": len(beam) - beam_final,
+    }
+    return archive, beam, diagnostics
+
+
+def _phase_b_has_parent_survivors(survivor_pool: Iterable[dict]) -> bool:
+    return bool(list(survivor_pool))
+
+
+def _map_c_start_beam(seed_rules: Iterable[dict], pool_c: list[dict], beam_width: int, max_conds: int) -> tuple[list[tuple[int, ...]], bool]:
+    width = max(1, int(beam_width))
+    cond_to_idx = {(str(c["col"]), str(c["op"]), float(c["value"])): i for i, c in enumerate(pool_c)}
+    mapped_beam: list[tuple[int, ...]] = []
+    for seed in _ab_parent_seed_snapshot(seed_rules, width):
+        mapped: list[int] = []
+        for condition in seed.get("conds", []):
+            idx = cond_to_idx.get((str(condition["col"]), str(condition["op"]), float(condition["value"])))
+            if idx is None:
+                mapped = []
+                break
+            mapped.append(int(idx))
+        if mapped:
+            mapped_beam.append(tuple(sorted(set(mapped))))
+    used_single_fallback = not mapped_beam
+    if used_single_fallback:
+        mapped_beam = [(i,) for i in range(min(width, len(pool_c)))]
+    return [beam for beam in mapped_beam if 1 <= len(beam) <= int(max_conds)], used_single_fallback
+
+
+def _d_archive_sort_key(row: dict) -> tuple[float, int, int, int]:
+    return (*_train_search_sort_key(row), len(tuple(row.get("_combo", tuple()))))
+
+
+def _phase_d_initial_depth(raw_start: int, phase_d_max_conds: int, max_path_conds: int, pool_size: int) -> int | None:
+    raw = int(raw_start)
+    max_depth = min(int(phase_d_max_conds), int(max_path_conds))
+    if raw == 1:
+        return 1
+    if raw == 2:
+        return 2 if int(pool_size) >= 2 and max_depth >= 2 else None
+    return max(1, min(raw, int(phase_d_max_conds), int(max_path_conds), int(pool_size)))
+
+
+def _dispatch_phase_d_start(
+    raw_start: int,
+    phase_d_max_conds: int,
+    max_path_conds: int,
+    pool_size: int,
+    run_stage,
+    consume_stage,
+    log,
+) -> int | None:
+    start_depth = _phase_d_initial_depth(raw_start, phase_d_max_conds, max_path_conds, pool_size)
+    if start_depth is None:
+        log("start2 pair stage unavailable: pool_size or effective max depth is below 2")
+        return None
+    if int(raw_start) != 1:
+        consume_stage(start_depth, "initial", run_stage(start_depth))
+        return start_depth
+
+    singles_eligible = consume_stage(1, "initial", run_stage(1))
+    if singles_eligible:
+        log("start1 pair fallback not needed: beam-eligible singles exist")
+        return 1
+    pair_depth_allowed = int(pool_size) >= 2 and min(int(phase_d_max_conds), int(max_path_conds)) >= 2
+    if not pair_depth_allowed:
+        log("start1 pair fallback unavailable: pool_size or effective max depth is below 2")
+        return 1
+    log("start1 pair fallback triggered")
+    pairs_eligible = consume_stage(2, "start1_pair_fallback", run_stage(2))
+    if not pairs_eligible:
+        log("start1 pair fallback ended without beam-eligible pairs")
+    return 2
+
+
+def _run_global_d_stage(idxs: Iterable[int], depth: int, batch_size: int, generation_cap: int, evaluate) -> tuple[list[dict], int, int, bool]:
+    generated_extensions = 0
+    evaluated_combos = 0
+    truncated = False
+    out: list[dict] = []
+    for chunk in _batched(itertools.combinations(list(idxs), int(depth)), max(64, int(batch_size))):
+        cap = int(generation_cap)
+        if cap > 0 and generated_extensions + len(chunk) >= cap:
+            chunk = chunk[: max(0, cap - generated_extensions)]
+            truncated = True
+        generated_extensions += len(chunk)
+        for combo in chunk:
+            evaluated_combos += 1
+            result = evaluate(tuple(sorted(combo)))
+            if result is not None:
+                out.append(result)
+        if truncated:
+            break
+    return out, generated_extensions, evaluated_combos, truncated
+
+
+def _better_train_score(candidate: dict | None, current: dict | None) -> bool:
+    if candidate is None:
+        return False
+    if current is None:
+        return True
+    return _parent_score_allows(candidate, current)
+
+
+def _neighbor_merge_trial(current: dict | None, candidate: dict | None, min_main_score: float) -> dict | None:
+    if candidate is None or not _is_final_valid_result(candidate, min_main_score):
+        return current
+    return candidate if _better_train_score(candidate, current) else current
+
+
+def _valid_tick_override_record(entry_idx: int, record: dict, n_rows: int, hold: int) -> bool:
+    try:
+        ii = int(entry_idx)
+        tick_y = int(record.get("y", -1))
+        tick_pnl = float(record.get("pnl", float("nan")))
+        tick_t_exit = int(record.get("t_exit", -1))
+        tick_tp_hits = int(record.get("tp_hits", -1))
+        if "t_qual" not in record:
+            return False
+        tick_t_qual = int(record.get("t_qual", -2))
+    except Exception:
+        return False
+    return bool(
+        0 <= ii < int(n_rows)
+        and tick_y in (0, 1)
+        and np.isfinite(tick_pnl)
+        and 1 <= tick_t_exit <= int(hold)
+        and tick_tp_hits >= 0
+        and -1 <= tick_t_qual <= int(hold)
+    )
+
+
+def _candidate_tick_metrics(
+    raw_mask: np.ndarray,
+    train_idx: int,
+    tradable_train: np.ndarray,
+    y_ref: np.ndarray,
+    t_exit_ref: np.ndarray,
+    select_entries,
+    required_override_indices: set[int],
+    valid_override_indices: set[int],
+) -> dict | None:
+    raw_m = np.asarray(raw_mask, dtype=bool)
+    required_for_candidate = {int(i) for i in np.flatnonzero(raw_m).tolist() if int(i) in required_override_indices}
+    if not required_for_candidate.issubset(valid_override_indices):
+        return None
+    y_ref_train = np.asarray(y_ref)[: int(train_idx)]
+    raw_tick_m = raw_m[: int(train_idx)] & np.asarray(tradable_train, dtype=bool) & ((y_ref_train == 0) | (y_ref_train == 1))
+    tick_raw_pos = int(np.sum(raw_tick_m & (y_ref_train == 1)))
+    tick_raw_neg = int(np.sum(raw_tick_m & (y_ref_train == 0)))
+    tick_raw_mask_count = int(tick_raw_pos + tick_raw_neg)
+    tick_raw_ratio = tick_raw_pos / max(1, tick_raw_neg)
+    selected_m, _raw_evaluable, _clusters_count = select_entries(raw_m, y_ref, t_exit_ref)
+    valid_m = np.asarray(selected_m, dtype=bool)[: int(train_idx)] & np.asarray(tradable_train, dtype=bool) & ((y_ref_train == 0) | (y_ref_train == 1))
+    tick_pos = int(np.sum(valid_m & (y_ref_train == 1)))
+    tick_neg = int(np.sum(valid_m & (y_ref_train == 0)))
+    tick_mask_count = int(tick_pos + tick_neg)
+    tick_ratio = tick_pos / max(1, tick_neg)
+    return {
+        "tick_single_pos_hits": tick_pos,
+        "tick_single_neg_hits": tick_neg,
+        "tick_single_mask_count": tick_mask_count,
+        "tick_single_ratio": float(tick_ratio),
+        "tick_single_mask_keep_ratio": _safe_ratio_or_nan(tick_mask_count, tick_raw_mask_count),
+        "tick_single_ratio_change": _safe_ratio_or_nan(tick_ratio, tick_raw_ratio),
+    }
+
+
+def _refine_missing_tick_candidates(
+    tick_scope_items: Iterable[dict],
+    y_basis: np.ndarray,
+    t_exit_basis: np.ndarray,
+    train_idx: int,
+    tradable_train: np.ndarray,
+    score_tick_source_map: dict[int, dict],
+    replay_entry_index_set: set[int],
+    n_rows: int,
+    hold: int,
+    select_entries,
+) -> tuple[bool, int]:
+    missing_items = [item for item in tick_scope_items if not _has_full_tick_metrics(item)]
+    if not missing_items:
+        return True, 0
+    y_ref = np.asarray(y_basis, dtype=np.int8).copy()
+    t_exit_ref = np.asarray(t_exit_basis, dtype=np.int32).copy()
+    valid_tick_map = {
+        int(idx): record
+        for idx, record in score_tick_source_map.items()
+        if int(idx) in replay_entry_index_set and _valid_tick_override_record(int(idx), record, n_rows, hold)
+    }
+    for idx, record in valid_tick_map.items():
+        y_ref[idx] = np.int8(int(record["y"]))
+        t_exit_ref[idx] = np.int32(int(record["t_exit"]))
+    metrics_complete = True
+    for item in missing_items:
+        metrics = _candidate_tick_metrics(
+            raw_mask=np.asarray(item["mask"], dtype=bool),
+            train_idx=train_idx,
+            tradable_train=tradable_train,
+            y_ref=y_ref,
+            t_exit_ref=t_exit_ref,
+            select_entries=select_entries,
+            required_override_indices=replay_entry_index_set,
+            valid_override_indices=set(valid_tick_map),
+        )
+        if metrics is None or not _has_full_tick_metrics(metrics):
+            metrics_complete = False
+            continue
+        item.update(metrics)
+        item["_single_pos_hits"] = int(metrics["tick_single_pos_hits"])
+        item["_single_neg_hits"] = int(metrics["tick_single_neg_hits"])
+        item["_single_mask_count"] = int(metrics["tick_single_mask_count"])
+        item["_single_ratio"] = float(metrics["tick_single_ratio"])
+        item["ratio"] = float(metrics["tick_single_ratio"])
+    return metrics_complete, len(missing_items)
+
+
+def _require_loaded_critical_minutes(required_minutes: Iterable[int], loaded_minute_bounds: dict[int, object]) -> None:
+    missing = sorted(int(minute) for minute in required_minutes if int(minute) not in loaded_minute_bounds)
+    if missing:
+        sample = ",".join(str(value) for value in missing[:10])
+        raise ValueError(
+            "AskBid-M1 critical TickReplay requires raw bid ticks for every critical minute; "
+            f"missing_critical_minutes_count={len(missing)} sample={sample}"
+        )
+
+
+def _tick_metric_status(row: dict, in_current_scope: bool) -> str:
+    if _has_full_tick_metrics(row):
+        return "full"
+    return "missing" if bool(in_current_scope) else "out_of_scope"
+
+
 def _atomic_write_csv(path: Path, frame: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent), encoding="utf-8", newline="") as tf:
@@ -728,8 +1091,6 @@ def _refinement_state(scope_rows: int, replay_enabled: bool, missing_after: int,
         return "empty_scope"
     if not replay_enabled:
         return "no_replay_configured"
-    if int(missing_after) > 0 and int(replay_entries) == 0:
-        return "null_critical_entries_existing_semantics"
     if int(missing_after) > 0:
         return "incomplete"
     return "complete"
@@ -3139,17 +3500,11 @@ def main() -> None:
                     )
                     timing_detail["tick_raw_load_sec"] += time.perf_counter() - raw_load_t0
                     timing_flags["tick_raw_load_skipped"] = False
-                    missing_minutes = sorted(int(m) for m in missing_critical_minutes if int(m) not in tick_minute_bounds)
                     print(f"[prefilter-tick-raw-load] critical_minutes_count={len(missing_critical_minutes)}")
                     timing_counts["tick_replay_raw_loaded_minutes_count"] = int(matched_total_minutes_count)
                     print(f"[prefilter-tick-raw-load] matched_total_minutes_count={int(matched_total_minutes_count)}")
                     print(f"[prefilter-tick-raw-load] used_real_ticks_source={'parquet_ticks' if args.tick_data.suffix.lower() in {'.parquet', '.pq'} else 'raw_ticks'}")
-                    if missing_minutes:
-                        sample = ",".join(str(x) for x in missing_minutes[:10])
-                        raise ValueError(
-                            "AskBid-M1 critical TickReplay requires raw bid ticks for every critical minute; "
-                            f"missing_critical_minutes_count={len(missing_minutes)} sample={sample}"
-                        )
+                    _require_loaded_critical_minutes(missing_critical_minutes, tick_minute_bounds)
                     tick_sim_t0 = time.perf_counter()
                     tick_map_new = _simulate_selected_entries_with_askbid_ticks(
                         entry_indices=missing_entry_indices,
@@ -3199,54 +3554,27 @@ def main() -> None:
                 timing_detail["tick_cache_diagnostics_sec"] += time.perf_counter() - diag_t0
                 timing_counts["tick_cache_diagnostics_entries_count"] = int(len(tick_map) if tick_map else len(cached_entries))
                 timing_flags["tick_cache_diagnostics_skipped"] = False
-            if tick_map:
-                candidate_metrics_t0 = time.perf_counter()
-                y_ref = np.asarray(y, dtype=np.int8).copy()
-                t_exit_ref = np.asarray(t_exit, dtype=np.int32).copy()
-                for idx_i, rec in tick_map.items():
-                    if int(idx_i) in replay_entry_index_set:
-                        y_ref[int(idx_i)] = np.int8(int(rec.get("y", -1)))
-                        t_exit_ref[int(idx_i)] = np.int32(int(rec.get("t_exit", -1)))
-                y_ref_train = y_ref[:train_idx]
-                metrics_complete = True
-                for it in tick_scope_items:
-                    if _has_full_tick_metrics(it):
-                        continue
-                    raw_m = np.asarray(it["mask"], dtype=bool)
-                    raw_tick_m = raw_m[:train_idx] & tradable_train & ((y_ref_train == 0) | (y_ref_train == 1))
-                    tick_raw_pos = int(np.sum(raw_tick_m & (y_ref_train == 1)))
-                    tick_raw_neg = int(np.sum(raw_tick_m & (y_ref_train == 0)))
-                    tick_raw_mask_count = int(tick_raw_pos + tick_raw_neg)
-                    tick_raw_ratio = tick_raw_pos / max(1, tick_raw_neg)
-                    selected_m, raw_evaluable, _ = _select_entries_for_mask(raw_m, y_ref, t_exit_ref)
-                    valid_m = selected_m[:train_idx] & tradable_train & ((y_ref_train == 0) | (y_ref_train == 1))
-                    requested_entries = sum(1 for idx_i in np.flatnonzero(raw_m).tolist() if int(idx_i) in replay_entry_index_set)
-                    cached_for_item = sum(1 for idx_i in np.flatnonzero(raw_m).tolist() if int(idx_i) in tick_map and int(idx_i) in replay_entry_index_set)
-                    if cached_for_item < requested_entries:
-                        metrics_complete = False
-                        continue
-                    tick_pos = int(np.sum(valid_m & (y_ref_train == 1)))
-                    tick_neg = int(np.sum(valid_m & (y_ref_train == 0)))
-                    tick_ratio = tick_pos / max(1, tick_neg)
-                    it["tick_single_pos_hits"] = tick_pos
-                    it["tick_single_neg_hits"] = tick_neg
-                    tick_mask_count = int(tick_pos + tick_neg)
-                    it["tick_single_mask_count"] = tick_mask_count
-                    it["tick_single_ratio"] = float(tick_ratio)
-                    it["tick_single_mask_keep_ratio"] = _safe_ratio_or_nan(tick_mask_count, tick_raw_mask_count)
-                    it["tick_single_ratio_change"] = _safe_ratio_or_nan(tick_ratio, tick_raw_ratio)
-                    it["_single_pos_hits"] = tick_pos
-                    it["_single_neg_hits"] = tick_neg
-                    it["_single_mask_count"] = tick_mask_count
-                    it["_single_ratio"] = float(tick_ratio)
-                    it["ratio"] = float(tick_ratio)
-                tick_refined_mode = any(_has_full_tick_metrics(it) for it in tick_scope_items)
-                if not metrics_complete:
-                    print("[prefilter-tick-cache] warning: some replay-relevant current-scope entries are missing tick cache results; affected candidates remain missing.")
-                timing_detail["tick_candidate_metrics_sec"] += time.perf_counter() - candidate_metrics_t0
-                print(f"[prefilter] askbid-tick-replayed {args.tick_refine_scope} scope on {len(replay_entry_indices)} replay-relevant entry rows.")
         else:
             print("[prefilter-tick-replay] no replay-relevant entries; AskBid-M1 M1 score basis remains unchanged")
+        if any(not _has_full_tick_metrics(it) for it in tick_scope_items):
+            candidate_metrics_t0 = time.perf_counter()
+            metrics_complete, _candidate_work_count = _refine_missing_tick_candidates(
+                tick_scope_items,
+                y,
+                t_exit,
+                train_idx,
+                tradable_train,
+                score_tick_source_map,
+                replay_entry_index_set,
+                n,
+                int(args.hold),
+                _select_entries_for_mask,
+            )
+            tick_refined_mode = any(_has_full_tick_metrics(it) for it in tick_scope_items)
+            if not metrics_complete:
+                print("[prefilter-tick-cache] warning: some replay-relevant current-scope entries are missing valid tick cache results; affected candidates remain missing.")
+            timing_detail["tick_candidate_metrics_sec"] += time.perf_counter() - candidate_metrics_t0
+            print(f"[prefilter] askbid-tick-replayed {args.tick_refine_scope} scope on {len(replay_entry_indices)} replay-relevant entry rows.")
     elif askbid_tick_replay_enabled:
         print(f"[prefilter-tick] skipped: tick_refine_scope={args.tick_refine_scope} produced empty candidate scope")
     wrote_coarse = False
@@ -3372,12 +3700,7 @@ def main() -> None:
                     row[col_tick] = float(it[col_tick])
                 else:
                     row.setdefault(col_tick, np.nan)
-            if _has_full_tick_metrics(row):
-                row["tick_metric_status"] = "full"
-            elif stable_k in tick_scope_stable_keys:
-                row["tick_metric_status"] = "missing"
-            else:
-                row["tick_metric_status"] = "out_of_scope"
+            row["tick_metric_status"] = _tick_metric_status(row, stable_k in tick_scope_stable_keys)
             existing_rows[stable_k] = _prefer_refined_row(
                 existing_rows.get(stable_k), row, refined_ctx_sig, REFINED_CACHE_SCHEMA_VERSION
             )
@@ -3422,29 +3745,15 @@ def main() -> None:
     score_tick_overrides = 0
     score_tick_invalid = 0
     for idx_i, rec in score_tick_source_map.items():
-        try:
-            ii = int(idx_i)
-            tick_y = int(rec.get("y", -1))
-            tick_pnl = float(rec.get("pnl", float("nan")))
-            tick_t_exit = int(rec.get("t_exit", -1))
-            tick_tp_hits = int(rec.get("tp_hits", -1))
-            if "t_qual" not in rec:
-                raise ValueError("missing tick_t_qual")
-            tick_t_qual = int(rec.get("t_qual", -2))
-        except Exception:
+        if not _valid_tick_override_record(idx_i, rec, n, int(args.hold)):
             score_tick_invalid += 1
             continue
-        tick_record_valid = (
-            0 <= ii < n
-            and tick_y in (0, 1)
-            and np.isfinite(tick_pnl)
-            and 1 <= tick_t_exit <= int(args.hold)
-            and tick_tp_hits >= 0
-            and -1 <= tick_t_qual <= int(args.hold)
-        )
-        if not tick_record_valid:
-            score_tick_invalid += 1
-            continue
+        ii = int(idx_i)
+        tick_y = int(rec["y"])
+        tick_pnl = float(rec["pnl"])
+        tick_t_exit = int(rec["t_exit"])
+        tick_tp_hits = int(rec["tp_hits"])
+        tick_t_qual = int(rec["t_qual"])
         score_y[ii] = tick_y
         score_pnl[ii] = tick_pnl
         score_t_exit[ii] = tick_t_exit
@@ -3495,7 +3804,6 @@ def main() -> None:
     reject_stats: dict[str, int] = {
         "rejected_pre_min_pos_per_week": 0,
         "rejected_min_pos_per_week": 0,
-        "rejected_min_main_score": 0,
         "rejected_same_parent_mask": 0,
         "rejected_not_strictly_better_than_parent": 0,
         "rejected_same_reference": 0,
@@ -3536,48 +3844,56 @@ def main() -> None:
     def _score_from_mask(mask: np.ndarray, only_lower_entry: bool | None = None, enforce_filters: bool = True) -> dict | None:
         days = max(1.0, float((df.index[train_idx - 1] - df.index[0]).total_seconds() / 86400.0))
         weeks = days / 7.0
-        if enforce_filters:
-            raw = np.asarray(mask, dtype=bool)
-            raw_train = raw[:train_idx] & score_tradable_train
-            raw_pos_hits = int(np.sum(raw_train & (score_y_train == 1)))
-            if raw_pos_hits < float(args.min_pos_per_week) * weeks:
-                if bool(args.debug_reject_stats):
-                    reject_stats["rejected_pre_min_pos_per_week"] += 1
-                return None
-        selected_mask, raw_evaluable, clusters_count = _select_entries_for_mask(mask, score_y, score_t_exit, only_lower_entry=only_lower_entry)
-        mt = selected_mask[:train_idx] & score_tradable_train
-        pos_hits = int(np.sum(mt & (score_y_train == 1)))
-        neg_hits = int(np.sum(mt & (score_y_train == 0)))
-        if enforce_filters and pos_hits < float(args.min_pos_per_week) * weeks:
+        raw = np.asarray(mask, dtype=bool)
+        raw_train = raw[:train_idx] & score_tradable_train
+        raw_pos_hits = int(np.sum(raw_train & (score_y_train == 1)))
+
+        def _select_for_score():
+            return _select_entries_for_mask(mask, score_y, score_t_exit, only_lower_entry=only_lower_entry)
+
+        def _count_selected_hits(selected):
+            selected_train = selected[:train_idx] & score_tradable_train
+            return int(np.sum(selected_train & (score_y_train == 1))), int(np.sum(selected_train & (score_y_train == 0)))
+
+        def _finish_score(selected_mask, raw_evaluable, clusters_count, pos_hits, neg_hits):
+            ratio = pos_hits / max(1, neg_hits)
+            mt_test = selected_mask[train_idx:] & score_tradable_test
+            pos_test = int(np.sum(mt_test & (score_y_test == 1)))
+            neg_test = int(np.sum(mt_test & (score_y_test == 0)))
+            ratio_test = pos_test / max(1, neg_test)
+            wf_mean, wf_min, wf_hits = _calc_wf(mt_test, score_y_test, int(args.wf_folds))
+            precision = pos_hits / max(1, (pos_hits + neg_hits))
+            selected_evaluable = int(pos_hits + neg_hits + pos_test + neg_test)
+            return {
+                "pos_hits": pos_hits,
+                "neg_hits": neg_hits,
+                "ratio": float(ratio),
+                "precision": float(precision),
+                "test_pos_hits": pos_test,
+                "test_neg_hits": neg_test,
+                "test_ratio": float(ratio_test),
+                "wf_mean_ratio": wf_mean,
+                "wf_min_ratio": wf_min,
+                "wf_hits": wf_hits,
+                "selection_ratio": float(selected_evaluable / raw_evaluable) if raw_evaluable > 0 else 0.0,
+                "clusters_count": int(clusters_count),
+            }
+
+        score, gate_reject = _run_scoring_gate_pipeline(
+            raw_pos_hits,
+            weeks,
+            float(args.min_pos_per_week),
+            enforce_filters,
+            _select_for_score,
+            _count_selected_hits,
+            _finish_score,
+        )
+        if score is None:
             if bool(args.debug_reject_stats):
-                reject_stats["rejected_min_pos_per_week"] += 1
+                reject_key = "rejected_pre_min_pos_per_week" if gate_reject == "raw_min_pos" else "rejected_min_pos_per_week"
+                reject_stats[reject_key] += 1
             return None
-        ratio = pos_hits / max(1, neg_hits)
-        if enforce_filters and ratio < float(args.min_main_score):
-            if bool(args.debug_reject_stats):
-                reject_stats["rejected_min_main_score"] += 1
-            return None
-        mt_test = selected_mask[train_idx:] & score_tradable_test
-        pos_test = int(np.sum(mt_test & (score_y_test == 1)))
-        neg_test = int(np.sum(mt_test & (score_y_test == 0)))
-        ratio_test = pos_test / max(1, neg_test)
-        wf_mean, wf_min, wf_hits = _calc_wf(mt_test, score_y_test, int(args.wf_folds))
-        precision = pos_hits / max(1, (pos_hits + neg_hits))
-        selected_evaluable = int(pos_hits + neg_hits + pos_test + neg_test)
-        return {
-            "pos_hits": pos_hits,
-            "neg_hits": neg_hits,
-            "ratio": float(ratio),
-            "precision": float(precision),
-            "test_pos_hits": pos_test,
-            "test_neg_hits": neg_test,
-            "test_ratio": float(ratio_test),
-            "wf_mean_ratio": wf_mean,
-            "wf_min_ratio": wf_min,
-            "wf_hits": wf_hits,
-            "selection_ratio": float(selected_evaluable / raw_evaluable) if raw_evaluable > 0 else 0.0,
-            "clusters_count": int(clusters_count),
-        }
+        return score
 
     def _train_key(r: dict) -> tuple[float, int, int]:
         return (float(r["ratio"]), int(r["pos_hits"]), -int(r["neg_hits"]))
@@ -3604,42 +3920,47 @@ def main() -> None:
                     seen_gid.add(gid)
             dedup.append(c)
         conds = dedup
-        # Binary flood cap per unlocked block
-        if sum(1 for c in conds if c["binary"]) > int(args.binary_cap_per_block):
+
+        def _evaluate_structurally_valid(valid_conds: list[dict]) -> dict | None:
+            mask = _build_mask_from_conds(
+                [{"col": c["col"], "op": c["op"], "value": c["value"], "domain": "auto"} for c in valid_conds]
+            )
+            sc = _score_from_mask(mask)
+            if sc is None:
+                return None
+            mh = _mask_hash(mask)
+            if parent is not None:
+                if str(parent.get("_mask_hash", "")) == mh:
+                    if bool(args.debug_reject_stats):
+                        reject_stats["rejected_same_parent_mask"] += 1
+                    return None
+                if not _parent_score_allows(sc, parent):
+                    if bool(args.debug_reject_stats):
+                        reject_stats["rejected_not_strictly_better_than_parent"] += 1
+                    return None
+            return {
+                "conds": [{"col": str(c["col"]), "op": str(c["op"]), "value": float(c["value"]), "domain": "auto"} for c in valid_conds],
+                "_combo": tuple(sorted(int(x) for x in combo)),
+                "_mask_hash": mh,
+                "search_source": str(source),
+                **sc,
+            }
+
+        result, structure_reject = _run_structure_gate(
+            conds,
+            int(args.binary_cap_per_block),
+            lambda triplets: miner.validate_binary_anchor_invariant(triplets, cols),
+            _evaluate_structurally_valid,
+        )
+        if structure_reject == "binary_cap":
             if bool(args.debug_reject_stats):
                 reject_stats["rejected_binary_cap"] += 1
             return None
-        # bundle/anchor validity
-        cond_triplets = [(str(c["col"]), str(c["op"]), float(c["value"])) for c in conds]
-        ok_bundle, _ = miner.validate_binary_anchor_invariant(cond_triplets, cols)
-        if not ok_bundle:
+        if structure_reject == "bundle_anchor":
             if bool(args.debug_reject_stats):
                 reject_stats["rejected_bundle_anchor"] += 1
             return None
-
-        mask = _build_mask_from_conds(
-            [{"col": c["col"], "op": c["op"], "value": c["value"], "domain": "auto"} for c in conds]
-        )
-        sc = _score_from_mask(mask)
-        if sc is None:
-            return None
-        mh = _mask_hash(mask)
-        if parent is not None:
-            if str(parent.get("_mask_hash", "")) == mh:
-                if bool(args.debug_reject_stats):
-                    reject_stats["rejected_same_parent_mask"] += 1
-                return None
-            if _train_key(sc) <= _train_key(parent):
-                if bool(args.debug_reject_stats):
-                    reject_stats["rejected_not_strictly_better_than_parent"] += 1
-                return None
-        return {
-            "conds": [{"col": str(c["col"]), "op": str(c["op"]), "value": float(c["value"]), "domain": "auto"} for c in conds],
-            "_combo": tuple(sorted(int(x) for x in combo)),
-            "_mask_hash": mh,
-            "search_source": str(source),
-            **sc,
-        }
+        return result
 
     csv_columns = [
         "path_index", "rule_human", "rule_json_id", "decode_type_info", "decode_bin_info", "pos_hits", "neg_hits",
@@ -3848,6 +4169,7 @@ def main() -> None:
 
     rng = random.Random(int(args.batch_random_seed))
     valid_pool: list[dict] = []
+    ab_survivor_pool: list[dict] = []
     progress_state: dict = {}
     phase_c_was_active = False
     original_early_stop_window_combos = int(args.early_stop_window_combos)
@@ -3988,10 +4310,10 @@ def main() -> None:
                 _log_phase_transition("A", "C", "phase_b_completed_pool_key", round=unlocked_next, pool_size=len(pool), valid_pool=len(valid_pool), max_valids=int(args.max_valids))
                 force_phase = "C"
                 break
-            if (not phase_a) and not valid_pool:
+            if (not phase_a) and not _phase_b_has_parent_survivors(ab_survivor_pool):
                 phase_b_skip_reason = "no_parent_seeds"
                 print("[prefilter-phase-b] started=False reason=no_parent_seeds")
-                print("[prefilter-phase-b] skipped: no parent seeds in valid_pool after phase A.")
+                print("[prefilter-phase-b] skipped: no beam-eligible parent survivors after phase A.")
                 _log_phase_transition("A", "C", "no_expandable_phase_b_parents", round=unlocked_next, pool_size=len(pool), valid_pool=len(valid_pool), max_valids=int(args.max_valids))
                 force_phase = "C"
                 break
@@ -4001,7 +4323,7 @@ def main() -> None:
                     phase_b_t0 = time.perf_counter()
                 phase_b_started = True
                 phase_b_skip_reason = "started"
-                print(f"[prefilter-phase-b] started=True pool_size={len(pool)} parent_seeds={len(valid_pool)}")
+                print(f"[prefilter-phase-b] started=True pool_size={len(pool)} parent_seeds={len(ab_survivor_pool)}")
                 _log_phase_transition("A", "B", phase_b_start_reason, round=unlocked_next, pool_size=len(pool), valid_pool=len(valid_pool), max_valids=int(args.max_valids))
             shard_specs: list[tuple[int, int, int, int]] = []
             batch_eff = max(256, int(args.batch_size))
@@ -4021,7 +4343,7 @@ def main() -> None:
             tested = 0
             valid_round = 0
             mut_i = 0
-            seeds = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
+            seeds = _ab_parent_seed_snapshot(ab_survivor_pool, int(args.max_valids))
             mut_combos: collections.deque[tuple[tuple[int, ...], dict]] = collections.deque()
             parent_ext_iter = None
             if (not phase_a) or (phase_a and len(seeds) > 0 and unlocked_next > int(args.step_size)):
@@ -4116,10 +4438,15 @@ def main() -> None:
                         if rr is not None:
                             out_batch.append(rr)
                 tested += len(combos)
-                valid_round += len(out_batch)
-                valid_pool.extend(out_batch)
-                valid_pool = _dedupe_mask(valid_pool)
-                valid_pool = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
+                ab_survivor_pool, valid_pool, final_valid_batch = _update_ab_search_pools(
+                    ab_survivor_pool,
+                    valid_pool,
+                    out_batch,
+                    float(args.min_main_score),
+                    int(args.max_valids),
+                    _dedupe_mask,
+                )
+                valid_round += len(final_valid_batch)
                 topk = valid_pool[: int(args.early_stop_top_k)]
                 a1 = _train_key(topk[0]) if topk else (-np.inf, -1, 1)
                 avg_ratio = float(np.mean([float(x["ratio"]) for x in topk])) if topk else float("nan")
@@ -4274,25 +4601,12 @@ def main() -> None:
         print("[prefilter-phase-c] skipped: empty family-top pool")
     else:
         idxs_c = list(range(len(pool_c)))
-        seed_rules = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: max(1, int(args.phase_c_beam_width))]
-        cond_to_idx_c = {(str(c["col"]), str(c["op"]), float(c["value"])): i for i, c in enumerate(pool_c)}
-        mapped_beam: list[tuple[int, ...]] = []
-        for s in seed_rules:
-            mapped = []
-            ok = True
-            for c in s.get("conds", []):
-                key = (str(c["col"]), str(c["op"]), float(c["value"]))
-                idx = cond_to_idx_c.get(key)
-                if idx is None:
-                    ok = False
-                    break
-                mapped.append(int(idx))
-            if ok and mapped:
-                mapped_beam.append(tuple(sorted(set(mapped))))
-        if not mapped_beam:
-            mapped_beam = [tuple([i]) for i in idxs_c[: max(1, min(int(args.phase_c_beam_width), len(idxs_c)))]]
-        beam = mapped_beam
-        beam = [b for b in beam if 1 <= len(b) <= int(args.phase_c_max_conds)]
+        beam, _used_c_single_fallback = _map_c_start_beam(
+            ab_survivor_pool,
+            pool_c,
+            int(args.phase_c_beam_width),
+            int(args.phase_c_max_conds),
+        )
         print(f"[prefilter-phase-c] start beam={len(beam)} pool={len(pool_c)}")
         phase_c_was_active = True
         phase_c_level = 0
@@ -4324,26 +4638,33 @@ def main() -> None:
                 generated_extensions += len(chunk)
                 for cb in chunk:
                     evaluated_combos += 1
-                    rr = evaluate_combo(cb, pool_c, None, source="C")
+                    rr = _evaluate_without_immediate_parent(evaluate_combo, cb, pool_c, "C")
                     if rr is not None:
                         out_c.append(rr)
                 if truncated:
                     break
             if not had_any:
-                print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated=0 evaluated=0 truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules=0 new_valid=0 beam_kept=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated=0 evaluated=0 truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules=0 new_valid=0 beam_candidates=0 beam_kept=0 beam_kept_final_valid=0 beam_kept_search_only=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
                 break
             if not out_c:
-                print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_c))} new_valid=0 beam_kept=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_c))} new_valid=0 beam_candidates=0 beam_kept=0 beam_kept_final_valid=0 beam_kept_search_only=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
                 break
             valid_before = len(valid_pool)
-            valid_pool.extend(out_c)
+            final_valid_c, beam_rules, c_diag = _select_level_results(
+                out_c,
+                float(args.min_main_score),
+                min(int(args.phase_c_max_conds), int(args.max_path_conds)),
+                int(args.phase_c_beam_width),
+            )
+            valid_pool.extend(final_valid_c)
             valid_pool = _dedupe_mask(valid_pool)
-            valid_pool = sorted(valid_pool, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.max_valids)]
+            valid_pool = sorted(valid_pool, key=_train_search_sort_key)[: int(args.max_valids)]
             _save_progress(valid_pool, progress_state)
-            beam_rules = sorted(out_c, key=lambda z: (-float(z["ratio"]), -int(z["pos_hits"]), int(z["neg_hits"])))[: int(args.phase_c_beam_width)]
             beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
+            beam_kept_final_valid = c_diag["beam_kept_final_valid"]
+            beam_kept_search_only = c_diag["beam_kept_search_only"]
             best_ratio = float(valid_pool[0]["ratio"]) if valid_pool else float("nan")
-            print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_c))} new_valid={max(0, len(valid_pool) - valid_before)} beam_kept={len(beam)} valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
+            print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_c))} new_valid={max(0, len(valid_pool) - valid_before)} beam_candidates={len(out_c)} beam_kept={len(beam)} beam_kept_final_valid={beam_kept_final_valid} beam_kept_search_only={beam_kept_search_only} valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
             cmd = _read_control_command(args.control_file)
             if cmd == "export_now":
                 print("[prefilter-control] export_now (phase C)"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file)
@@ -4376,7 +4697,7 @@ def main() -> None:
         else:
             tick_pool = sorted(tick_pool, key=lambda z: (-float(z.get("tick_single_ratio", -np.inf)), -int(z.get("tick_single_pos_hits", z.get("_single_pos_hits", 0)))))
             idxs_d = list(range(len(tick_pool)))
-            start_depth = max(1, min(int(args.phase_d_start_conds), int(args.phase_d_max_conds), int(args.max_path_conds), len(idxs_d)))
+            raw_start_depth = int(args.phase_d_start_conds)
             d_beam: list[tuple[int, ...]] = []
             phase_d_level = 0
 
@@ -4397,43 +4718,50 @@ def main() -> None:
                     print("[prefilter-control] enable_early_stop"); args.early_stop_window_combos = int(original_early_stop_window_combos); _write_control_none(args.control_file)
                 return False
 
-            def _d_sort_key(r: dict) -> tuple[float, int, int, int]:
-                return (-float(r["ratio"]), -int(r["pos_hits"]), int(r["neg_hits"]), len(tuple(r.get("_combo", tuple()))))
-
             def _keep_d_pool(rows: list[dict]) -> list[dict]:
                 rows = _dedupe_mask(rows)
-                return sorted(rows, key=_d_sort_key)[: int(args.max_valids)]
+                return sorted(rows, key=_d_archive_sort_key)[: int(args.max_valids)]
 
-            # level=0: evaluate all start-depth combinations directly, streamingly.
-            level_t0 = time.perf_counter()
-            generated_extensions = 0
-            evaluated_combos = 0
-            truncated = False
-            out_d: list[dict] = []
-            for chunk in _batched(itertools.combinations(idxs_d, start_depth), max(64, int(args.batch_size))):
-                cap = int(args.phase_d_max_generated_per_level)
-                if cap > 0 and generated_extensions + len(chunk) >= cap:
-                    chunk = chunk[: max(0, cap - generated_extensions)]
-                    truncated = True
-                generated_extensions += len(chunk)
-                for cb in chunk:
-                    evaluated_combos += 1
-                    rr = evaluate_combo(tuple(sorted(cb)), tick_pool, None, source="D")
-                    if rr is not None:
-                        out_d.append(rr)
-                if truncated:
-                    break
-            if out_d:
+            def _evaluate_d_start_stage(depth: int) -> tuple[list[dict], int, int, bool, float]:
+                level_t0 = time.perf_counter()
+                out_d, generated_extensions, evaluated_combos, truncated = _run_global_d_stage(
+                    idxs_d,
+                    depth,
+                    int(args.batch_size),
+                    int(args.phase_d_max_generated_per_level),
+                    lambda cb: _evaluate_without_immediate_parent(evaluate_combo, cb, tick_pool, "D"),
+                )
+                return out_d, generated_extensions, evaluated_combos, truncated, time.perf_counter() - level_t0
+
+            def _consume_d_start_stage(depth: int, stage_tag: str, stage_result: tuple[list[dict], int, int, bool, float]) -> bool:
+                nonlocal d_valid_pool, d_beam
+                out_d, generated_extensions, evaluated_combos, truncated, elapsed = stage_result
                 before = len(d_valid_pool)
-                d_valid_pool = _keep_d_pool(d_valid_pool + out_d)
+                final_valid_d, beam_rules, d_diag = _select_level_results(
+                    out_d,
+                    float(args.min_main_score),
+                    min(int(args.phase_d_max_conds), int(args.max_path_conds)),
+                    int(args.phase_d_beam_width),
+                    _dedupe_mask,
+                )
+                d_valid_pool = _keep_d_pool(d_valid_pool + final_valid_d)
                 _save_progress(valid_pool + d_valid_pool, progress_state)
-                beam_rules = sorted(_dedupe_mask(out_d), key=_d_sort_key)[: int(args.phase_d_beam_width)]
                 d_beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
+                beam_kept_final_valid = d_diag["beam_kept_final_valid"]
+                beam_kept_search_only = d_diag["beam_kept_search_only"]
                 best_ratio = float(d_valid_pool[0]["ratio"]) if d_valid_pool else float("nan")
-                print(f"[prefilter-phase-d] level=0 depth={start_depth} seeds=all pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_kept={len(d_beam)} d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
-            else:
-                print(f"[prefilter-phase-d] level=0 depth={start_depth} seeds=all pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_kept=0 d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
-                _save_progress(valid_pool + d_valid_pool, progress_state)
+                print(f"[prefilter-phase-d] level=0 depth={depth} stage={stage_tag} seeds=all pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_candidates={len(out_d)} beam_kept={len(d_beam)} beam_kept_final_valid={beam_kept_final_valid} beam_kept_search_only={beam_kept_search_only} d_valid_pool={len(d_valid_pool)} elapsed={elapsed:.2f}s best_ratio={best_ratio:.6g}")
+                return bool(out_d)
+
+            _dispatch_phase_d_start(
+                raw_start_depth,
+                int(args.phase_d_max_conds),
+                int(args.max_path_conds),
+                len(idxs_d),
+                _evaluate_d_start_stage,
+                _consume_d_start_stage,
+                lambda message: print(f"[prefilter-phase-d] {message}"),
+            )
             if _phase_d_control():
                 d_beam = []
 
@@ -4474,24 +4802,32 @@ def main() -> None:
                     generated_extensions += len(chunk)
                     for cb in chunk:
                         evaluated_combos += 1
-                        rr = evaluate_combo(cb, tick_pool, None, source="D")
+                        rr = _evaluate_without_immediate_parent(evaluate_combo, cb, tick_pool, "D")
                         if rr is not None:
                             out_d.append(rr)
                     if truncated:
                         break
                 depth_txt = f"depth={min_depth}" if min_depth == max_depth else f"depth_range={min_depth}..{max_depth}"
                 if (not had_any) or (not out_d):
-                    print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_kept=0 d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                    print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_candidates=0 beam_kept=0 beam_kept_final_valid=0 beam_kept_search_only=0 d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
                     _save_progress(valid_pool + d_valid_pool, progress_state)
                     _phase_d_control()
                     break
                 before = len(d_valid_pool)
-                d_valid_pool = _keep_d_pool(d_valid_pool + out_d)
+                final_valid_d, beam_rules, d_diag = _select_level_results(
+                    out_d,
+                    float(args.min_main_score),
+                    min(int(args.phase_d_max_conds), int(args.max_path_conds)),
+                    int(args.phase_d_beam_width),
+                    _dedupe_mask,
+                )
+                d_valid_pool = _keep_d_pool(d_valid_pool + final_valid_d)
                 _save_progress(valid_pool + d_valid_pool, progress_state)
-                beam_rules = sorted(_dedupe_mask(out_d), key=_d_sort_key)[: int(args.phase_d_beam_width)]
                 d_beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
+                beam_kept_final_valid = d_diag["beam_kept_final_valid"]
+                beam_kept_search_only = d_diag["beam_kept_search_only"]
                 best_ratio = float(d_valid_pool[0]["ratio"]) if d_valid_pool else float("nan")
-                print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_kept={len(d_beam)} d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
+                print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_candidates={len(out_d)} beam_kept={len(d_beam)} beam_kept_final_valid={beam_kept_final_valid} beam_kept_search_only={beam_kept_search_only} d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
                 if _phase_d_control():
                     break
             print("[prefilter-phase-d] done")
@@ -4509,15 +4845,6 @@ def main() -> None:
         ftype = str(meta.get(col, {}).get("feature_type", ""))
         return ftype == "continuous"
 
-    def _better_score(a: dict | None, b: dict | None) -> bool:
-        if a is None:
-            return False
-        if b is None:
-            return True
-        ka = (float(a["ratio"]), int(a["pos_hits"]), -int(a["neg_hits"]))
-        kb = (float(b["ratio"]), int(b["pos_hits"]), -int(b["neg_hits"]))
-        return ka > kb
-
     def _mask_cond_to_interval(c: dict) -> tuple[int, int]:
         if "lo_bin" in c and "hi_bin" in c:
             return int(c["lo_bin"]), int(c["hi_bin"])
@@ -4528,7 +4855,7 @@ def main() -> None:
         conds = [dict(x) for x in rule.get("conds", [])]
         base_mask = _build_mask_from_conds(conds)
         best_sc = _score_from_mask(base_mask)
-        if best_sc is None:
+        if best_sc is None or not _is_final_valid_result(best_sc, float(args.min_main_score)):
             return rule
         changed = True
         while changed:
@@ -4551,7 +4878,7 @@ def main() -> None:
                     trial_conds = [dict(x) for x in conds]
                     trial_conds[i] = cand
                     sc = _score_from_mask(_build_mask_from_conds(trial_conds))
-                    if _better_score(sc, local_best_sc):
+                    if _neighbor_merge_trial(local_best_sc, sc, float(args.min_main_score)) is sc:
                         local_best_sc = sc
                         local_best = cand
                 if hi < eff:
@@ -4562,7 +4889,7 @@ def main() -> None:
                     trial_conds = [dict(x) for x in conds]
                     trial_conds[i] = cand
                     sc = _score_from_mask(_build_mask_from_conds(trial_conds))
-                    if _better_score(sc, local_best_sc):
+                    if _neighbor_merge_trial(local_best_sc, sc, float(args.min_main_score)) is sc:
                         local_best_sc = sc
                         local_best = cand
                 if local_best is not None:
@@ -4575,7 +4902,7 @@ def main() -> None:
         final_mask = _build_mask_from_conds(conds)
         merged_rule["_mask_hash"] = _mask_hash(final_mask)
         final_sc = _score_from_mask(final_mask)
-        if final_sc is not None:
+        if final_sc is not None and _is_final_valid_result(final_sc, float(args.min_main_score)):
             merged_rule.update(final_sc)
         return merged_rule
 

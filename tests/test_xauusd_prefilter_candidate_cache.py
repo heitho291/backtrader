@@ -268,12 +268,122 @@ def test_500_250_250_partition_keeps_all_candidates_in_replay_scope():
         (0, False, 0, 0, "empty_scope"),
         (2, False, 2, 0, "no_replay_configured"),
         (2, True, 0, 4, "complete"),
-        (2, True, 2, 0, "null_critical_entries_existing_semantics"),
+        (2, True, 2, 0, "incomplete"),
         (2, True, 1, 4, "incomplete"),
     ],
 )
-def test_refinement_states_preserve_block1_null_critical_semantics(scope_rows, replay, missing, entries, expected):
+def test_refinement_states_include_block2_zero_critical_completion(scope_rows, replay, missing, entries, expected):
     assert prefilter._refinement_state(scope_rows, replay, missing, entries) == expected
+
+
+def test_zero_critical_candidate_metrics_are_full_from_askbid_m1_basis():
+    item = {"stable_candidate_key": "zero", "mask": prefilter.np.asarray([True, True, False], dtype=bool)}
+    y_ref = prefilter.np.asarray([1, 0, 1], dtype=prefilter.np.int8)
+    t_exit_ref = prefilter.np.asarray([1, 1, 1], dtype=prefilter.np.int32)
+
+    def select_entries(mask, _y, _t_exit):
+        return prefilter.np.asarray(mask, dtype=bool), int(prefilter.np.sum(mask)), 1
+
+    complete, work_count = prefilter._refine_missing_tick_candidates(
+        tick_scope_items=[item],
+        y_basis=y_ref,
+        t_exit_basis=t_exit_ref,
+        train_idx=3,
+        tradable_train=prefilter.np.ones(3, dtype=bool),
+        score_tick_source_map={},
+        replay_entry_index_set=set(),
+        n_rows=3,
+        hold=2,
+        select_entries=select_entries,
+    )
+    assert complete
+    assert work_count == 1
+    assert prefilter._has_full_tick_metrics(item)
+    assert item["tick_single_pos_hits"] == 1
+    assert item["tick_single_neg_hits"] == 1
+    assert item["tick_single_ratio"] == 1.0
+    full, missing = prefilter._partition_tick_metric_rows([item])
+    assert [row["stable_candidate_key"] for row in full] == ["zero"]
+    assert missing == []
+    assert prefilter._tick_metric_status(item, True) == "full"
+    phase_d_pool_base, _ = prefilter._partition_tick_metric_rows([item])
+    assert len(phase_d_pool_base) == 1
+    assert phase_d_pool_base[0] is item
+    assert prefilter._refinement_state(1, True, len(missing), 0) == "complete"
+
+
+def test_tick_refinement_applies_valid_override_and_skips_empty_or_stored_full_scope():
+    item = {"stable_candidate_key": "override", "mask": prefilter.np.asarray([True, False], dtype=bool)}
+
+    def select_entries(mask, _y, _t_exit):
+        return prefilter.np.asarray(mask, dtype=bool), 1, 1
+
+    valid_record = {"y": 1, "pnl": 0.2, "t_exit": 1, "t_qual": 0, "tp_hits": 1}
+    complete, work_count = prefilter._refine_missing_tick_candidates(
+        [item],
+        prefilter.np.asarray([0, 0], dtype=prefilter.np.int8),
+        prefilter.np.asarray([1, 1], dtype=prefilter.np.int32),
+        2,
+        prefilter.np.ones(2, dtype=bool),
+        {0: valid_record},
+        {0},
+        2,
+        2,
+        select_entries,
+    )
+    assert complete and work_count == 1
+    assert item["tick_single_pos_hits"] == 1
+    assert item["tick_single_neg_hits"] == 0
+    assert prefilter._tick_metric_status(item, True) == "full"
+
+    complete, work_count = prefilter._refine_missing_tick_candidates(
+        [], prefilter.np.asarray([], dtype=prefilter.np.int8), prefilter.np.asarray([], dtype=prefilter.np.int32),
+        0, prefilter.np.asarray([], dtype=bool), {}, set(), 0, 1, select_entries,
+    )
+    assert complete and work_count == 0
+    complete, work_count = prefilter._refine_missing_tick_candidates(
+        [item], prefilter.np.asarray([0, 0], dtype=prefilter.np.int8), prefilter.np.asarray([1, 1], dtype=prefilter.np.int32),
+        2, prefilter.np.ones(2, dtype=bool), {}, set(), 2, 2, select_entries,
+    )
+    assert complete and work_count == 0
+
+
+def test_required_raw_tick_minutes_still_fail_fast():
+    with pytest.raises(ValueError, match="missing_critical_minutes_count=1"):
+        prefilter._require_loaded_critical_minutes({100, 200}, {100: (0, 1)})
+    prefilter._require_loaded_critical_minutes({100}, {100: (0, 1)})
+
+
+def test_full_tick_metric_status_is_persisted_by_regular_csv_writer(tmp_path):
+    metrics = {name: 1.0 for name in prefilter.REQUIRED_TICK_METRIC_COLUMNS}
+    row = {"stable_candidate_key": "full", **metrics}
+    row["tick_metric_status"] = prefilter._tick_metric_status(row, True)
+    out = tmp_path / "refined.csv"
+    wrote, reason = prefilter._write_csv_if_changed(out, pd.DataFrame([row]), key_cols=["stable_candidate_key"])
+    assert wrote and reason == "rows_changed"
+    restored = pd.read_csv(out).iloc[0].to_dict()
+    assert restored["tick_metric_status"] == "full"
+    assert prefilter._has_full_tick_metrics(restored)
+
+
+def test_required_invalid_tick_override_keeps_candidate_incomplete():
+    raw_mask = prefilter.np.asarray([True, False], dtype=bool)
+
+    def select_entries(mask, _y, _t_exit):
+        return prefilter.np.asarray(mask, dtype=bool), 1, 1
+
+    metrics = prefilter._candidate_tick_metrics(
+        raw_mask=raw_mask,
+        train_idx=2,
+        tradable_train=prefilter.np.ones(2, dtype=bool),
+        y_ref=prefilter.np.asarray([1, 0], dtype=prefilter.np.int8),
+        t_exit_ref=prefilter.np.asarray([1, 1], dtype=prefilter.np.int32),
+        select_entries=select_entries,
+        required_override_indices={0},
+        valid_override_indices=set(),
+    )
+    assert metrics is None
+    assert prefilter._refinement_state(1, True, 1, 1) == "incomplete"
 
 
 def test_phase_d_base_is_current_scope_intersection_full_metrics():
