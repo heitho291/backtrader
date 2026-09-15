@@ -139,6 +139,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-random-seed", type=int, default=42)
     p.add_argument("--debug-reject-stats", action="store_true", default=False)
     p.add_argument("--debug-timing-breakdown", action="store_true", default=False)
+    p.add_argument("--debug-exact-combo-stats", action="store_true", default=False)
+    p.add_argument("--debug-score-stage-timing", action="store_true", default=False)
     p.add_argument("--debug-atr-candidates", action="store_true", default=False)
     p.add_argument("--label-cache-npz", type=Path, default=None)
     p.add_argument("--min-single-pos-hits", type=int, default=2)
@@ -183,6 +185,338 @@ def _batched(iterable: Iterable[Tuple[int, ...]], n: int):
             buf = []
     if buf:
         yield buf
+
+
+def _exact_combo_key(combo: Iterable[int]) -> tuple[int, ...]:
+    return tuple(int(x) for x in combo)
+
+
+def _train_rank_values(row: dict, single: bool = False) -> tuple[float, int, int]:
+    if single:
+        return (
+            float(row.get("_single_ratio", row.get("ratio", 0.0))),
+            int(row.get("_single_pos_hits", row.get("pos_hits", 0))),
+            -int(row.get("_single_neg_hits", row.get("neg_hits", 0))),
+        )
+    return (float(row["ratio"]), int(row["pos_hits"]), -int(row["neg_hits"]))
+
+
+def _merge_combo_provenance(provenance: dict, combo_key: tuple[int, ...], parent_id: int, parent_nodes: dict[int, dict]) -> None:
+    parent = parent_nodes[int(parent_id)]
+    entry = provenance.setdefault(
+        combo_key,
+        {"parent_ids": set(), "root_ids": set(), "best_train_rank": None, "best_parent_ids": set()},
+    )
+    entry["parent_ids"].add(int(parent_id))
+    entry["root_ids"].update(int(x) for x in parent["root_ids"])
+    rank = tuple(parent["train_rank"])
+    best_rank = entry["best_train_rank"]
+    if best_rank is None or rank > best_rank:
+        entry["best_train_rank"] = rank
+        entry["best_parent_ids"] = {int(parent_id)}
+    elif rank == best_rank:
+        entry["best_parent_ids"].add(int(parent_id))
+
+
+def _run_exact_combo_stage(
+    raw_items: Iterable[tuple[Iterable[int], int | None]],
+    batch_size: int,
+    generation_cap: int,
+    evaluate,
+    parent_nodes: dict[int, dict] | None = None,
+    state_out: dict | None = None,
+) -> tuple[list[dict], int, int, bool]:
+    seen: set[tuple[int, ...]] = set()
+    provenance: dict[tuple[int, ...], dict] = {}
+    out: list[dict] = []
+    raw = 0
+    evaluated = 0
+    duplicates = 0
+    truncated = False
+    for chunk in _batched(raw_items, max(64, int(batch_size))):
+        cap = int(generation_cap)
+        if cap > 0 and raw + len(chunk) >= cap:
+            chunk = chunk[: max(0, cap - raw)]
+            truncated = True
+        raw += len(chunk)
+        for combo, parent_id in chunk:
+            key = _exact_combo_key(combo)
+            if parent_id is not None:
+                if parent_nodes is None:
+                    raise ValueError("parent_nodes are required for parent-linked exact-combo generation")
+                _merge_combo_provenance(provenance, key, int(parent_id), parent_nodes)
+            if key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
+            evaluated += 1
+            result = evaluate(key)
+            if result is not None:
+                out.append(result)
+        if truncated:
+            break
+    successful_keys = {_exact_combo_key(row.get("_combo", ())) for row in out}
+    provenance = {key: value for key, value in provenance.items() if key in successful_keys}
+    if state_out is not None:
+        state_out.clear()
+        state_out.update({
+            "seen": seen,
+            "raw": raw,
+            "unique": len(seen),
+            "duplicates": duplicates,
+            "evaluated": evaluated,
+            "provenance": provenance,
+        })
+    return out, raw, evaluated, truncated
+
+
+def _evaluate_with_same_reference(
+    combo: Iterable[int],
+    pool_items: list[dict],
+    same_ref: dict,
+    parse_feature_meta,
+    evaluate_reduced,
+    on_removed=None,
+):
+    combo_key = _exact_combo_key(combo)
+    reduced: list[dict] = []
+    seen_gid: set[int] = set()
+    for condition in (pool_items[i] for i in combo_key):
+        family = str(parse_feature_meta(str(condition["col"])).get("family", ""))
+        if family in {"dist_support", "dist_resist"}:
+            gid = int(same_ref.get(str(condition["col"]), 0))
+            if gid > 0 and gid in seen_gid:
+                if on_removed is not None:
+                    on_removed()
+                continue
+            if gid > 0:
+                seen_gid.add(gid)
+        reduced.append(condition)
+    result = evaluate_reduced(reduced)
+    if result is not None:
+        result["_combo"] = combo_key
+    return result
+
+
+def _make_start_nodes(rows: Iterable[dict], first_id: int = 0) -> tuple[list[dict], int]:
+    nodes: list[dict] = []
+    next_id = int(first_id)
+    for row in rows:
+        node_id = next_id
+        next_id += 1
+        nodes.append({
+            "parent_id": node_id,
+            "combo": _exact_combo_key(row.get("_combo", ())),
+            "root_ids": (node_id,),
+            "train_rank": _train_rank_values(row),
+        })
+    return nodes, next_id
+
+
+def _map_c_start_nodes(seed_rules: Iterable[dict], pool_c: list[dict], beam_width: int, max_conds: int) -> tuple[list[dict], bool, int]:
+    width = max(1, int(beam_width))
+    cond_to_idx = {(str(c["col"]), str(c["op"]), float(c["value"])): i for i, c in enumerate(pool_c)}
+    mapped: list[tuple[tuple[int, ...], dict]] = []
+    for seed in _ab_parent_seed_snapshot(seed_rules, width):
+        indices: list[int] = []
+        for condition in seed.get("conds", []):
+            idx = cond_to_idx.get((str(condition["col"]), str(condition["op"]), float(condition["value"])))
+            if idx is None:
+                indices = []
+                break
+            indices.append(int(idx))
+        if indices:
+            combo = tuple(sorted(set(indices)))
+            mapped.append((combo, seed))
+    used_single_fallback = not mapped
+    if used_single_fallback:
+        mapped = [((i,), pool_c[i]) for i in range(min(width, len(pool_c)))]
+    mapped = [(combo, row) for combo, row in mapped if 1 <= len(combo) <= int(max_conds)]
+    nodes: list[dict] = []
+    for node_id, (combo, row) in enumerate(mapped):
+        nodes.append({
+            "parent_id": int(node_id),
+            "combo": combo,
+            "root_ids": (int(node_id),),
+            "train_rank": _train_rank_values(row, single=used_single_fallback),
+        })
+    return nodes, used_single_fallback, len(nodes)
+
+
+def _advance_beam_nodes(beam_rules: Iterable[dict], provenance: dict, first_id: int) -> tuple[list[dict], int]:
+    nodes: list[dict] = []
+    next_id = int(first_id)
+    for row in beam_rules:
+        combo = _exact_combo_key(row.get("_combo", ()))
+        roots = tuple(sorted(int(x) for x in provenance.get(combo, {}).get("root_ids", ())))
+        nodes.append({
+            "parent_id": next_id,
+            "combo": combo,
+            "root_ids": roots,
+            "train_rank": _train_rank_values(row),
+        })
+        next_id += 1
+    return nodes, next_id
+
+
+def _c_mask_duplicate_diagnostics(rows: Iterable[dict], max_depth: int, beam_width: int) -> dict[str, int]:
+    _archive, expandable = _partition_level_roles(rows, 0.0, max_depth)
+    unique_masks = {str(row.get("_mask_hash", "")) for row in expandable}
+    hypothetical: list[dict] = []
+    seen_masks: set[str] = set()
+    if int(beam_width) > 0:
+        for row in sorted(expandable, key=_train_search_sort_key):
+            mask_hash = str(row.get("_mask_hash", ""))
+            if mask_hash in seen_masks:
+                continue
+            seen_masks.add(mask_hash)
+            hypothetical.append(row)
+            if len(hypothetical) >= int(beam_width):
+                break
+    return {
+        "c_valid_results_before_mask_dedupe": len(expandable),
+        "c_unique_masks": len(unique_masks),
+        "c_mask_duplicate_results": len(expandable) - len(unique_masks),
+        "c_hypothetical_beam_unique_masks": len({str(row.get("_mask_hash", "")) for row in hypothetical}),
+    }
+
+
+def _new_score_stage_stats() -> dict[str, float | int]:
+    return {
+        "evaluate_calls": 0,
+        "mask_build_calls": 0,
+        "mask_build_sec": 0.0,
+        "raw_precheck_calls": 0,
+        "raw_precheck_sec": 0.0,
+        "raw_precheck_rejects": 0,
+        "raw_entries_total": 0,
+        "clm_calls": 0,
+        "clm_sec": 0.0,
+        "clm_entries_total": 0,
+        "post_clm_minpos_rejects": 0,
+        "remaining_score_calls": 0,
+        "remaining_score_sec": 0.0,
+    }
+
+
+def _record_score_evaluate(stage_stats: dict | None) -> None:
+    if stage_stats is not None:
+        stage_stats["evaluate_calls"] += 1
+
+
+def _score_stage_summary(stats: dict, level_wall_sec: float) -> dict:
+    out = dict(stats)
+    out["avg_raw_entries"] = float(stats["raw_entries_total"]) / max(1, int(stats["raw_precheck_calls"]))
+    out["avg_clm_entries"] = float(stats["clm_entries_total"]) / max(1, int(stats["clm_calls"]))
+    out["level_wall_sec"] = float(level_wall_sec)
+    return out
+
+
+def _format_score_stage_line(phase: str, level: int, stage: str, stats: dict, level_wall_sec: float) -> str:
+    summary = _score_stage_summary(stats, level_wall_sec)
+    return (
+        f"[prefilter-score-stage] phase={phase} level={int(level)} stage={stage} "
+        f"evaluate_calls={int(summary['evaluate_calls'])} "
+        f"mask_build_calls={int(summary['mask_build_calls'])} mask_build_sec={float(summary['mask_build_sec']):.6f} "
+        f"raw_precheck_calls={int(summary['raw_precheck_calls'])} raw_precheck_sec={float(summary['raw_precheck_sec']):.6f} "
+        f"raw_precheck_rejects={int(summary['raw_precheck_rejects'])} avg_raw_entries={float(summary['avg_raw_entries']):.6f} "
+        f"clm_calls={int(summary['clm_calls'])} clm_sec={float(summary['clm_sec']):.6f} "
+        f"avg_clm_entries={float(summary['avg_clm_entries']):.6f} "
+        f"post_clm_minpos_rejects={int(summary['post_clm_minpos_rejects'])} "
+        f"remaining_score_calls={int(summary['remaining_score_calls'])} "
+        f"remaining_score_sec={float(summary['remaining_score_sec']):.6f} "
+        f"level_wall_sec={float(summary['level_wall_sec']):.6f}"
+    )
+
+
+def _run_score_stages(
+    raw_precheck,
+    weeks: float,
+    min_pos_per_week: float,
+    enforce_filters: bool,
+    select_entries,
+    count_selected_hits,
+    finish_score,
+    stage_stats: dict | None = None,
+):
+    raw_t0 = time.perf_counter() if stage_stats is not None else None
+    raw_pos_hits, raw_entries = raw_precheck()
+    raw_allowed = _min_pos_allows(raw_pos_hits, weeks, min_pos_per_week, enforce_filters)
+    if stage_stats is not None:
+        stage_stats["raw_precheck_calls"] += 1
+        stage_stats["raw_entries_total"] += int(raw_entries)
+        stage_stats["raw_precheck_sec"] += time.perf_counter() - raw_t0
+        if not raw_allowed:
+            stage_stats["raw_precheck_rejects"] += 1
+    if not raw_allowed:
+        return None, "raw_min_pos"
+
+    clm_t0 = time.perf_counter() if stage_stats is not None else None
+    selected_mask, raw_evaluable, clusters_count = select_entries()
+    if stage_stats is not None:
+        stage_stats["clm_calls"] += 1
+        stage_stats["clm_entries_total"] += int(raw_evaluable)
+        stage_stats["clm_sec"] += time.perf_counter() - clm_t0
+
+    remaining_t0 = time.perf_counter() if stage_stats is not None else None
+    pos_hits, neg_hits = count_selected_hits(selected_mask)
+    post_allowed = _min_pos_allows(pos_hits, weeks, min_pos_per_week, enforce_filters)
+    if stage_stats is not None:
+        stage_stats["remaining_score_calls"] += 1
+    if not post_allowed:
+        if stage_stats is not None:
+            stage_stats["post_clm_minpos_rejects"] += 1
+            stage_stats["remaining_score_sec"] += time.perf_counter() - remaining_t0
+        return None, "post_clm_min_pos"
+    score = finish_score(selected_mask, raw_evaluable, clusters_count, int(pos_hits), int(neg_hits))
+    if stage_stats is not None:
+        stage_stats["remaining_score_sec"] += time.perf_counter() - remaining_t0
+    return score, None
+
+
+def _run_mask_build(build_mask, stage_stats: dict | None = None):
+    mask_t0 = time.perf_counter() if stage_stats is not None else None
+    mask = build_mask()
+    if stage_stats is not None:
+        stage_stats["mask_build_calls"] += 1
+        stage_stats["mask_build_sec"] += time.perf_counter() - mask_t0
+    return mask
+
+
+def _dedupe_mask_rows(rows: Iterable[dict], on_duplicate=None) -> list[dict]:
+    buckets: dict[tuple[int, int, int, int], dict[str, dict]] = {}
+    for row in rows:
+        key = (
+            int(row["pos_hits"]),
+            int(row["neg_hits"]),
+            int(row["test_pos_hits"]),
+            int(row["test_neg_hits"]),
+        )
+        buckets.setdefault(key, {})
+        mask_hash = str(row.get("_mask_hash", ""))
+        current = buckets[key].get(mask_hash)
+        if current is None:
+            buckets[key][mask_hash] = row
+            continue
+        if on_duplicate is not None:
+            on_duplicate()
+        if len(row.get("conds", [])) < len(current.get("conds", [])):
+            buckets[key][mask_hash] = row
+        elif len(row.get("conds", [])) == len(current.get("conds", [])):
+            row_test_key = (float(row["test_ratio"]), int(row["test_pos_hits"]), -int(row["test_neg_hits"]))
+            current_test_key = (
+                float(current["test_ratio"]),
+                int(current["test_pos_hits"]),
+                -int(current["test_neg_hits"]),
+            )
+            row_train_key = _train_rank_values(row)
+            current_train_key = _train_rank_values(current)
+            if row_test_key > current_test_key or (row_test_key == current_test_key and row_train_key > current_train_key):
+                buckets[key][mask_hash] = row
+    out: list[dict] = []
+    for masks in buckets.values():
+        out.extend(masks.values())
+    return out
 
 
 def _chunk_list(xs: list, n: int) -> list[list]:
@@ -323,8 +657,10 @@ def _parent_score_allows(score: dict, parent: dict | None) -> bool:
     return score_key > parent_key
 
 
-def _evaluate_without_immediate_parent(evaluate_combo, combo, pool_items, source: str):
-    return evaluate_combo(combo, pool_items, None, source=source)
+def _evaluate_without_immediate_parent(evaluate_combo, combo, pool_items, source: str, stage_stats: dict | None = None):
+    if stage_stats is None:
+        return evaluate_combo(combo, pool_items, None, source=source)
+    return evaluate_combo(combo, pool_items, None, source=source, stage_stats=stage_stats)
 
 
 def _partition_level_roles(rows: Iterable[dict], min_main_score: float, max_depth: int) -> tuple[list[dict], list[dict]]:
@@ -360,23 +696,8 @@ def _phase_b_has_parent_survivors(survivor_pool: Iterable[dict]) -> bool:
 
 
 def _map_c_start_beam(seed_rules: Iterable[dict], pool_c: list[dict], beam_width: int, max_conds: int) -> tuple[list[tuple[int, ...]], bool]:
-    width = max(1, int(beam_width))
-    cond_to_idx = {(str(c["col"]), str(c["op"]), float(c["value"])): i for i, c in enumerate(pool_c)}
-    mapped_beam: list[tuple[int, ...]] = []
-    for seed in _ab_parent_seed_snapshot(seed_rules, width):
-        mapped: list[int] = []
-        for condition in seed.get("conds", []):
-            idx = cond_to_idx.get((str(condition["col"]), str(condition["op"]), float(condition["value"])))
-            if idx is None:
-                mapped = []
-                break
-            mapped.append(int(idx))
-        if mapped:
-            mapped_beam.append(tuple(sorted(set(mapped))))
-    used_single_fallback = not mapped_beam
-    if used_single_fallback:
-        mapped_beam = [(i,) for i in range(min(width, len(pool_c)))]
-    return [beam for beam in mapped_beam if 1 <= len(beam) <= int(max_conds)], used_single_fallback
+    nodes, used_single_fallback, _next_id = _map_c_start_nodes(seed_rules, pool_c, beam_width, max_conds)
+    return [tuple(node["combo"]) for node in nodes], used_single_fallback
 
 
 def _d_archive_sort_key(row: dict) -> tuple[float, int, int, int]:
@@ -425,25 +746,16 @@ def _dispatch_phase_d_start(
     return 2
 
 
-def _run_global_d_stage(idxs: Iterable[int], depth: int, batch_size: int, generation_cap: int, evaluate) -> tuple[list[dict], int, int, bool]:
-    generated_extensions = 0
-    evaluated_combos = 0
-    truncated = False
-    out: list[dict] = []
-    for chunk in _batched(itertools.combinations(list(idxs), int(depth)), max(64, int(batch_size))):
-        cap = int(generation_cap)
-        if cap > 0 and generated_extensions + len(chunk) >= cap:
-            chunk = chunk[: max(0, cap - generated_extensions)]
-            truncated = True
-        generated_extensions += len(chunk)
-        for combo in chunk:
-            evaluated_combos += 1
-            result = evaluate(tuple(sorted(combo)))
-            if result is not None:
-                out.append(result)
-        if truncated:
-            break
-    return out, generated_extensions, evaluated_combos, truncated
+def _run_global_d_stage(
+    idxs: Iterable[int],
+    depth: int,
+    batch_size: int,
+    generation_cap: int,
+    evaluate,
+    state_out: dict | None = None,
+) -> tuple[list[dict], int, int, bool]:
+    raw_items = ((tuple(combo), None) for combo in itertools.combinations(list(idxs), int(depth)))
+    return _run_exact_combo_stage(raw_items, batch_size, generation_cap, evaluate, state_out=state_out)
 
 
 def _better_train_score(candidate: dict | None, current: dict | None) -> bool:
@@ -3841,12 +4153,19 @@ def main() -> None:
                 return np.zeros(n, dtype=bool)
         return mask
 
-    def _score_from_mask(mask: np.ndarray, only_lower_entry: bool | None = None, enforce_filters: bool = True) -> dict | None:
+    def _score_from_mask(
+        mask: np.ndarray,
+        only_lower_entry: bool | None = None,
+        enforce_filters: bool = True,
+        stage_stats: dict | None = None,
+    ) -> dict | None:
         days = max(1.0, float((df.index[train_idx - 1] - df.index[0]).total_seconds() / 86400.0))
         weeks = days / 7.0
-        raw = np.asarray(mask, dtype=bool)
-        raw_train = raw[:train_idx] & score_tradable_train
-        raw_pos_hits = int(np.sum(raw_train & (score_y_train == 1)))
+
+        def _raw_precheck():
+            raw = np.asarray(mask, dtype=bool)
+            raw_train = raw[:train_idx] & score_tradable_train
+            return int(np.sum(raw_train & (score_y_train == 1))), int(np.sum(raw_train))
 
         def _select_for_score():
             return _select_entries_for_mask(mask, score_y, score_t_exit, only_lower_entry=only_lower_entry)
@@ -3879,14 +4198,15 @@ def main() -> None:
                 "clusters_count": int(clusters_count),
             }
 
-        score, gate_reject = _run_scoring_gate_pipeline(
-            raw_pos_hits,
+        score, gate_reject = _run_score_stages(
+            _raw_precheck,
             weeks,
             float(args.min_pos_per_week),
             enforce_filters,
             _select_for_score,
             _count_selected_hits,
             _finish_score,
+            stage_stats,
         )
         if score is None:
             if bool(args.debug_reject_stats):
@@ -3898,34 +4218,23 @@ def main() -> None:
     def _train_key(r: dict) -> tuple[float, int, int]:
         return (float(r["ratio"]), int(r["pos_hits"]), -int(r["neg_hits"]))
 
-    def _test_key(r: dict) -> tuple[float, int, int]:
-        return (float(r["test_ratio"]), int(r["test_pos_hits"]), -int(r["test_neg_hits"]))
-
     def _mask_hash(mask: np.ndarray) -> str:
         return _mask_hash_arr(mask)
 
-    def evaluate_combo(combo: Tuple[int, ...], pool_items: List[dict], parent: dict | None = None, source: str = "A") -> dict | None:
-        conds = [pool_items[i] for i in combo]
-        dedup = []
-        seen_gid = set()
-        for c in conds:
-            fam = str(miner._parse_feature_meta(str(c["col"])).get("family", ""))
-            if fam in {"dist_support", "dist_resist"}:
-                gid = int(same_ref.get(str(c["col"]), 0))
-                if gid > 0 and gid in seen_gid:
-                    if bool(args.debug_reject_stats):
-                        reject_stats["rejected_same_reference"] += 1
-                    continue
-                if gid > 0:
-                    seen_gid.add(gid)
-            dedup.append(c)
-        conds = dedup
-
+    def evaluate_combo(
+        combo: Tuple[int, ...],
+        pool_items: List[dict],
+        parent: dict | None = None,
+        source: str = "A",
+        stage_stats: dict | None = None,
+    ) -> dict | None:
+        _record_score_evaluate(stage_stats)
         def _evaluate_structurally_valid(valid_conds: list[dict]) -> dict | None:
-            mask = _build_mask_from_conds(
-                [{"col": c["col"], "op": c["op"], "value": c["value"], "domain": "auto"} for c in valid_conds]
+            mask = _run_mask_build(
+                lambda: _build_mask_from_conds([{"col": c["col"], "op": c["op"], "value": c["value"], "domain": "auto"} for c in valid_conds]),
+                stage_stats,
             )
-            sc = _score_from_mask(mask)
+            sc = _score_from_mask(mask, stage_stats=stage_stats)
             if sc is None:
                 return None
             mh = _mask_hash(mask)
@@ -3940,27 +4249,40 @@ def main() -> None:
                     return None
             return {
                 "conds": [{"col": str(c["col"]), "op": str(c["op"]), "value": float(c["value"]), "domain": "auto"} for c in valid_conds],
-                "_combo": tuple(sorted(int(x) for x in combo)),
                 "_mask_hash": mh,
                 "search_source": str(source),
                 **sc,
             }
 
-        result, structure_reject = _run_structure_gate(
-            conds,
-            int(args.binary_cap_per_block),
-            lambda triplets: miner.validate_binary_anchor_invariant(triplets, cols),
-            _evaluate_structurally_valid,
+        def _evaluate_reduced(conds: list[dict]):
+            result, structure_reject = _run_structure_gate(
+                conds,
+                int(args.binary_cap_per_block),
+                lambda triplets: miner.validate_binary_anchor_invariant(triplets, cols),
+                _evaluate_structurally_valid,
+            )
+            if structure_reject == "binary_cap":
+                if bool(args.debug_reject_stats):
+                    reject_stats["rejected_binary_cap"] += 1
+                return None
+            if structure_reject == "bundle_anchor":
+                if bool(args.debug_reject_stats):
+                    reject_stats["rejected_bundle_anchor"] += 1
+                return None
+            return result
+
+        def _record_same_reference_removal():
+            if bool(args.debug_reject_stats):
+                reject_stats["rejected_same_reference"] += 1
+
+        return _evaluate_with_same_reference(
+            combo,
+            pool_items,
+            same_ref,
+            miner._parse_feature_meta,
+            _evaluate_reduced,
+            _record_same_reference_removal,
         )
-        if structure_reject == "binary_cap":
-            if bool(args.debug_reject_stats):
-                reject_stats["rejected_binary_cap"] += 1
-            return None
-        if structure_reject == "bundle_anchor":
-            if bool(args.debug_reject_stats):
-                reject_stats["rejected_bundle_anchor"] += 1
-            return None
-        return result
 
     csv_columns = [
         "path_index", "rule_human", "rule_json_id", "decode_type_info", "decode_bin_info", "pos_hits", "neg_hits",
@@ -4122,26 +4444,11 @@ def main() -> None:
                 raise ValueError(f"rule_human parentheses mismatch at row {i}: {txt!r}")
 
     def _dedupe_mask(rows: list[dict]) -> list[dict]:
-        buckets: dict[tuple[int, int, int, int], dict[str, dict]] = {}
-        for r in rows:
-            key = (int(r["pos_hits"]), int(r["neg_hits"]), int(r["test_pos_hits"]), int(r["test_neg_hits"]))
-            buckets.setdefault(key, {})
-            mh = str(r.get("_mask_hash", ""))
-            cur = buckets[key].get(mh)
-            if cur is None:
-                buckets[key][mh] = r
-                continue
+        def _record_duplicate_mask():
             if bool(args.debug_reject_stats):
                 reject_stats["rejected_duplicate_mask"] += 1
-            if len(r.get("conds", [])) < len(cur.get("conds", [])):
-                buckets[key][mh] = r
-            elif len(r.get("conds", [])) == len(cur.get("conds", [])):
-                if _test_key(r) > _test_key(cur) or (_test_key(r) == _test_key(cur) and _train_key(r) > _train_key(cur)):
-                    buckets[key][mh] = r
-        out: list[dict] = []
-        for m in buckets.values():
-            out.extend(m.values())
-        return out
+
+        return _dedupe_mask_rows(rows, _record_duplicate_mask)
 
     def _save_progress(valid_pool: list[dict], state: dict) -> None:
         non_d_rows = [r for r in valid_pool if str(r.get("search_source", "")) != "D"]
@@ -4585,6 +4892,30 @@ def main() -> None:
         if phase_b_skip_reason == "not_reached":
             phase_b_skip_reason = "phase_a_or_direct_to_c"
 
+    exact_phase_totals = {
+        "C": {"raw": 0, "unique": 0, "duplicates": 0, "evaluated": 0},
+        "D": {"raw": 0, "unique": 0, "duplicates": 0, "evaluated": 0},
+    }
+
+    def _record_exact_stage(phase: str, level: int, stage: str, state: dict) -> None:
+        totals = exact_phase_totals[str(phase)]
+        for key in ("raw", "unique", "duplicates", "evaluated"):
+            totals[key] += int(state.get(key, 0))
+        if bool(args.debug_exact_combo_stats):
+            print(
+                f"[prefilter-exact-combo] phase={phase} level={int(level)} stage={stage} "
+                f"raw={int(state.get('raw', 0))} unique={int(state.get('unique', 0))} "
+                f"duplicates={int(state.get('duplicates', 0))} evaluated={int(state.get('evaluated', 0))}"
+            )
+
+    def _print_exact_total(phase: str) -> None:
+        if bool(args.debug_exact_combo_stats):
+            totals = exact_phase_totals[str(phase)]
+            print(
+                f"[prefilter-exact-combo-total] phase={phase} raw={totals['raw']} unique={totals['unique']} "
+                f"duplicates={totals['duplicates']} evaluated={totals['evaluated']}"
+            )
+
     # Phase C: family-top-pool beam search
     phase_c_t0 = time.perf_counter()
     pool_c = _build_unlocked_pool(
@@ -4601,53 +4932,63 @@ def main() -> None:
         print("[prefilter-phase-c] skipped: empty family-top pool")
     else:
         idxs_c = list(range(len(pool_c)))
-        beam, _used_c_single_fallback = _map_c_start_beam(
+        beam_nodes, _used_c_single_fallback, next_c_parent_id = _map_c_start_nodes(
             ab_survivor_pool,
             pool_c,
             int(args.phase_c_beam_width),
             int(args.phase_c_max_conds),
         )
-        print(f"[prefilter-phase-c] start beam={len(beam)} pool={len(pool_c)}")
+        print(f"[prefilter-phase-c] start beam={len(beam_nodes)} pool={len(pool_c)}")
         phase_c_was_active = True
         phase_c_level = 0
         force_phase_d_after_c = False
-        while beam:
+        while beam_nodes:
             phase_c_level += 1
             level_t0 = time.perf_counter()
-            seeds_at_level_start = len(beam)
-            generated_extensions = 0
-            evaluated_combos = 0
-            truncated = False
-            out_c: list[dict] = []
+            seeds_at_level_start = len(beam_nodes)
+            parent_nodes = {int(node["parent_id"]): node for node in beam_nodes}
             def _iter_cands_c():
-                for base in beam:
+                for node in beam_nodes:
+                    base = tuple(node["combo"])
                     cset = set(base)
                     add_cands = [x for x in idxs_c if x not in cset]
                     for add_k in range(max(1, int(args.phase_c_add_min)), max(1, int(args.phase_c_add_max)) + 1):
                         if len(base) + add_k > int(args.phase_c_max_conds) or len(base) + add_k > int(args.max_path_conds):
                             continue
                         for adds in itertools.combinations(add_cands, add_k):
-                            yield tuple(sorted(cset | set(adds)))
-            had_any = False
-            for chunk in _batched(_iter_cands_c(), max(64, int(args.batch_size))):
-                had_any = True
-                cap = int(args.phase_c_max_generated_per_level)
-                if cap > 0 and generated_extensions + len(chunk) >= cap:
-                    chunk = chunk[: max(0, cap - generated_extensions)]
-                    truncated = True
-                generated_extensions += len(chunk)
-                for cb in chunk:
-                    evaluated_combos += 1
-                    rr = _evaluate_without_immediate_parent(evaluate_combo, cb, pool_c, "C")
-                    if rr is not None:
-                        out_c.append(rr)
-                if truncated:
-                    break
-            if not had_any:
-                print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated=0 evaluated=0 truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules=0 new_valid=0 beam_candidates=0 beam_kept=0 beam_kept_final_valid=0 beam_kept_search_only=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                            yield tuple(sorted(cset | set(adds))), int(node["parent_id"])
+            c_exact_state: dict = {}
+            c_stage_stats = _new_score_stage_stats() if bool(args.debug_score_stage_timing) else None
+            def _evaluate_c_exact(cb):
+                if c_stage_stats is None:
+                    return _evaluate_without_immediate_parent(evaluate_combo, cb, pool_c, "C")
+                return _evaluate_without_immediate_parent(evaluate_combo, cb, pool_c, "C", c_stage_stats)
+            out_c, generated_extensions, evaluated_combos, truncated = _run_exact_combo_stage(
+                _iter_cands_c(),
+                int(args.batch_size),
+                int(args.phase_c_max_generated_per_level),
+                _evaluate_c_exact,
+                parent_nodes,
+                c_exact_state,
+            )
+            _record_exact_stage("C", phase_c_level, "extension", c_exact_state)
+            level_elapsed = time.perf_counter() - level_t0
+            if bool(args.debug_exact_combo_stats):
+                c_mask_diag = _c_mask_duplicate_diagnostics(
+                    out_c,
+                    min(int(args.phase_c_max_conds), int(args.max_path_conds)),
+                    int(args.phase_c_beam_width),
+                )
+                print("[prefilter-c-mask-diagnostic] " + " ".join(f"{key}={value}" for key, value in c_mask_diag.items()))
+            if generated_extensions == 0:
+                if c_stage_stats is not None:
+                    print(_format_score_stage_line("C", phase_c_level, "extension", c_stage_stats, level_elapsed))
+                print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated=0 evaluated=0 truncated={truncated} rejected_duplicates={int(c_exact_state.get('duplicates', 0))} rejected_invalid_rules=0 new_valid=0 beam_candidates=0 beam_kept=0 beam_kept_final_valid=0 beam_kept_search_only=0 valid_pool={len(valid_pool)} elapsed={level_elapsed:.2f}s")
                 break
             if not out_c:
-                print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_c))} new_valid=0 beam_candidates=0 beam_kept=0 beam_kept_final_valid=0 beam_kept_search_only=0 valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                if c_stage_stats is not None:
+                    print(_format_score_stage_line("C", phase_c_level, "extension", c_stage_stats, level_elapsed))
+                print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates={int(c_exact_state.get('duplicates', 0))} rejected_invalid_rules={max(0, evaluated_combos - len(out_c))} new_valid=0 beam_candidates=0 beam_kept=0 beam_kept_final_valid=0 beam_kept_search_only=0 valid_pool={len(valid_pool)} elapsed={level_elapsed:.2f}s")
                 break
             valid_before = len(valid_pool)
             final_valid_c, beam_rules, c_diag = _select_level_results(
@@ -4660,11 +5001,18 @@ def main() -> None:
             valid_pool = _dedupe_mask(valid_pool)
             valid_pool = sorted(valid_pool, key=_train_search_sort_key)[: int(args.max_valids)]
             _save_progress(valid_pool, progress_state)
-            beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
+            beam_nodes, next_c_parent_id = _advance_beam_nodes(
+                beam_rules,
+                c_exact_state.get("provenance", {}),
+                next_c_parent_id,
+            )
             beam_kept_final_valid = c_diag["beam_kept_final_valid"]
             beam_kept_search_only = c_diag["beam_kept_search_only"]
             best_ratio = float(valid_pool[0]["ratio"]) if valid_pool else float("nan")
-            print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_c))} new_valid={max(0, len(valid_pool) - valid_before)} beam_candidates={len(out_c)} beam_kept={len(beam)} beam_kept_final_valid={beam_kept_final_valid} beam_kept_search_only={beam_kept_search_only} valid_pool={len(valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
+            level_elapsed = time.perf_counter() - level_t0
+            if c_stage_stats is not None:
+                print(_format_score_stage_line("C", phase_c_level, "extension", c_stage_stats, level_elapsed))
+            print(f"[prefilter-phase-c] level={phase_c_level} depth_range=add{int(args.phase_c_add_min)}..add{int(args.phase_c_add_max)} seeds={seeds_at_level_start} pool={len(pool_c)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates={int(c_exact_state.get('duplicates', 0))} rejected_invalid_rules={max(0, evaluated_combos - len(out_c))} new_valid={max(0, len(valid_pool) - valid_before)} beam_candidates={len(out_c)} beam_kept={len(beam_nodes)} beam_kept_final_valid={beam_kept_final_valid} beam_kept_search_only={beam_kept_search_only} valid_pool={len(valid_pool)} elapsed={level_elapsed:.2f}s best_ratio={best_ratio:.6g}")
             cmd = _read_control_command(args.control_file)
             if cmd == "export_now":
                 print("[prefilter-control] export_now (phase C)"); _save_progress(valid_pool, progress_state); _write_control_none(args.control_file)
@@ -4679,6 +5027,7 @@ def main() -> None:
             elif cmd == "enable_early_stop":
                 print("[prefilter-control] enable_early_stop"); args.early_stop_window_combos = int(original_early_stop_window_combos); _write_control_none(args.control_file)
         print("[prefilter-phase-c] done")
+        _print_exact_total("C")
     timing_detail2["phase_c_total_sec"] += time.perf_counter() - phase_c_t0
 
     # Phase D: full tick beam search
@@ -4698,7 +5047,8 @@ def main() -> None:
             tick_pool = sorted(tick_pool, key=lambda z: (-float(z.get("tick_single_ratio", -np.inf)), -int(z.get("tick_single_pos_hits", z.get("_single_pos_hits", 0)))))
             idxs_d = list(range(len(tick_pool)))
             raw_start_depth = int(args.phase_d_start_conds)
-            d_beam: list[tuple[int, ...]] = []
+            d_beam_nodes: list[dict] = []
+            next_d_parent_id = 0
             phase_d_level = 0
 
             def _phase_d_control() -> bool:
@@ -4722,20 +5072,30 @@ def main() -> None:
                 rows = _dedupe_mask(rows)
                 return sorted(rows, key=_d_archive_sort_key)[: int(args.max_valids)]
 
-            def _evaluate_d_start_stage(depth: int) -> tuple[list[dict], int, int, bool, float]:
+            def _evaluate_d_start_stage(depth: int):
                 level_t0 = time.perf_counter()
+                exact_state: dict = {}
+                stage_stats = _new_score_stage_stats() if bool(args.debug_score_stage_timing) else None
+                evaluate_d = (
+                    (lambda cb: _evaluate_without_immediate_parent(evaluate_combo, cb, tick_pool, "D"))
+                    if stage_stats is None
+                    else (lambda cb: _evaluate_without_immediate_parent(evaluate_combo, cb, tick_pool, "D", stage_stats))
+                )
                 out_d, generated_extensions, evaluated_combos, truncated = _run_global_d_stage(
                     idxs_d,
                     depth,
                     int(args.batch_size),
                     int(args.phase_d_max_generated_per_level),
-                    lambda cb: _evaluate_without_immediate_parent(evaluate_combo, cb, tick_pool, "D"),
+                    evaluate_d,
+                    exact_state,
                 )
-                return out_d, generated_extensions, evaluated_combos, truncated, time.perf_counter() - level_t0
+                return out_d, generated_extensions, evaluated_combos, truncated, time.perf_counter() - level_t0, exact_state, stage_stats
 
-            def _consume_d_start_stage(depth: int, stage_tag: str, stage_result: tuple[list[dict], int, int, bool, float]) -> bool:
-                nonlocal d_valid_pool, d_beam
-                out_d, generated_extensions, evaluated_combos, truncated, elapsed = stage_result
+            def _consume_d_start_stage(depth: int, stage_tag: str, stage_result) -> bool:
+                nonlocal d_valid_pool, d_beam_nodes, next_d_parent_id
+                out_d, generated_extensions, evaluated_combos, truncated, elapsed, exact_state, stage_stats = stage_result
+                consume_t0 = time.perf_counter() if stage_stats is not None else None
+                _record_exact_stage("D", 0, stage_tag, exact_state)
                 before = len(d_valid_pool)
                 final_valid_d, beam_rules, d_diag = _select_level_results(
                     out_d,
@@ -4746,11 +5106,13 @@ def main() -> None:
                 )
                 d_valid_pool = _keep_d_pool(d_valid_pool + final_valid_d)
                 _save_progress(valid_pool + d_valid_pool, progress_state)
-                d_beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
+                d_beam_nodes, next_d_parent_id = _make_start_nodes(beam_rules, next_d_parent_id)
                 beam_kept_final_valid = d_diag["beam_kept_final_valid"]
                 beam_kept_search_only = d_diag["beam_kept_search_only"]
                 best_ratio = float(d_valid_pool[0]["ratio"]) if d_valid_pool else float("nan")
-                print(f"[prefilter-phase-d] level=0 depth={depth} stage={stage_tag} seeds=all pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_candidates={len(out_d)} beam_kept={len(d_beam)} beam_kept_final_valid={beam_kept_final_valid} beam_kept_search_only={beam_kept_search_only} d_valid_pool={len(d_valid_pool)} elapsed={elapsed:.2f}s best_ratio={best_ratio:.6g}")
+                if stage_stats is not None:
+                    print(_format_score_stage_line("D", 0, stage_tag, stage_stats, elapsed + (time.perf_counter() - consume_t0)))
+                print(f"[prefilter-phase-d] level=0 depth={depth} stage={stage_tag} seeds=all pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates={int(exact_state.get('duplicates', 0))} rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_candidates={len(out_d)} beam_kept={len(d_beam_nodes)} beam_kept_final_valid={beam_kept_final_valid} beam_kept_search_only={beam_kept_search_only} d_valid_pool={len(d_valid_pool)} elapsed={elapsed:.2f}s best_ratio={best_ratio:.6g}")
                 return bool(out_d)
 
             _dispatch_phase_d_start(
@@ -4763,18 +5125,15 @@ def main() -> None:
                 lambda message: print(f"[prefilter-phase-d] {message}"),
             )
             if _phase_d_control():
-                d_beam = []
+                d_beam_nodes = []
 
-            while d_beam and not stop_after_batch_requested:
+            while d_beam_nodes and not stop_after_batch_requested:
                 phase_d_level += 1
                 level_t0 = time.perf_counter()
-                seeds_at_level_start = len(d_beam)
-                generated_extensions = 0
-                evaluated_combos = 0
-                truncated = False
-                out_d = []
-                current_min_base_len = min((len(b) for b in d_beam), default=0)
-                current_max_base_len = max((len(b) for b in d_beam), default=0)
+                seeds_at_level_start = len(d_beam_nodes)
+                parent_nodes = {int(node["parent_id"]): node for node in d_beam_nodes}
+                current_min_base_len = min((len(node["combo"]) for node in d_beam_nodes), default=0)
+                current_max_base_len = max((len(node["combo"]) for node in d_beam_nodes), default=0)
                 min_depth = current_min_base_len + max(1, int(args.phase_d_add_min))
                 hard_max_depth = min(int(args.phase_d_max_conds), int(args.max_path_conds))
                 max_depth = min(current_max_base_len + max(1, int(args.phase_d_add_max)), hard_max_depth)
@@ -4783,33 +5142,37 @@ def main() -> None:
                     break
 
                 def _iter_cands_d():
-                    for base in d_beam:
+                    for node in d_beam_nodes:
+                        base = tuple(node["combo"])
                         cset = set(base)
                         add_cands = [x for x in idxs_d if x not in cset]
                         for add_k in range(max(1, int(args.phase_d_add_min)), max(1, int(args.phase_d_add_max)) + 1):
                             if len(base) + add_k > int(args.phase_d_max_conds) or len(base) + add_k > int(args.max_path_conds):
                                 continue
                             for adds in itertools.combinations(add_cands, add_k):
-                                yield tuple(sorted(cset | set(adds)))
+                                yield tuple(sorted(cset | set(adds))), int(node["parent_id"])
 
-                had_any = False
-                for chunk in _batched(_iter_cands_d(), max(64, int(args.batch_size))):
-                    had_any = True
-                    cap = int(args.phase_d_max_generated_per_level)
-                    if cap > 0 and generated_extensions + len(chunk) >= cap:
-                        chunk = chunk[: max(0, cap - generated_extensions)]
-                        truncated = True
-                    generated_extensions += len(chunk)
-                    for cb in chunk:
-                        evaluated_combos += 1
-                        rr = _evaluate_without_immediate_parent(evaluate_combo, cb, tick_pool, "D")
-                        if rr is not None:
-                            out_d.append(rr)
-                    if truncated:
-                        break
+                d_exact_state: dict = {}
+                d_stage_stats = _new_score_stage_stats() if bool(args.debug_score_stage_timing) else None
+                def _evaluate_d_exact(cb):
+                    if d_stage_stats is None:
+                        return _evaluate_without_immediate_parent(evaluate_combo, cb, tick_pool, "D")
+                    return _evaluate_without_immediate_parent(evaluate_combo, cb, tick_pool, "D", d_stage_stats)
+                out_d, generated_extensions, evaluated_combos, truncated = _run_exact_combo_stage(
+                    _iter_cands_d(),
+                    int(args.batch_size),
+                    int(args.phase_d_max_generated_per_level),
+                    _evaluate_d_exact,
+                    parent_nodes,
+                    d_exact_state,
+                )
+                _record_exact_stage("D", phase_d_level, "extension", d_exact_state)
+                level_elapsed = time.perf_counter() - level_t0
                 depth_txt = f"depth={min_depth}" if min_depth == max_depth else f"depth_range={min_depth}..{max_depth}"
-                if (not had_any) or (not out_d):
-                    print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos)} new_valid=0 beam_candidates=0 beam_kept=0 beam_kept_final_valid=0 beam_kept_search_only=0 d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s")
+                if generated_extensions == 0 or not out_d:
+                    if d_stage_stats is not None:
+                        print(_format_score_stage_line("D", phase_d_level, "extension", d_stage_stats, level_elapsed))
+                    print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates={int(d_exact_state.get('duplicates', 0))} rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid=0 beam_candidates=0 beam_kept=0 beam_kept_final_valid=0 beam_kept_search_only=0 d_valid_pool={len(d_valid_pool)} elapsed={level_elapsed:.2f}s")
                     _save_progress(valid_pool + d_valid_pool, progress_state)
                     _phase_d_control()
                     break
@@ -4823,14 +5186,22 @@ def main() -> None:
                 )
                 d_valid_pool = _keep_d_pool(d_valid_pool + final_valid_d)
                 _save_progress(valid_pool + d_valid_pool, progress_state)
-                d_beam = [tuple(sorted(int(x) for x in r.get("_combo", tuple()))) for r in beam_rules]
+                d_beam_nodes, next_d_parent_id = _advance_beam_nodes(
+                    beam_rules,
+                    d_exact_state.get("provenance", {}),
+                    next_d_parent_id,
+                )
                 beam_kept_final_valid = d_diag["beam_kept_final_valid"]
                 beam_kept_search_only = d_diag["beam_kept_search_only"]
                 best_ratio = float(d_valid_pool[0]["ratio"]) if d_valid_pool else float("nan")
-                print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates=unknown rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_candidates={len(out_d)} beam_kept={len(d_beam)} beam_kept_final_valid={beam_kept_final_valid} beam_kept_search_only={beam_kept_search_only} d_valid_pool={len(d_valid_pool)} elapsed={time.perf_counter() - level_t0:.2f}s best_ratio={best_ratio:.6g}")
+                level_elapsed = time.perf_counter() - level_t0
+                if d_stage_stats is not None:
+                    print(_format_score_stage_line("D", phase_d_level, "extension", d_stage_stats, level_elapsed))
+                print(f"[prefilter-phase-d] level={phase_d_level} {depth_txt} seeds={seeds_at_level_start} pool={len(tick_pool)} estimated_generated=unknown generated={generated_extensions} evaluated={evaluated_combos} truncated={truncated} rejected_duplicates={int(d_exact_state.get('duplicates', 0))} rejected_invalid_rules={max(0, evaluated_combos - len(out_d))} new_valid={max(0, len(d_valid_pool) - before)} beam_candidates={len(out_d)} beam_kept={len(d_beam_nodes)} beam_kept_final_valid={beam_kept_final_valid} beam_kept_search_only={beam_kept_search_only} d_valid_pool={len(d_valid_pool)} elapsed={level_elapsed:.2f}s best_ratio={best_ratio:.6g}")
                 if _phase_d_control():
                     break
             print("[prefilter-phase-d] done")
+            _print_exact_total("D")
     timing_detail2["phase_d_total_sec"] += time.perf_counter() - phase_d_t0
 
     rules_export_t0 = time.perf_counter()
