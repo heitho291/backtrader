@@ -280,7 +280,7 @@ def test_d_dispatch_initializes_only_selected_start_roots_for_single_pair_and_sp
             selected_nodes[:] = nodes
             return bool(rows)
 
-        result = prefilter._dispatch_phase_d_start(raw_start, 5, 5, 4, run, consume, lambda _message: None)
+        result = prefilter._dispatch_phase_d_start(raw_start, 5, 4, run, consume, lambda _message: None)
         return result, stages, selected_nodes
 
     depth, stages, singles = execute(1, {1})
@@ -314,7 +314,7 @@ def test_d_pair_fallback_without_eligible_pairs_creates_no_roots():
         roots[:] = nodes
         return bool(rows)
 
-    assert prefilter._dispatch_phase_d_start(1, 4, 4, 4, run, consume, lambda _message: None) == 2
+    assert prefilter._dispatch_phase_d_start(1, 4, 4, run, consume, lambda _message: None) == 2
     assert stages == [1, 2]
     assert roots == []
 
