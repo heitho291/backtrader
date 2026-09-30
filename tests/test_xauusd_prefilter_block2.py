@@ -189,20 +189,20 @@ def test_d_archive_tie_break_and_level_diagnostics_are_preserved():
 
 
 def test_phase_d_start_depth_changes_only_explicit_one_and_two_semantics():
-    assert prefilter._phase_d_initial_depth(1, 9, 8, 4) == 1
-    assert prefilter._phase_d_initial_depth(2, 9, 8, 4) == 2
-    assert prefilter._phase_d_initial_depth(2, 1, 8, 4) is None
-    assert prefilter._phase_d_initial_depth(2, 9, 8, 1) is None
+    assert prefilter._phase_d_initial_depth(1, 9, 4) == 1
+    assert prefilter._phase_d_initial_depth(2, 9, 4) == 2
+    assert prefilter._phase_d_initial_depth(2, 1, 4) is None
+    assert prefilter._phase_d_initial_depth(2, 9, 1) is None
     # Other raw values preserve the base max(1, min(raw, limits, pool)) behavior.
-    assert prefilter._phase_d_initial_depth(3, 9, 8, 4) == 3
-    assert prefilter._phase_d_initial_depth(3, 2, 8, 4) == 2
-    assert prefilter._phase_d_initial_depth(10, 9, 8, 4) == 4
-    assert prefilter._phase_d_initial_depth(0, 9, 8, 4) == 1
-    assert prefilter._phase_d_initial_depth(-3, 9, 8, 4) == 1
+    assert prefilter._phase_d_initial_depth(3, 9, 4) == 3
+    assert prefilter._phase_d_initial_depth(3, 2, 4) == 2
+    assert prefilter._phase_d_initial_depth(10, 9, 4) == 4
+    assert prefilter._phase_d_initial_depth(0, 9, 4) == 1
+    assert prefilter._phase_d_initial_depth(-3, 9, 4) == 1
 
 
 def test_phase_d_start_dispatch_behavior_and_preservation():
-    def execute(raw_start, eligible_by_depth, phase_max=4, path_max=4, pool_size=4):
+    def execute(raw_start, eligible_by_depth, phase_max=4, pool_size=4):
         stages = []
         logs = []
 
@@ -222,7 +222,7 @@ def test_phase_d_start_dispatch_behavior_and_preservation():
             stages.append(("consume", depth, tag, tuple(rows)))
             return bool(rows)
 
-        result_depth = prefilter._dispatch_phase_d_start(raw_start, phase_max, path_max, pool_size, run, consume, logs.append)
+        result_depth = prefilter._dispatch_phase_d_start(raw_start, phase_max, pool_size, run, consume, logs.append)
         return result_depth, stages, logs
 
     depth, stages, logs = execute(1, {1: ["search-only"]})

@@ -128,7 +128,12 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--step-size", type=int, default=5)
     p.add_argument("--top-paths", type=int, default=24)
-    p.add_argument("--max-path-conds", type=int, default=8)
+    p.add_argument(
+        "--phase-ab-max-path-conds",
+        type=int,
+        default=8,
+        help="maximum A/B condition depth (default: 8)",
+    )
     p.add_argument("--workers", type=str, default="auto")
     p.add_argument("--batch-size", type=int, default=50000)
     p.add_argument("--memory-soft-limit-gb", type=float, default=20.0)
@@ -146,7 +151,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-single-pos-hits", type=int, default=2)
     p.add_argument("--min-single-lift", type=float, default=1.01)
     p.add_argument("--max-single-mask-count", type=int, default=0)
-    p.add_argument("--family-top-n", type=int, default=40)
+    p.add_argument(
+        "--phase-ab-family-top-n",
+        type=int,
+        default=9,
+        help="candidates retained per family for A/B (default: 9)",
+    )
+    p.add_argument(
+        "--phase-c-family-top-n",
+        type=int,
+        default=9,
+        help="candidates retained per family for C (default: 9)",
+    )
     p.add_argument("--family-split-delta-window", action="store_true", default=False)
     p.add_argument("--include-candidates-file", type=Path, default=None)
     p.add_argument("--out-candidates-coarse-csv", type=Path, default=None)
@@ -695,6 +711,41 @@ def _phase_b_has_parent_survivors(survivor_pool: Iterable[dict]) -> bool:
     return bool(list(survivor_pool))
 
 
+def _phase_b_can_start(survivor_pool: Iterable[dict], previous_pool: list[dict], next_pool: list[dict]) -> bool:
+    return _phase_b_has_parent_survivors(survivor_pool) and bool(_new_block_indices(previous_pool, next_pool))
+
+
+def _ab_unlock_decision(
+    previous_pool: list[dict],
+    current_pool: list[dict],
+    phase_a: bool,
+    unlocked_next: int,
+    ranked_pool_size: int,
+) -> tuple[str, list[int]]:
+    new_block_idxs = _new_block_indices(previous_pool, current_pool)
+    if new_block_idxs:
+        return "run", new_block_idxs
+    if bool(phase_a) and int(unlocked_next) < int(ranked_pool_size):
+        return "advance_a", []
+    return "to_c", []
+
+
+def _phase_a_transition_state(
+    reason: str,
+    unlocked_next: int,
+    current_pool: list[dict],
+    survivor_pool: Iterable[dict],
+    next_pool: list[dict],
+) -> dict:
+    processed_pool = list(current_pool)
+    return {
+        "unlocked": int(unlocked_next),
+        "processed_pool": processed_pool,
+        "next_phase": "B" if _phase_b_can_start(survivor_pool, processed_pool, next_pool) else "C",
+        "reason": str(reason),
+    }
+
+
 def _map_c_start_beam(seed_rules: Iterable[dict], pool_c: list[dict], beam_width: int, max_conds: int) -> tuple[list[tuple[int, ...]], bool]:
     nodes, used_single_fallback, _next_id = _map_c_start_nodes(seed_rules, pool_c, beam_width, max_conds)
     return [tuple(node["combo"]) for node in nodes], used_single_fallback
@@ -704,26 +755,25 @@ def _d_archive_sort_key(row: dict) -> tuple[float, int, int, int]:
     return (*_train_search_sort_key(row), len(tuple(row.get("_combo", tuple()))))
 
 
-def _phase_d_initial_depth(raw_start: int, phase_d_max_conds: int, max_path_conds: int, pool_size: int) -> int | None:
+def _phase_d_initial_depth(raw_start: int, phase_d_max_conds: int, pool_size: int) -> int | None:
     raw = int(raw_start)
-    max_depth = min(int(phase_d_max_conds), int(max_path_conds))
+    max_depth = int(phase_d_max_conds)
     if raw == 1:
         return 1
     if raw == 2:
         return 2 if int(pool_size) >= 2 and max_depth >= 2 else None
-    return max(1, min(raw, int(phase_d_max_conds), int(max_path_conds), int(pool_size)))
+    return max(1, min(raw, int(phase_d_max_conds), int(pool_size)))
 
 
 def _dispatch_phase_d_start(
     raw_start: int,
     phase_d_max_conds: int,
-    max_path_conds: int,
     pool_size: int,
     run_stage,
     consume_stage,
     log,
 ) -> int | None:
-    start_depth = _phase_d_initial_depth(raw_start, phase_d_max_conds, max_path_conds, pool_size)
+    start_depth = _phase_d_initial_depth(raw_start, phase_d_max_conds, pool_size)
     if start_depth is None:
         log("start2 pair stage unavailable: pool_size or effective max depth is below 2")
         return None
@@ -735,7 +785,7 @@ def _dispatch_phase_d_start(
     if singles_eligible:
         log("start1 pair fallback not needed: beam-eligible singles exist")
         return 1
-    pair_depth_allowed = int(pool_size) >= 2 and min(int(phase_d_max_conds), int(max_path_conds)) >= 2
+    pair_depth_allowed = int(pool_size) >= 2 and int(phase_d_max_conds) >= 2
     if not pair_depth_allowed:
         log("start1 pair fallback unavailable: pool_size or effective max depth is below 2")
         return 1
@@ -756,6 +806,24 @@ def _run_global_d_stage(
 ) -> tuple[list[dict], int, int, bool]:
     raw_items = ((tuple(combo), None) for combo in itertools.combinations(list(idxs), int(depth)))
     return _run_exact_combo_stage(raw_items, batch_size, generation_cap, evaluate, state_out=state_out)
+
+
+def _iter_beam_extensions(
+    nodes: Iterable[dict],
+    idxs: list[int],
+    add_min: int,
+    add_max: int,
+    max_conds: int,
+):
+    for node in nodes:
+        base = tuple(node["combo"])
+        cset = set(base)
+        add_cands = [x for x in idxs if x not in cset]
+        for add_k in range(max(1, int(add_min)), max(1, int(add_max)) + 1):
+            if len(base) + add_k > int(max_conds):
+                continue
+            for adds in itertools.combinations(add_cands, add_k):
+                yield tuple(sorted(cset | set(adds))), int(node["parent_id"])
 
 
 def _better_train_score(candidate: dict | None, current: dict | None) -> bool:
@@ -946,6 +1014,19 @@ def _ordered_frame(rows: list[dict], preferred_cols: list[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=preferred_cols)
     extra = [c for c in frame.columns if c not in preferred_cols]
     return frame[[c for c in preferred_cols if c in frame.columns] + extra]
+
+
+def _candidate_output_frame(rows: list[dict], preferred_cols: list[str]) -> pd.DataFrame:
+    return _ordered_frame(rows, preferred_cols).drop(
+        columns=[
+            "kept_after_family_topn",
+            "coarse_single_raw_mask_count",
+            "coarse_single_raw_ratio",
+            "tick_single_raw_mask_count",
+            "tick_single_raw_ratio",
+        ],
+        errors="ignore",
+    )
 
 
 def _atomic_write_npz(path: Path, **arrays) -> None:
@@ -1147,12 +1228,12 @@ def _iter_combinations_with_new(idxs: list[int], r: int, new_start: int):
                     yield tuple(sorted(o_part + n_part))
 
 
-def _iter_parent_extensions(parent: dict, idxs: list[int], max_path_conds: int):
+def _iter_parent_extensions(parent: dict, add_idxs: list[int], max_path_conds: int):
     cset = set(int(x) for x in parent.get("_combo", ()))
     remaining = int(max_path_conds) - len(cset)
     if remaining <= 0:
         return
-    add_candidates = [x for x in idxs if x not in cset]
+    add_candidates = [x for x in add_idxs if x not in cset]
     for add_k in range(1, remaining + 1):
         for adds in itertools.combinations(add_candidates, add_k):
             combo = tuple(sorted(cset | set(adds)))
@@ -1160,9 +1241,94 @@ def _iter_parent_extensions(parent: dict, idxs: list[int], max_path_conds: int):
                 yield combo, parent
 
 
-def _iter_all_parent_extensions(seeds: list[dict], idxs: list[int], max_path_conds: int):
+def _iter_all_parent_extensions(seeds: list[dict], add_idxs: list[int], max_path_conds: int):
     for p in seeds:
-        yield from _iter_parent_extensions(p, idxs, max_path_conds)
+        yield from _iter_parent_extensions(p, add_idxs, max_path_conds)
+
+
+def _candidate_pool_identity(row: dict) -> str:
+    stable_key = str(row.get("stable_candidate_key", "")).strip()
+    if stable_key:
+        return stable_key
+    return _stable_candidate_key(
+        str(row.get("col", "")),
+        str(row.get("op", "")),
+        _canonicalize_candidate_value(str(row.get("col", "")), str(row.get("op", "")), float(row.get("value", np.nan))),
+    )
+
+
+def _new_block_indices(previous_pool: list[dict], current_pool: list[dict]) -> list[int]:
+    previous_keys = [_candidate_pool_identity(row) for row in previous_pool]
+    current_keys = [_candidate_pool_identity(row) for row in current_pool]
+    if current_keys[: len(previous_keys)] != previous_keys:
+        raise ValueError("A/B unlocked pool no longer preserves the prior stable-identity prefix")
+    return list(range(len(previous_keys), len(current_keys)))
+
+
+def _new_ab_parent_usage_stats(
+    seeds: list[dict], min_main_score: float, enabled: bool = True
+) -> dict[str, int] | None:
+    if not enabled:
+        return None
+    final_valid = sum(1 for seed in seeds if _is_final_valid_result(seed, min_main_score))
+    return {
+        "ab_survivors_final_valid": int(final_valid),
+        "ab_survivors_search_only": int(len(seeds) - final_valid),
+        "parent_ext_evaluated_from_final_valid": 0,
+        "parent_ext_evaluated_from_search_only": 0,
+        "parent_ext_final_valid_children_from_final_valid": 0,
+        "parent_ext_final_valid_children_from_search_only": 0,
+        "_reported": 0,
+    }
+
+
+def _record_ab_parent_usage(
+    stats: dict[str, int],
+    parents: list[dict | None],
+    results: list[dict | None],
+    min_main_score: float,
+) -> None:
+    for parent, result in zip(parents, results):
+        if parent is None:
+            continue
+        parent_kind = "final_valid" if _is_final_valid_result(parent, min_main_score) else "search_only"
+        stats[f"parent_ext_evaluated_from_{parent_kind}"] += 1
+        if result is not None and _is_final_valid_result(result, min_main_score):
+            stats[f"parent_ext_final_valid_children_from_{parent_kind}"] += 1
+
+
+def _record_ab_parent_usage_batch(
+    stats: dict[str, int] | None,
+    parents: list[dict | None],
+    results: list[dict | None] | None,
+    min_main_score: float,
+) -> None:
+    if stats is None:
+        return
+    _record_ab_parent_usage(stats, parents, results or [], min_main_score)
+
+
+def _print_ab_parent_usage_once(
+    stats: dict[str, int] | None,
+    round_number: int,
+    phase: str,
+) -> bool:
+    if stats is None or bool(stats.get("_reported", 0)):
+        return False
+    fields = (
+        "ab_survivors_final_valid",
+        "ab_survivors_search_only",
+        "parent_ext_evaluated_from_final_valid",
+        "parent_ext_evaluated_from_search_only",
+        "parent_ext_final_valid_children_from_final_valid",
+        "parent_ext_final_valid_children_from_search_only",
+    )
+    print(
+        f"[prefilter-ab-parent-usage] round={int(round_number)} phase={str(phase)} "
+        + " ".join(f"{key}={int(stats[key])}" for key in fields)
+    )
+    stats["_reported"] = 1
+    return True
 
 
 
@@ -1352,8 +1518,15 @@ def _filter_candidate_inventory_rows(
     return out
 
 
-def _tick_scope_keys(scope: str, inventory: list[dict], filtered: list[dict], fam_top: list[dict]) -> set[str]:
-    selected = fam_top if scope == "fam_top" else filtered if scope == "filtered" else inventory
+def _tick_scope_keys(
+    scope: str,
+    inventory: list[dict],
+    filtered: list[dict],
+    phase_ab_fam_top: list[dict],
+    phase_c_fam_top: list[dict] | None = None,
+) -> set[str]:
+    family_union = [*phase_ab_fam_top, *(phase_c_fam_top if phase_c_fam_top is not None else [])]
+    selected = family_union if scope == "fam_top" else filtered if scope == "filtered" else inventory
     return {str(r.get("stable_candidate_key", "")) for r in selected}
 
 
@@ -1366,6 +1539,27 @@ def _family_top_rows(rows: list[dict], family_top_n: int) -> list[dict]:
         ranked = sorted(group, key=lambda z: (-float(z["lift"]), -int(z["_single_pos_hits"]), int(z["_single_mask_count"])))
         out.extend(ranked[: int(family_top_n)])
     return out
+
+
+def _rank_family_pool(rows: list[dict], tick_refined_mode: bool, rank_name: str) -> list[dict]:
+    if tick_refined_mode:
+        ranked = sorted(
+            rows,
+            key=lambda z: (
+                -float(z.get("ratio", 0.0)),
+                -int(z.get("_single_pos_hits", 0)),
+                int(z.get("_single_mask_count", 0)),
+            ),
+        )
+        return _with_rank_context(ranked, rank_name)
+    return _with_rank_context(sorted(rows, key=lambda z: z["lift"], reverse=True), rank_name)
+
+
+def _family_membership_fields(stable_key: str, phase_ab_keys: set[str], phase_c_keys: set[str]) -> dict[str, int]:
+    return {
+        "kept_after_phase_ab_family_topn": int(stable_key in phase_ab_keys),
+        "kept_after_phase_c_family_topn": int(stable_key in phase_c_keys),
+    }
 
 
 def _mask_required_keys(tick_scope_keys: set[str], replay_enabled: bool) -> set[str]:
@@ -3560,8 +3754,10 @@ def main() -> None:
     filtered_elapsed = max(0.0, time.perf_counter() - filtered_items_build_t0 - allowlist_filter_elapsed)
     timing_detail2["filtered_items_sec"] += filtered_elapsed
     fam_top_build_t0 = time.perf_counter()
-    fam_top = _family_top_rows(filtered_items, int(args.family_top_n))
-    print(f"[prefilter-candidates] current_family_top_rows={len(fam_top)}")
+    phase_ab_fam_top = _family_top_rows(filtered_items, int(args.phase_ab_family_top_n))
+    phase_c_fam_top = _family_top_rows(filtered_items, int(args.phase_c_family_top_n))
+    print(f"[prefilter-candidates] current_phase_ab_family_top_rows={len(phase_ab_fam_top)}")
+    print(f"[prefilter-candidates] current_phase_c_family_top_rows={len(phase_c_fam_top)}")
     family_top_elapsed = time.perf_counter() - fam_top_build_t0
     timing_detail2["family_top_sec"] += family_top_elapsed
     askbid_tick_replay_enabled = args.tick_entry_cache_npz is not None
@@ -3628,7 +3824,13 @@ def main() -> None:
         rebuild_legacy=False,
     )
     timing_detail2["refined_csv_load_sec"] += time.perf_counter() - refined_csv_load_t0
-    tick_scope_stable_keys = _tick_scope_keys(str(args.tick_refine_scope), candidate_inventory_rows, filtered_items, fam_top)
+    tick_scope_stable_keys = _tick_scope_keys(
+        str(args.tick_refine_scope),
+        candidate_inventory_rows,
+        filtered_items,
+        phase_ab_fam_top,
+        phase_c_fam_top,
+    )
     inventory_by_stable = {str(it["stable_candidate_key"]): it for it in candidate_inventory_rows}
     mask_required_keys = _mask_required_keys(tick_scope_stable_keys, askbid_tick_replay_enabled)
     fresh_masks = {
@@ -3718,7 +3920,11 @@ def main() -> None:
         print(f"[prefilter-resume] refined_rows_with_stored_tick_metrics={refined_rows_with_tick}")
         print(f"[prefilter-resume] refined_rows_missing_tick_metrics={refined_rows_missing_tick}")
         print(f"[prefilter-resume] requested_allowlist_keys={len(allow_keys) if allow_keys is not None else 0}")
-        print(f"[prefilter-resume] usable_refined_keys_for_fam_top={sum(1 for it in fam_top if 'tick_single_ratio' in it)}")
+        print(
+            "[prefilter-resume] "
+            f"usable_refined_keys_for_phase_ab_family_top={sum(1 for it in phase_ab_fam_top if 'tick_single_ratio' in it)} "
+            f"usable_refined_keys_for_phase_c_family_top={sum(1 for it in phase_c_fam_top if 'tick_single_ratio' in it)}"
+        )
         print(f"[prefilter-resume] usable_refined_keys_for_tick_scope={sum(1 for it in tick_scope_items if 'tick_single_ratio' in it)}")
     elif bool(allow_keys_refined):
         if refined_out is None or not refined_out.exists():
@@ -3895,7 +4101,8 @@ def main() -> None:
     refined_reason = "not_requested"
     if coarse_out is not None:
         coarse_csv_t0 = time.perf_counter()
-        fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
+        phase_ab_fam_top_keys = {str(z.get("stable_candidate_key", "")) for z in phase_ab_fam_top}
+        phase_c_fam_top_keys = {str(z.get("stable_candidate_key", "")) for z in phase_c_fam_top}
         coarse_rows = []
         for it in candidate_inventory_rows:
             stable_k = str(it.get("stable_candidate_key", "")).strip() or _stable_candidate_key(str(it["col"]), str(it["op"]), _canonicalize_candidate_value(str(it["col"]), str(it["op"]), float(it["value"])))
@@ -3914,14 +4121,14 @@ def main() -> None:
                 "coarse_single_ratio_change": float(it.get("coarse_single_ratio_change", np.nan)),
                 "coarse_lift": float(it.get("coarse_lift", it.get("lift", 0.0))),
                 "binary": int(bool(it.get("binary", False))),
-                "kept_after_family_topn": int(str(it["candidate_key"]) in fam_top_keys),
+                **_family_membership_fields(stable_k, phase_ab_fam_top_keys, phase_c_fam_top_keys),
                 "__stage": "coarse",
                 "__schema_version": CANDIDATE_CACHE_SCHEMA_VERSION,
                 "__ctx_sig": coarse_ctx_sig,
             }
             coarse_rows.append(row)
-        coarse_cols = ["candidate_key", "stable_candidate_key", "col", "op", "value", "family", "coarse_single_pos_hits", "coarse_single_neg_hits", "coarse_single_mask_count", "coarse_single_ratio", "coarse_single_mask_keep_ratio", "coarse_single_ratio_change", "coarse_lift", "binary", "kept_after_family_topn", "__stage", "__schema_version", "__ctx_sig"]
-        coarse_frame = _ordered_frame(coarse_rows, coarse_cols).drop(columns=["coarse_single_raw_mask_count", "coarse_single_raw_ratio", "tick_single_raw_mask_count", "tick_single_raw_ratio"], errors="ignore")
+        coarse_cols = ["candidate_key", "stable_candidate_key", "col", "op", "value", "family", "coarse_single_pos_hits", "coarse_single_neg_hits", "coarse_single_mask_count", "coarse_single_ratio", "coarse_single_mask_keep_ratio", "coarse_single_ratio_change", "coarse_lift", "binary", "kept_after_phase_ab_family_topn", "kept_after_phase_c_family_topn", "__stage", "__schema_version", "__ctx_sig"]
+        coarse_frame = _candidate_output_frame(coarse_rows, coarse_cols)
         wrote_coarse, coarse_reason = _write_csv_if_changed(coarse_out, coarse_frame, key_cols=["stable_candidate_key"])
         coarse_rows_prev = int(len(coarse_resume)) if coarse_resume is not None else 0
         coarse_rows_after = int(len(coarse_rows))
@@ -3952,7 +4159,8 @@ def main() -> None:
 
     if refined_out is not None:
         refined_csv_t0 = time.perf_counter()
-        fam_top_keys = {str(z.get("candidate_key")) for z in fam_top}
+        phase_ab_fam_top_keys = {str(z.get("stable_candidate_key", "")) for z in phase_ab_fam_top}
+        phase_c_fam_top_keys = {str(z.get("stable_candidate_key", "")) for z in phase_c_fam_top}
 
         def _refined_row_key(row: dict) -> str:
             try:
@@ -3975,6 +4183,7 @@ def main() -> None:
                 if not stable_k or stable_k not in inventory_by_stable:
                     continue
                 row = {k: r.get(k) for k in r.index}
+                row.pop("kept_after_family_topn", None)
                 row["stable_candidate_key"] = stable_k
                 row["tick_metric_status"] = str(row.get("tick_metric_status", "out_of_scope") or "out_of_scope")
                 row["__ctx_sig"] = refined_ctx_sig
@@ -4002,7 +4211,7 @@ def main() -> None:
                 "coarse_single_ratio_change": float(it.get("coarse_single_ratio_change", np.nan)),
                 "coarse_lift": float(it.get("coarse_lift", it.get("lift", 0.0))),
                 "binary": int(bool(it.get("binary", False))),
-                "kept_after_family_topn": int(str(it["candidate_key"]) in fam_top_keys),
+                **_family_membership_fields(stable_k, phase_ab_fam_top_keys, phase_c_fam_top_keys),
                 "__stage": "refined",
                 "__schema_version": REFINED_CACHE_SCHEMA_VERSION,
                 "__ctx_sig": refined_ctx_sig,
@@ -4025,8 +4234,8 @@ def main() -> None:
                 deduped_rows.get(k), row, refined_ctx_sig, REFINED_CACHE_SCHEMA_VERSION
             )
         cand_rows = _refined_rows_for_inventory(candidate_inventory_rows, deduped_rows)
-        refined_cols = ["candidate_key_refined", "stable_candidate_key", "col", "op", "value", "family", "coarse_single_pos_hits", "coarse_single_neg_hits", "coarse_single_mask_count", "coarse_single_ratio", "coarse_single_mask_keep_ratio", "coarse_single_ratio_change", "coarse_lift", "binary", "kept_after_family_topn", "tick_single_pos_hits", "tick_single_neg_hits", "tick_single_mask_count", "tick_single_ratio", "tick_single_mask_keep_ratio", "tick_single_ratio_change", "tick_metric_status", "__stage", "__schema_version", "__ctx_sig"]
-        refined_frame = _ordered_frame(cand_rows, refined_cols).drop(columns=["coarse_single_raw_mask_count", "coarse_single_raw_ratio", "tick_single_raw_mask_count", "tick_single_raw_ratio"], errors="ignore")
+        refined_cols = ["candidate_key_refined", "stable_candidate_key", "col", "op", "value", "family", "coarse_single_pos_hits", "coarse_single_neg_hits", "coarse_single_mask_count", "coarse_single_ratio", "coarse_single_mask_keep_ratio", "coarse_single_ratio_change", "coarse_lift", "binary", "kept_after_phase_ab_family_topn", "kept_after_phase_c_family_topn", "tick_single_pos_hits", "tick_single_neg_hits", "tick_single_mask_count", "tick_single_ratio", "tick_single_mask_keep_ratio", "tick_single_ratio_change", "tick_metric_status", "__stage", "__schema_version", "__ctx_sig"]
+        refined_frame = _candidate_output_frame(cand_rows, refined_cols)
         prev_refined_rows = int(len(refined_resume)) if refined_resume is not None else 0
         wrote_refined, refined_reason = _write_csv_if_changed(refined_out, refined_frame, key_cols=["stable_candidate_key"])
         refined_rows_after = int(len(cand_rows))
@@ -4095,10 +4304,8 @@ def main() -> None:
     print(f"[prefilter-candidates] released_single_candidate_masks={released_single_masks}")
 
     rank_sort_t0 = time.perf_counter()
-    if tick_refined_mode:
-        rank_lift = _with_rank_context(sorted(fam_top, key=lambda z: (-float(z.get("ratio", 0.0)), -int(z.get("_single_pos_hits", 0)), int(z.get("_single_mask_count", 0)))), "ratio")
-    else:
-        rank_lift = _with_rank_context(sorted(fam_top, key=lambda z: z["lift"], reverse=True), "lift")
+    rank_ab = _rank_family_pool(phase_ab_fam_top, tick_refined_mode, "ratio" if tick_refined_mode else "lift")
+    rank_c = _rank_family_pool(phase_c_fam_top, tick_refined_mode, "ratio" if tick_refined_mode else "lift")
     rank_freq: list[dict] = []
     rank_ratio: list[dict] = []
     timing_detail["ranking_sort_sec"] += time.perf_counter() - rank_sort_t0
@@ -4477,6 +4684,7 @@ def main() -> None:
     rng = random.Random(int(args.batch_random_seed))
     valid_pool: list[dict] = []
     ab_survivor_pool: list[dict] = []
+    processed_ab_pool: list[dict] = []
     progress_state: dict = {}
     phase_c_was_active = False
     original_early_stop_window_combos = int(args.early_stop_window_combos)
@@ -4576,7 +4784,8 @@ def main() -> None:
         non_bin_items = items_total_count - bin_items
         print(
             f"[prefilter-items] cols={len(cols)} items={items_total_count} "
-            f"filtered_items={len(filtered_items)} family_top_pool={len(rank_lift)} "
+            f"filtered_items={len(filtered_items)} phase_ab_family_top_pool={len(rank_ab)} "
+            f"phase_c_family_top_pool={len(rank_c)} "
             f"dist_items={dist_items} non_dist_items={non_dist_items} "
             f"binary_items={bin_items} non_binary_items={non_bin_items}"
         )
@@ -4593,7 +4802,7 @@ def main() -> None:
             unlocked_next = unlocked + int(args.step_size)
             pool = _build_unlocked_pool(
                 miner_mod=miner,
-                rank_lists=[rank_lift],
+                rank_lists=[rank_ab],
                 all_candidate_cols=cols,
                 unlocked_next=unlocked_next,
                 step_size=int(args.step_size),
@@ -4601,12 +4810,31 @@ def main() -> None:
                 binary_anchor_lookahead_blocks=int(args.binary_anchor_lookahead_blocks),
                 binary_cap_per_block=10 ** 9,
             )
-            if not pool:
-                _log_phase_transition("A" if not phase_b_started else "B", "C", "unlocked_pool_empty", round=unlocked_next, pool_size=0, valid_pool=len(valid_pool), max_valids=int(args.max_valids))
-                break
-            idxs = list(range(len(pool)))
-            old_pool_size = max(0, len(pool) - int(args.step_size))
             phase_a = (len(valid_pool) < int(args.max_valids)) and (not force_phase_b_requested)
+            idxs = list(range(len(pool)))
+            unlock_action, new_block_idxs = _ab_unlock_decision(
+                processed_ab_pool,
+                pool,
+                phase_a,
+                unlocked_next,
+                len(rank_ab),
+            )
+            if unlock_action == "advance_a":
+                unlocked = unlocked_next
+                processed_ab_pool = list(pool)
+                continue
+            if unlock_action == "to_c":
+                _log_phase_transition(
+                    "A" if phase_a else "B",
+                    "C",
+                    "no_new_ab_candidates",
+                    round=unlocked_next,
+                    pool_size=len(pool),
+                    valid_pool=len(valid_pool),
+                    max_valids=int(args.max_valids),
+                )
+                break
+            old_pool_size = int(new_block_idxs[0])
             phase_b_pool_key = _phase_b_pool_key(pool)
             if phase_a:
                 print("[prefilter-phase-b] started=False reason=phase_a_active")
@@ -4636,7 +4864,7 @@ def main() -> None:
             batch_eff = max(256, int(args.batch_size))
             sid = 0
             if phase_a:
-                for r in range(2, int(args.max_path_conds) + 1):
+                for r in range(2, int(args.phase_ab_max_path_conds) + 1):
                     if r > len(idxs):
                         continue
                     total_r = sum(1 for _ in _iter_combinations_with_new(idxs, r, old_pool_size))
@@ -4651,12 +4879,21 @@ def main() -> None:
             valid_round = 0
             mut_i = 0
             seeds = _ab_parent_seed_snapshot(ab_survivor_pool, int(args.max_valids))
+            ab_parent_usage = _new_ab_parent_usage_stats(
+                seeds,
+                float(args.min_main_score),
+                bool(args.debug_reject_stats),
+            )
             mut_combos: collections.deque[tuple[tuple[int, ...], dict]] = collections.deque()
             parent_ext_iter = None
             if (not phase_a) or (phase_a and len(seeds) > 0 and unlocked_next > int(args.step_size)):
-                parent_ext_iter = _iter_all_parent_extensions(seeds, idxs, int(args.max_path_conds))
+                parent_ext_iter = _iter_all_parent_extensions(
+                    seeds,
+                    new_block_idxs,
+                    int(args.phase_ab_max_path_conds),
+                )
             combos_total_free = 0
-            rmax = min(int(args.max_path_conds), len(idxs))
+            rmax = min(int(args.phase_ab_max_path_conds), len(idxs))
             if phase_a:
                 for rr in range(2, rmax + 1):
                     combos_total_free += sum(1 for _ in _iter_combinations_with_new(idxs, rr, old_pool_size))
@@ -4729,9 +4966,12 @@ def main() -> None:
                         phase_b_exhausted = True
                         break
                 out_batch: list[dict] = []
+                batch_results: list[dict | None] | None = [] if ab_parent_usage is not None else None
                 if workers_eff <= 1:
                     for i, cb in enumerate(combos):
                         rr = evaluate_combo(cb, pool, parents[i], source=("A" if phase_a else "B"))
+                        if batch_results is not None:
+                            batch_results.append(rr)
                         if rr is not None:
                             out_batch.append(rr)
                 else:
@@ -4742,8 +4982,16 @@ def main() -> None:
                     futs = [ex.submit(evaluate_combo, cb, pool, parents[i], ("A" if phase_a else "B")) for i, cb in enumerate(combos)]
                     for f in futs:
                         rr = f.result()
+                        if batch_results is not None:
+                            batch_results.append(rr)
                         if rr is not None:
                             out_batch.append(rr)
+                _record_ab_parent_usage_batch(
+                    ab_parent_usage,
+                    parents,
+                    batch_results,
+                    float(args.min_main_score),
+                )
                 tested += len(combos)
                 ab_survivor_pool, valid_pool, final_valid_batch = _update_ab_search_pools(
                     ab_survivor_pool,
@@ -4856,6 +5104,12 @@ def main() -> None:
             for ex in executor_cache.values():
                 ex.shutdown(wait=True)
 
+            _print_ab_parent_usage_once(
+                ab_parent_usage,
+                unlocked_next,
+                "A" if phase_a else "B",
+            )
+
             if (not phase_a) and (phase_b_exhausted or force_phase == "C"):
                 completed_phase_b_pool_keys.add(phase_b_pool_key)
             if stop_after_batch_requested:
@@ -4871,17 +5125,48 @@ def main() -> None:
                 break
             if not valid_pool:
                 unlocked = unlocked_next
-                if unlocked >= len(rank_lift):
+                processed_ab_pool = list(pool)
+                if unlocked >= len(rank_ab):
                     _log_phase_transition("A" if phase_a else "B", "C", "phase_a_exhausted" if phase_a else "phase_b_exhausted", round=unlocked_next, pool_size=len(pool), valid_pool=0, max_valids=int(args.max_valids), tested_total=tested, total_free=combos_total_free, total_parent_ext=combos_total_parent_extensions, total_combined=combos_total)
                     break
                 continue
             best_paths = list(valid_pool)
             cur_best = float(best_paths[0]["ratio"]) if best_paths else -np.inf
-            if phase_a and (not force_phase_b_requested) and cur_best <= prev_best + 1e-12:
-                _log_phase_transition("A", "C", "phase_a_no_improvement", round=unlocked_next, pool_size=len(pool), valid_pool=len(valid_pool), max_valids=int(args.max_valids), tested_total=tested, total_free=combos_total_free, total_parent_ext=combos_total_parent_extensions, total_combined=combos_total)
+            requested_b_reason = None
+            if phase_a and force_phase_b_requested:
+                requested_b_reason = phase_b_start_reason
+            elif phase_a and cur_best <= prev_best + 1e-12:
+                requested_b_reason = "phase_a_no_improvement"
+            if requested_b_reason is not None:
+                next_pool = _build_unlocked_pool(
+                    miner_mod=miner,
+                    rank_lists=[rank_ab],
+                    all_candidate_cols=cols,
+                    unlocked_next=unlocked_next + int(args.step_size),
+                    step_size=int(args.step_size),
+                    binary_cap_per_list_block=10 ** 9,
+                    binary_anchor_lookahead_blocks=int(args.binary_anchor_lookahead_blocks),
+                    binary_cap_per_block=10 ** 9,
+                )
+                transition = _phase_a_transition_state(
+                    requested_b_reason,
+                    unlocked_next,
+                    pool,
+                    ab_survivor_pool,
+                    next_pool,
+                )
+                unlocked = int(transition["unlocked"])
+                processed_ab_pool = list(transition["processed_pool"])
+                if transition["next_phase"] == "B":
+                    force_phase_b_requested = True
+                    phase_b_start_reason = str(transition["reason"])
+                    prev_best = cur_best
+                    continue
+                _log_phase_transition("A", "C", requested_b_reason, round=unlocked_next, pool_size=len(pool), valid_pool=len(valid_pool), max_valids=int(args.max_valids), tested_total=tested, total_free=combos_total_free, total_parent_ext=combos_total_parent_extensions, total_combined=combos_total)
                 break
             prev_best = cur_best
             unlocked = unlocked_next
+            processed_ab_pool = list(pool)
     except KeyboardInterrupt:
         print("[prefilter] interrupted; checkpoint saved.")
         _save_progress(valid_pool, progress_state)
@@ -4920,9 +5205,9 @@ def main() -> None:
     phase_c_t0 = time.perf_counter()
     pool_c = _build_unlocked_pool(
         miner_mod=miner,
-        rank_lists=[rank_lift],
+        rank_lists=[rank_c],
         all_candidate_cols=cols,
-        unlocked_next=len(rank_lift),
+        unlocked_next=len(rank_c),
         step_size=int(args.step_size),
         binary_cap_per_list_block=10 ** 9,
         binary_anchor_lookahead_blocks=int(args.binary_anchor_lookahead_blocks),
@@ -4948,15 +5233,13 @@ def main() -> None:
             seeds_at_level_start = len(beam_nodes)
             parent_nodes = {int(node["parent_id"]): node for node in beam_nodes}
             def _iter_cands_c():
-                for node in beam_nodes:
-                    base = tuple(node["combo"])
-                    cset = set(base)
-                    add_cands = [x for x in idxs_c if x not in cset]
-                    for add_k in range(max(1, int(args.phase_c_add_min)), max(1, int(args.phase_c_add_max)) + 1):
-                        if len(base) + add_k > int(args.phase_c_max_conds) or len(base) + add_k > int(args.max_path_conds):
-                            continue
-                        for adds in itertools.combinations(add_cands, add_k):
-                            yield tuple(sorted(cset | set(adds))), int(node["parent_id"])
+                yield from _iter_beam_extensions(
+                    beam_nodes,
+                    idxs_c,
+                    int(args.phase_c_add_min),
+                    int(args.phase_c_add_max),
+                    int(args.phase_c_max_conds),
+                )
             c_exact_state: dict = {}
             c_stage_stats = _new_score_stage_stats() if bool(args.debug_score_stage_timing) else None
             def _evaluate_c_exact(cb):
@@ -4976,7 +5259,7 @@ def main() -> None:
             if bool(args.debug_exact_combo_stats):
                 c_mask_diag = _c_mask_duplicate_diagnostics(
                     out_c,
-                    min(int(args.phase_c_max_conds), int(args.max_path_conds)),
+                    int(args.phase_c_max_conds),
                     int(args.phase_c_beam_width),
                 )
                 print("[prefilter-c-mask-diagnostic] " + " ".join(f"{key}={value}" for key, value in c_mask_diag.items()))
@@ -4994,7 +5277,7 @@ def main() -> None:
             final_valid_c, beam_rules, c_diag = _select_level_results(
                 out_c,
                 float(args.min_main_score),
-                min(int(args.phase_c_max_conds), int(args.max_path_conds)),
+                int(args.phase_c_max_conds),
                 int(args.phase_c_beam_width),
             )
             valid_pool.extend(final_valid_c)
@@ -5100,7 +5383,7 @@ def main() -> None:
                 final_valid_d, beam_rules, d_diag = _select_level_results(
                     out_d,
                     float(args.min_main_score),
-                    min(int(args.phase_d_max_conds), int(args.max_path_conds)),
+                    int(args.phase_d_max_conds),
                     int(args.phase_d_beam_width),
                     _dedupe_mask,
                 )
@@ -5118,7 +5401,6 @@ def main() -> None:
             _dispatch_phase_d_start(
                 raw_start_depth,
                 int(args.phase_d_max_conds),
-                int(args.max_path_conds),
                 len(idxs_d),
                 _evaluate_d_start_stage,
                 _consume_d_start_stage,
@@ -5135,22 +5417,20 @@ def main() -> None:
                 current_min_base_len = min((len(node["combo"]) for node in d_beam_nodes), default=0)
                 current_max_base_len = max((len(node["combo"]) for node in d_beam_nodes), default=0)
                 min_depth = current_min_base_len + max(1, int(args.phase_d_add_min))
-                hard_max_depth = min(int(args.phase_d_max_conds), int(args.max_path_conds))
+                hard_max_depth = int(args.phase_d_max_conds)
                 max_depth = min(current_max_base_len + max(1, int(args.phase_d_add_max)), hard_max_depth)
                 if min_depth > max_depth:
                     print("[prefilter-phase-d] done: max depth reached")
                     break
 
                 def _iter_cands_d():
-                    for node in d_beam_nodes:
-                        base = tuple(node["combo"])
-                        cset = set(base)
-                        add_cands = [x for x in idxs_d if x not in cset]
-                        for add_k in range(max(1, int(args.phase_d_add_min)), max(1, int(args.phase_d_add_max)) + 1):
-                            if len(base) + add_k > int(args.phase_d_max_conds) or len(base) + add_k > int(args.max_path_conds):
-                                continue
-                            for adds in itertools.combinations(add_cands, add_k):
-                                yield tuple(sorted(cset | set(adds))), int(node["parent_id"])
+                    yield from _iter_beam_extensions(
+                        d_beam_nodes,
+                        idxs_d,
+                        int(args.phase_d_add_min),
+                        int(args.phase_d_add_max),
+                        int(args.phase_d_max_conds),
+                    )
 
                 d_exact_state: dict = {}
                 d_stage_stats = _new_score_stage_stats() if bool(args.debug_score_stage_timing) else None
@@ -5180,7 +5460,7 @@ def main() -> None:
                 final_valid_d, beam_rules, d_diag = _select_level_results(
                     out_d,
                     float(args.min_main_score),
-                    min(int(args.phase_d_max_conds), int(args.max_path_conds)),
+                    int(args.phase_d_max_conds),
                     int(args.phase_d_beam_width),
                     _dedupe_mask,
                 )
